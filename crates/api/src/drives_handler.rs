@@ -652,10 +652,24 @@ pub async fn upload_data(
     }
     .await;
 
-    if let Err((status, msg)) = stream_result {
-        state.drives.importing.store(false, Ordering::SeqCst);
-        return crate::json_error(status, &msg);
-    }
+    let bytes_written = match stream_result {
+        Ok(n) => n,
+        Err((status, msg)) => {
+            tracing::warn!(
+                "upload_data: body stream failed status={} msg={} tmp={}",
+                status.as_u16(),
+                msg,
+                tmp
+            );
+            state.drives.importing.store(false, Ordering::SeqCst);
+            return crate::json_error(status, &msg);
+        }
+    };
+    tracing::info!(
+        "upload_data: received {} byte(s) at {}",
+        bytes_written,
+        tmp
+    );
 
     // Emit `drive_import` WebSocket events so the web UI can show a
     // live progress bar during what may be a multi-minute restore.
@@ -684,6 +698,12 @@ pub async fn upload_data(
 
     match result {
         Ok(Ok(stats)) => {
+            tracing::info!(
+                "upload_data: import success routes={} processed_files={} drive_tags={}",
+                stats.routes,
+                stats.processed_files,
+                stats.drive_tags
+            );
             hub.broadcast(
                 "drive_import",
                 &serde_json::json!({
@@ -704,6 +724,7 @@ pub async fn upload_data(
             )
         }
         Ok(Err(e)) => {
+            tracing::warn!("upload_data: import failed: {}", e);
             hub.broadcast(
                 "drive_import",
                 &serde_json::json!({"phase": "error", "error": e.to_string()}),
@@ -711,10 +732,31 @@ pub async fn upload_data(
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
         Err(e) => {
+            tracing::warn!("upload_data: import task panicked: {}", e);
             hub.broadcast(
                 "drive_import",
                 &serde_json::json!({"phase": "error", "error": e.to_string()}),
             );
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
+        }
+    }
+}
+
+/// GET /api/drives/data/import-history — read-only handler that returns the
+/// last 20 import diagnostics records persisted in the `meta` table. Each
+/// entry is `{ timestamp, stats, diagnostics }` so an operator can see why
+/// drives may have gone missing without scraping logs. Empty array if no
+/// imports have run yet.
+pub async fn import_history(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.drives.store.import_history() {
+        Ok(history) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "history": history })),
+        ),
+        Err(e) => {
+            tracing::warn!("import_history: failed to read meta: {}", e);
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string())
         }
     }

@@ -564,15 +564,46 @@ impl DriveStore {
         path: &str,
         on_progress: F,
     ) -> Result<crate::json_compat::ImportStats> {
-        let stats = {
+        let existing_before = self.route_count.load(Ordering::Relaxed);
+        let (stats, diag) = {
             let mut conn = self.conn.lock().unwrap();
             let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+            // Persist the diagnostics record while we still hold the writer
+            // lock. Best-effort — a failure here is logged but not fatal,
+            // since the import itself already committed.
+            if let Err(e) = persist_import_history(&conn, &s.0, &s.1) {
+                warn!("import_json_file_with_progress: failed to persist import history: {}", e);
+            }
             s
         };
         self.drive_cache_dirty.store(true, Ordering::Release);
         self.refresh_counts()?;
+        let after = self.route_count.load(Ordering::Relaxed);
+        info!(
+            "import_json_file: existing_before={} stats_routes={} after={} (delta={})",
+            existing_before,
+            stats.routes,
+            after,
+            after - existing_before
+        );
+        if diag.has_problems() {
+            warn!(
+                "import_json_file: diagnostics flagged problems — see import_json warnings above; \
+                 query GET /api/drives/data/import-history for the persisted record"
+            );
+        }
         Ok(stats)
+    }
+
+    /// Read the ring-buffered import history (last [`IMPORT_HISTORY_MAX`]
+    /// entries). Each entry contains the `ImportStats` and `ImportDiagnostics`
+    /// captured at import time, plus a Unix epoch timestamp. Used by
+    /// `GET /api/drives/data/import-history` so operators can see why drives
+    /// went missing without scraping logs.
+    pub fn import_history(&self) -> Result<Vec<ImportHistoryEntry>> {
+        let conn = self.conn.lock().unwrap();
+        read_import_history_inner(&conn)
     }
 
     /// Export current DB contents as `drive-data.json` at `path`.
@@ -769,6 +800,61 @@ fn write_export_json(conn: &Connection, tmp_path: &str) -> Result<()> {
     Ok(())
 }
 
+/// Maximum number of import-history records kept in the `meta` table.
+const IMPORT_HISTORY_MAX: usize = 20;
+
+/// Wire-format record for one entry in the persisted import history.
+/// Stored as a JSON array under `meta` key `import_history` (newest last).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportHistoryEntry {
+    /// Unix epoch seconds when the import completed.
+    pub timestamp: i64,
+    pub stats: crate::json_compat::ImportStats,
+    pub diagnostics: crate::json_compat::ImportDiagnostics,
+}
+
+/// Append a single import's stats + diagnostics to the ring-buffered
+/// `import_history` JSON array in the `meta` table. Keeps the most recent
+/// `IMPORT_HISTORY_MAX` entries; older ones are dropped from the front.
+fn persist_import_history(
+    conn: &Connection,
+    stats: &crate::json_compat::ImportStats,
+    diag: &crate::json_compat::ImportDiagnostics,
+) -> Result<()> {
+    let entry = ImportHistoryEntry {
+        timestamp: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0),
+        stats: *stats,
+        diagnostics: diag.clone(),
+    };
+    let mut history: Vec<ImportHistoryEntry> = match schema::meta_get(conn, "import_history")? {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    history.push(entry);
+    if history.len() > IMPORT_HISTORY_MAX {
+        let drop = history.len() - IMPORT_HISTORY_MAX;
+        history.drain(0..drop);
+    }
+    let json = serde_json::to_string(&history)
+        .map_err(|e| anyhow::anyhow!("serialize import_history: {}", e))?;
+    schema::meta_set(conn, "import_history", &json)?;
+    Ok(())
+}
+
+/// Read the persisted import history from the `meta` table. Returns an
+/// empty Vec if no imports have been recorded.
+fn read_import_history_inner(conn: &Connection) -> Result<Vec<ImportHistoryEntry>> {
+    match schema::meta_get(conn, "import_history")? {
+        Some(s) if !s.is_empty() => serde_json::from_str(&s)
+            .map_err(|e| anyhow::anyhow!("parse import_history: {}", e)),
+        _ => Ok(Vec::new()),
+    }
+}
+
 /// Build the grouped drive list and store it as JSON in the `meta` table,
 /// along with the route count and tag row count used to validate the cache
 /// on the next startup.
@@ -807,6 +893,13 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
     // duplicates.
     let drives = crate::grouper::group_summaries_fast(&summaries, &tags);
     let visible = crate::grouper::hide_tessie_overlapping_sei(drives.clone());
+    info!(
+        "drive cache: route_count={} drives={} visible={} tags={}",
+        route_count,
+        drives.len(),
+        visible.len(),
+        tags_count
+    );
     let json = serde_json::to_string(&visible)
         .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
     schema::meta_set(conn, "drive_list_cache", &json)?;
@@ -1327,7 +1420,7 @@ fn run_one_shot_import(conn: &mut Connection, candidates: &[&str]) -> Result<()>
     };
 
     info!("[drives] Importing legacy JSON from {}", source_path);
-    let stats =
+    let (stats, diag) =
         crate::json_compat::import_json(conn, source_path, |routes_imported| {
             info!("[drives] Import progress: {} routes", routes_imported);
         })
@@ -1336,6 +1429,9 @@ fn run_one_shot_import(conn: &mut Connection, candidates: &[&str]) -> Result<()>
         "[drives] Import complete: {} routes, {} processed files, {} tags",
         stats.routes, stats.processed_files, stats.drive_tags
     );
+    if let Err(e) = persist_import_history(conn, &stats, &diag) {
+        warn!("[drives] failed to persist import history: {}", e);
+    }
 
     // Set the marker BEFORE renaming. If we die between these two steps,
     // the worst outcome on next boot is an orphan JSON left alone (the

@@ -472,6 +472,18 @@ const DIAGNOSTICS_SCRIPT: &str = r#"{
   tail -50 /mutable/archiveloop.log 2>/dev/null || echo "no archiveloop log"
   echo ""
 
+  echo "====== drive-import history (persisted, last 20) ======"
+  curl -fsS --max-time 5 http://127.0.0.1/api/drives/data/import-history 2>/dev/null \
+    || echo "could not reach /api/drives/data/import-history"
+  echo ""
+
+  echo "====== drive-import logs (journalctl, last 7 days) ======"
+  journalctl -u sentryusb --since "7 days ago" --no-pager 2>/dev/null \
+    | grep -E "import_json|group_clips|hide_tessie_overlapping_sei|upload_data|drive cache:" \
+    | tail -200 \
+    || echo "no matching journalctl entries"
+  echo ""
+
   echo "====== temperatures ======"
   cat /sys/class/thermal/thermal_zone0/temp 2>/dev/null | awk '{printf "CPU: %.1f°C\n", $1/1000}'
   vcgencmd measure_temp 2>/dev/null || true

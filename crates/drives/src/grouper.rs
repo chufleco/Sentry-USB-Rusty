@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
+use tracing::{info, warn};
 
 use crate::extract::{
     AUTOPILOT_AUTOSTEER, AUTOPILOT_FSD, AUTOPILOT_OFF, AUTOPILOT_TACC, GEAR_PARK,
@@ -247,6 +248,7 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
     }
 
     // Deduplicate by normalized file path (handles mixed \ and /)
+    let input_count = routes.len();
     let mut seen = HashMap::with_capacity(routes.len());
     let mut unique = Vec::with_capacity(routes.len());
     for r in routes {
@@ -255,24 +257,52 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
             unique.push(r);
         }
     }
+    let unique_count = unique.len();
+    if unique_count < input_count {
+        warn!(
+            "group_clips: dedup dropped {} duplicate-path route(s) (input={} unique={})",
+            input_count - unique_count,
+            input_count,
+            unique_count,
+        );
+    }
 
-    // Parse timestamps and build TimedRoute references
+    // Parse timestamps and build TimedRoute references — record up to 10
+    // dropped filenames so the most common cause of "missing drives on
+    // import" (filenames lacking the YYYY-MM-DD_HH-MM-SS pattern) shows up
+    // in operator logs.
+    let mut dropped_examples: Vec<String> = Vec::new();
+    let mut dropped_total: usize = 0;
     let mut timed: Vec<TimedRoute> = unique
         .into_iter()
-        .filter_map(|r| {
-            let ts = parse_file_timestamp(&r.file)?;
-            Some(TimedRoute {
-                route: r.clone(),
-                timestamp: ts,
-            })
+        .filter_map(|r| match parse_file_timestamp(&r.file) {
+            Some(ts) => Some(TimedRoute { route: r.clone(), timestamp: ts }),
+            None => {
+                dropped_total += 1;
+                if dropped_examples.len() < 10 {
+                    dropped_examples.push(r.file.clone());
+                }
+                None
+            }
         })
         .collect();
+    if dropped_total > 0 {
+        warn!(
+            "group_clips: {} route(s) dropped — filename does not contain YYYY-MM-DD_HH-MM-SS pattern. Examples: {:?}",
+            dropped_total, dropped_examples
+        );
+    }
 
     if timed.is_empty() {
+        info!(
+            "group_clips: input={} unique={} timed=0 groups=0 (no parseable timestamps)",
+            input_count, unique_count
+        );
         return Vec::new();
     }
 
     timed.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    let timed_count = timed.len();
 
     // First pass: group by time gap
     let mut time_groups: Vec<Vec<TimedRoute>> = Vec::new();
@@ -300,6 +330,13 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
             }
         }
     }
+    info!(
+        "group_clips: input={} unique={} timed={} groups={}",
+        input_count,
+        unique_count,
+        timed_count,
+        groups.len()
+    );
     groups
 }
 
@@ -1833,6 +1870,7 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
 /// by ID (e.g. `find_drive_files`) must continue to operate on the
 /// un-hidden grouping so the IDs handed to the frontend stay valid.
 pub fn hide_tessie_overlapping_sei(summaries: Vec<DriveSummary>) -> Vec<DriveSummary> {
+    let before = summaries.len();
     // Build sorted list of [start, end] ranges from the SEI drives.
     let mut sei_ranges: Vec<(i64, i64)> = Vec::new();
     for d in &summaries {
@@ -1877,6 +1915,13 @@ pub fn hide_tessie_overlapping_sei(summaries: Vec<DriveSummary>) -> Vec<DriveSum
         if !hide {
             out.push(d);
         }
+    }
+    let hidden = before.saturating_sub(out.len());
+    if hidden > 0 {
+        info!(
+            "hide_tessie_overlapping_sei: hid {} Tessie drive(s) overlapping SEI windows (before={} after={})",
+            hidden, before, out.len()
+        );
     }
     out
 }

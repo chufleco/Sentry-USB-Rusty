@@ -15,6 +15,7 @@ use std::io::Write;
 
 use anyhow::{bail, Context, Result};
 use rusqlite::{params, Connection};
+use tracing::{debug, info, warn};
 
 use crate::aggregate::compute_route_aggregates;
 use crate::blob::{decode_f32s, decode_gear_runs, decode_points, decode_u8s};
@@ -39,6 +40,44 @@ pub struct ImportStats {
     pub drive_tags: usize,
 }
 
+/// Per-route problems discovered during a JSON import. The route is still
+/// inserted in every case — these counters exist so operators can see *why*
+/// a drive might not appear in the UI even though the import "succeeded".
+/// Persisted to the `meta` table after each import for post-mortem queries.
+#[derive(Debug, Default, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportDiagnostics {
+    /// Total routes seen in the JSON (matches `ImportStats.routes` on success).
+    pub seen: usize,
+    /// Routes whose `points` array was empty — they insert with NULL lat/lon
+    /// and zero aggregates, but still appear in `/api/drives/routes`.
+    pub empty_points: usize,
+    /// Routes whose `date` field was empty/whitespace.
+    pub empty_date: usize,
+    /// Routes whose normalized `file` matched another route earlier in the
+    /// same JSON — second occurrence overwrites the first via INSERT OR REPLACE.
+    pub duplicate_files_in_json: usize,
+    /// First few file paths flagged by any of the above categories. Capped to
+    /// `EXAMPLE_LIMIT` so a pathological import doesn't blow up the meta row.
+    pub bad_examples: Vec<String>,
+}
+
+/// Cap on `ImportDiagnostics::bad_examples` length.
+const EXAMPLE_LIMIT: usize = 20;
+
+impl ImportDiagnostics {
+    fn record_example(&mut self, file: &str) {
+        if self.bad_examples.len() < EXAMPLE_LIMIT {
+            self.bad_examples.push(file.to_string());
+        }
+    }
+
+    /// True when at least one category fired — operators should look at logs.
+    pub fn has_problems(&self) -> bool {
+        self.empty_points > 0 || self.empty_date > 0 || self.duplicate_files_in_json > 0
+    }
+}
+
 /// Import a Go-format `drive-data.json` into the SQLite store.
 ///
 /// Uses a streaming serde visitor: each Route is deserialized from the
@@ -54,23 +93,33 @@ pub fn import_json<F>(
     conn: &mut Connection,
     path: &str,
     on_progress: F,
-) -> Result<ImportStats>
+) -> Result<(ImportStats, ImportDiagnostics)>
 where
     F: Fn(usize),
 {
     use serde::de::{Deserializer as _, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::fmt;
     use std::io::{BufReader, Read, Seek, SeekFrom};
+
+    // File size is useful in logs to spot zero-byte or truncated uploads.
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
 
     // Open and skip UTF-8 BOM (Windows-edited JSON prepends EF BB BF).
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("open {}", path))?;
     {
         let mut bom = [0u8; 3];
-        let n = file.read(&mut bom).unwrap_or(0);
-        if n < 3 || bom != [0xEF, 0xBB, 0xBF] {
-            file.seek(SeekFrom::Start(0))?;
+        match file.read(&mut bom) {
+            Ok(n) => {
+                if n < 3 || bom != [0xEF, 0xBB, 0xBF] {
+                    file.seek(SeekFrom::Start(0))?;
+                }
+            }
+            Err(e) => {
+                warn!("import_json: BOM probe read failed on {}: {}", path, e);
+                file.seek(SeekFrom::Start(0))?;
+            }
         }
     }
     let reader = BufReader::with_capacity(64 * 1024, file);
@@ -79,6 +128,11 @@ where
     let existing_count: i64 = conn
         .query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))
         .unwrap_or(0);
+
+    info!(
+        "import_json: starting path={} size_bytes={} existing_routes={}",
+        path, file_size, existing_count
+    );
 
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -99,6 +153,8 @@ where
         processed_files: usize,
         drive_tags: usize,
         on_progress: &'tx dyn Fn(usize),
+        diag: &'tx mut ImportDiagnostics,
+        seen_files: &'tx mut HashSet<String>,
     }
 
     /// Deserializes the `routes` JSON array element-by-element.  Each Route
@@ -120,6 +176,33 @@ where
         fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
             while let Some(route) = seq.next_element::<Route>()? {
                 let agg = compute_route_aggregates(&route);
+
+                // Per-route diagnostics — record problems but still insert.
+                self.0.diag.seen += 1;
+                let norm = normalize_path(&route.file);
+                let mut flagged = false;
+                if route.points.is_empty() {
+                    self.0.diag.empty_points += 1;
+                    flagged = true;
+                }
+                if route.date.trim().is_empty() {
+                    self.0.diag.empty_date += 1;
+                    flagged = true;
+                }
+                if !self.0.seen_files.insert(norm.clone()) {
+                    self.0.diag.duplicate_files_in_json += 1;
+                    flagged = true;
+                }
+                if flagged {
+                    self.0.diag.record_example(&route.file);
+                }
+                debug!(
+                    "import: route file={} points={} date={}",
+                    route.file,
+                    route.points.len(),
+                    route.date
+                );
+
                 insert_imported_route(self.0.tx, &route, &agg, self.0.now)
                     .map_err(|e| serde::de::Error::custom(e.to_string()))?;
                 self.0.routes += 1;
@@ -189,7 +272,18 @@ where
     }
 
     // Run the streaming parse.
-    let mut ctx = Ctx { tx: &tx, now, routes: 0, processed_files: 0, drive_tags: 0, on_progress: &on_progress };
+    let mut diag = ImportDiagnostics::default();
+    let mut seen_files: HashSet<String> = HashSet::new();
+    let mut ctx = Ctx {
+        tx: &tx,
+        now,
+        routes: 0,
+        processed_files: 0,
+        drive_tags: 0,
+        on_progress: &on_progress,
+        diag: &mut diag,
+        seen_files: &mut seen_files,
+    };
     let mut de = serde_json::Deserializer::from_reader(reader);
     de.deserialize_map(TopLevel(&mut ctx))
         .map_err(|e: serde_json::Error| {
@@ -207,6 +301,12 @@ where
     if existing_count as usize >= SYNCGUARD_MIN_ROUTES
         && (stats.routes as f64) < (existing_count as f64 * SYNCGUARD_SHRINK_RATIO)
     {
+        warn!(
+            "import_json: shrink guard refused import — existing={} new={} threshold={:.0}%",
+            existing_count,
+            stats.routes,
+            SYNCGUARD_SHRINK_RATIO * 100.0,
+        );
         bail!(
             "refusing import: would shrink store from {} routes to {} (< {:.0}% retained). \
              Likely a truncated or corrupted upload — delete the existing DB manually if \
@@ -219,7 +319,42 @@ where
 
     on_progress(stats.routes);
     tx.commit()?;
-    Ok(stats)
+
+    // Aggregate summary at INFO so a healthy import emits one line.
+    info!(
+        "import_json: complete path={} routes={} processed_files={} drive_tags={} \
+         empty_points={} empty_date={} duplicate_files_in_json={}",
+        path,
+        stats.routes,
+        stats.processed_files,
+        stats.drive_tags,
+        diag.empty_points,
+        diag.empty_date,
+        diag.duplicate_files_in_json,
+    );
+
+    // One WARN per non-zero category, with up to EXAMPLE_LIMIT example file
+    // paths so operators can grep for the offending entries.
+    if diag.empty_points > 0 {
+        warn!(
+            "import_json: {} route(s) had empty points array — they will not appear as drives. Examples: {:?}",
+            diag.empty_points, diag.bad_examples
+        );
+    }
+    if diag.empty_date > 0 {
+        warn!(
+            "import_json: {} route(s) had empty date field. Examples: {:?}",
+            diag.empty_date, diag.bad_examples
+        );
+    }
+    if diag.duplicate_files_in_json > 0 {
+        warn!(
+            "import_json: {} route(s) had duplicate file paths within the JSON — second occurrence overwrote the first. Examples: {:?}",
+            diag.duplicate_files_in_json, diag.bad_examples
+        );
+    }
+
+    Ok((stats, diag))
 }
 
 /// Insert a route from a JSON import — matches the DDL in
@@ -602,5 +737,137 @@ mod streaming_export_tests {
         let _ = std::fs::remove_file(format!("{}-wal", db_str));
         let _ = std::fs::remove_file(format!("{}-shm", db_str));
         let _ = std::fs::remove_file(&json_path);
+    }
+}
+
+#[cfg(test)]
+mod import_diagnostics_tests {
+    use super::*;
+    use rusqlite::Connection;
+
+    /// JSON helper — assembles a `drive-data.json`-shaped payload for tests.
+    fn build_json(routes_json: &str) -> String {
+        format!(
+            r#"{{"processedFiles": [], "routes": [{}], "driveTags": {{}}}}"#,
+            routes_json
+        )
+    }
+
+    /// Returns a minimal route literal with overridable file + points.
+    fn route_lit(file: &str, points_json: &str, date: &str) -> String {
+        format!(
+            r#"{{"file":"{}","date":"{}","points":{},"gearStates":[],"autopilotStates":[],"speeds":[],"accelPositions":[],"rawParkCount":0,"rawFrameCount":0}}"#,
+            file, date, points_json
+        )
+    }
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    #[test]
+    fn diagnostics_flag_empty_points() {
+        let json = build_json(&format!(
+            "{},{}",
+            route_lit("2025-01-15_12-00-00/clip.mp4", "[]", "2025-01-15"),
+            route_lit("2025-01-15_12-05-00/clip.mp4", "[[37.0,-122.0]]", "2025-01-15"),
+        ));
+        let path = std::env::temp_dir().join("sentryusb-diag-empty-points.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let mut conn = fresh_conn();
+        let (stats, diag) = import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        assert_eq!(stats.routes, 2);
+        assert_eq!(diag.empty_points, 1);
+        assert_eq!(diag.empty_date, 0);
+        assert_eq!(diag.duplicate_files_in_json, 0);
+        assert!(diag.bad_examples.iter().any(|e| e.contains("12-00-00")));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn diagnostics_flag_duplicate_file_paths_after_normalization() {
+        // Two routes whose `file` differs only in slash style. The second
+        // overwrites the first via INSERT OR REPLACE — we want this counted.
+        let json = build_json(&format!(
+            "{},{}",
+            route_lit(
+                "2025-01-15_12-00-00\\\\clip.mp4",
+                "[[37.0,-122.0]]",
+                "2025-01-15"
+            ),
+            route_lit(
+                "2025-01-15_12-00-00/clip.mp4",
+                "[[37.1,-122.1]]",
+                "2025-01-15"
+            ),
+        ));
+        let path = std::env::temp_dir().join("sentryusb-diag-dup-paths.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let mut conn = fresh_conn();
+        let (_stats, diag) = import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        assert_eq!(diag.duplicate_files_in_json, 1);
+        assert!(diag.has_problems());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn diagnostics_clean_import_has_no_problems() {
+        let json = build_json(&route_lit(
+            "2025-01-15_12-00-00/clip.mp4",
+            "[[37.0,-122.0],[37.1,-122.1]]",
+            "2025-01-15",
+        ));
+        let path = std::env::temp_dir().join("sentryusb-diag-clean.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let mut conn = fresh_conn();
+        let (stats, diag) = import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        assert_eq!(stats.routes, 1);
+        assert_eq!(diag.seen, 1);
+        assert!(!diag.has_problems(), "clean import should not flag problems");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The grouper's timestamp filter (grouper.rs `parse_file_timestamp`) is
+    /// the most likely cause of "missing drives on import": a route whose
+    /// filename lacks YYYY-MM-DD_HH-MM-SS lands in the routes table but
+    /// never appears as a drive. We verify the route IS imported (so logs
+    /// + import-history reflect it) — the grouper-side warn is exercised
+    /// by integration tests.
+    #[test]
+    fn route_with_unparseable_filename_still_imports() {
+        let json = build_json(&route_lit(
+            "weird-file-no-timestamp.mp4",
+            "[[37.0,-122.0],[37.1,-122.1]]",
+            "2025-01-15",
+        ));
+        let path = std::env::temp_dir().join("sentryusb-diag-unparseable.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let mut conn = fresh_conn();
+        let (stats, diag) = import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+
+        // import_json itself doesn't validate filenames — that's the
+        // grouper's job. The route IS in the DB.
+        assert_eq!(stats.routes, 1);
+        assert_eq!(diag.empty_points, 0);
+
+        // Confirm the row landed in the routes table.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+
+        let _ = std::fs::remove_file(&path);
     }
 }
