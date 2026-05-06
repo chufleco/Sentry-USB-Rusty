@@ -103,6 +103,12 @@ enum SpaceAction {
 
 #[tokio::main]
 async fn main() {
+    // Boot-phase timer. Lets us attribute the gap between systemd
+    // "Started sentryusb.service" and the UDC bind in the journal.
+    // Each `phase!` call emits `boot_phase=NAME elapsed_ms=N` so it's
+    // greppable: `journalctl -b -u sentryusb.service | grep boot_phase`.
+    let t0 = std::time::Instant::now();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -111,7 +117,15 @@ async fn main() {
         )
         .init();
 
+    macro_rules! phase {
+        ($name:expr) => {
+            info!(boot_phase = $name, elapsed_ms = t0.elapsed().as_millis() as u64);
+        };
+    }
+    phase!("tracing_initialized");
+
     let args = Args::parse();
+    phase!("args_parsed");
 
     // Subcommand dispatch — the wrappers in /root/bin/ expect these to
     // run to completion synchronously and exit with a status code.
@@ -128,6 +142,7 @@ async fn main() {
 
     // Initialize auth
     let auth = sentryusb_api::init_auth();
+    phase!("auth_initialized");
 
     // WebSocket hub
     let hub = sentryusb_ws::Hub::new();
@@ -142,6 +157,7 @@ async fn main() {
             Arc::new(sentryusb_drives::DriveStore::open_memory().expect("failed to create in-memory DB"))
         }
     };
+    phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
     // DriveStore::open via the one-shot import dance (matches Go Store.Load).
@@ -177,6 +193,7 @@ async fn main() {
     // awake_stop after boot isn't deferred forever.
     sentryusb_api::drives_handler::clear_keep_awake_wanted();
     let keep_awake = sentryusb_api::keep_awake::KeepAwakeManager::new(is_busy);
+    phase!("processor_keepawake_initialized");
 
     // SentryCloud upload pipeline. Background tasks pull pending routes
     // from the local DB, encrypt under the per-Pi key, and POST to
@@ -186,6 +203,7 @@ async fn main() {
         hub.clone(),
         cloud_notify,
     ).await;
+    phase!("cloud_uploader_spawned");
 
     let app_state = sentryusb_api::router::AppState {
         hub: hub.clone(),
@@ -206,6 +224,7 @@ async fn main() {
 
     // Resume Away Mode if the flag file still has time remaining.
     sentryusb_api::away_mode::restore_from_file();
+    phase!("startup_tasks_spawned");
 
     // Build the API router
     let mut app = sentryusb_api::build_router(app_state.clone());
@@ -238,6 +257,7 @@ async fn main() {
         auth,
         sentryusb_api::auth::auth_middleware,
     ));
+    phase!("router_built");
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], args.port));
     info!("SentryUSB server listening on {}", addr);
@@ -245,6 +265,13 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(addr)
         .await
         .expect("failed to bind address");
+    phase!("listener_bound");
+
+    info!(
+        boot_phase = "ready",
+        elapsed_total_ms = t0.elapsed().as_millis() as u64,
+        "SentryUSB ready to serve requests",
+    );
 
     axum::serve(
         listener,
