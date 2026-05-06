@@ -1909,13 +1909,18 @@ export default function Settings() {
       {/* Preferences & Connections */}
       <div>
         <p className="section-label mb-2 px-1">Preferences</p>
-        <div className="columns-1 gap-2 lg:columns-3 [&>*]:mb-2 [&>*]:break-inside-avoid">
-          <KeepAwakePreference />
-          <AwayModeControl />
-          <ConfigBackupSection />
-          <CommunityFeaturesSection />
-          <MobileNotificationsSection />
-          {piConfig?.uses_ble === "yes" && <BlePairButton />}
+        <div className="grid grid-cols-1 items-start gap-2 lg:grid-cols-3">
+          <div className="flex flex-col gap-2">
+            <KeepAwakePreference />
+            <AwayModeControl />
+          </div>
+          <div className="flex flex-col gap-2">
+            <ConfigBackupSection />
+            <CommunityFeaturesSection />
+          </div>
+          <div className="flex flex-col gap-2">
+            <MobileNotificationsSection />
+            {piConfig?.uses_ble === "yes" && <BlePairButton />}
 
           {/* Update tile — version + check + banners merged */}
           <div className="glass-card overflow-hidden">
@@ -2081,6 +2086,7 @@ export default function Settings() {
                 Discord
               </a>
             </div>
+          </div>
           </div>
         </div>
       </div>
