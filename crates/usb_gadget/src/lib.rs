@@ -13,7 +13,14 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 const GADGET_NAME: &str = "sentryusb";
-const LANG: &str = "0x0409"; // US English
+// US English. Must match the form used by `run/enable_gadget.sh:13` (`0x409`)
+// — the kernel parses `0x0409` and `0x409` to the same numeric langid (0x409)
+// but the configfs dentry takes whichever string mkdir'd first. Boot runs the
+// shell script which uses `0x409`; if Rust uses `0x0409`, `disable()` can't
+// rmdir `strings/0x409` and the orphan dir pins libcomposite forever, while
+// `enable()` then tries to mkdir `strings/0x0409` and the kernel rejects it
+// with EEXIST because language 0x409 is already registered.
+const LANG: &str = "0x409";
 const CFG: &str = "c";
 
 /// Disk images that can be exposed as USB mass storage LUNs.
