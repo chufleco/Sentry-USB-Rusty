@@ -393,7 +393,7 @@ pub async fn test_archive(
             let _ = std::fs::create_dir_all(tmp_dir);
             let src = format!("{}:{}", server, export);
             let res = sentryusb_shell::run_with_timeout(
-                timeout, "mount", &["-t", "nfs", &src, tmp_dir, "-o", "nolock,soft,timeo=50"],
+                timeout, "mount", &["-t", "nfs", &src, tmp_dir, "-o", "nolock,soft,timeo=50,proto=tcp,vers=3"],
             ).await;
             if res.is_ok() {
                 let _ = sentryusb_shell::run_with_timeout(
