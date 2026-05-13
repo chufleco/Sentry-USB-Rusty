@@ -535,6 +535,27 @@ async fn configure_nfs_mount(env: &SetupEnv, emitter: &SetupEmitter) -> Result<(
     );
     replace_fstab_entry("nfs", "/mnt/archive", &line)?;
     emitter.progress("Added NFS mount to /etc/fstab");
+
+    // Optional music share. archiveloop's `connect-archive.sh` mounts
+    // `/mnt/musicarchive` from this fstab entry, and `copy-music.sh`
+    // then rsyncs from there into the loop-mounted music_disk.bin.
+    // `ro` because we only ever read this share — matches the bash
+    // `verify-and-configure-archive.sh` that handles the conf-file
+    // flow, where the music line is also written read-only.
+    // Without this block, conf-file installs that set MUSIC_SHARE_NAME
+    // end up with archiveloop retrying the mount 10× per cycle and
+    // giving up ("mount: /mnt/musicarchive: can't find in /etc/fstab"),
+    // so music sync silently never runs.
+    let music_share = env.get("MUSIC_SHARE_NAME", "");
+    if !music_share.is_empty() {
+        std::fs::create_dir_all("/mnt/musicarchive").context("mkdir /mnt/musicarchive")?;
+        let music_line = format!(
+            "{}:{} /mnt/musicarchive nfs ro,noauto,nolock,proto=tcp,vers=3 0 0",
+            server, music_share
+        );
+        replace_fstab_entry("nfs", "/mnt/musicarchive", &music_line)?;
+        emitter.progress("Added NFS music mount to /etc/fstab");
+    }
     Ok(())
 }
 
