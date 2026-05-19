@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -268,11 +267,7 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         }
 
         total_stored += stored_this_batch;
-        state
-            .total_uploaded
-            .fetch_add(stored_this_batch as u64, Ordering::Relaxed);
         if stored_this_batch > 0 {
-            state.last_upload_at_ms.store(now_ms(), Ordering::Relaxed);
             *state.last_upload_error.lock().await = None;
             let pending = db_ext::pending_count(&state.store);
             state.hub.broadcast(

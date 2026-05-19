@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use std::time::SystemTime;
 
 use chrono::{DateTime, Utc};
@@ -10,6 +9,8 @@ use tracing::warn;
 use sentryusb_cloud_crypto::credentials::CloudCredentialsV1;
 use sentryusb_drives::DriveStore;
 use sentryusb_ws::Hub;
+
+use crate::db_ext;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -50,11 +51,7 @@ pub struct CloudStateInner {
 
     pub pairing_cancel: Mutex<Option<Arc<Notify>>>,
 
-    pub last_upload_at_ms: AtomicI64,
-
     pub last_upload_error: Mutex<Option<String>>,
-
-    pub total_uploaded: AtomicU64,
 }
 
 #[derive(Debug, Clone)]
@@ -86,9 +83,7 @@ impl CloudStateInner {
             creds: Mutex::new(None),
             pairing: Mutex::new(PairingProgress::default()),
             pairing_cancel: Mutex::new(None),
-            last_upload_at_ms: AtomicI64::new(0),
             last_upload_error: Mutex::new(None),
-            total_uploaded: AtomicU64::new(0),
         }
     }
 
@@ -117,12 +112,9 @@ impl CloudStateInner {
                 .unwrap_or(0)
             });
 
-        let last_upload_ms = self.last_upload_at_ms.load(Ordering::Relaxed);
-        let last_upload_at = if last_upload_ms > 0 {
-            chrono::DateTime::<Utc>::from_timestamp_millis(last_upload_ms)
-        } else {
-            None
-        };
+        let (total_uploaded_route_count, last_upload_secs) = db_ext::upload_summary(&self.store);
+        let last_upload_at = last_upload_secs
+            .and_then(|s| chrono::DateTime::<Utc>::from_timestamp(s, 0));
 
         let last_upload_error = self.last_upload_error.lock().await.clone();
 
@@ -135,7 +127,7 @@ impl CloudStateInner {
                 last_upload_at,
                 last_upload_error,
                 pending_route_count,
-                total_uploaded_route_count: self.total_uploaded.load(Ordering::Relaxed) as i64,
+                total_uploaded_route_count,
                 dek_rotation_generation: Some(c.dek_rotation_generation),
                 cloud_base_url: c.cloud_base_url.clone(),
                 pairing_state: pairing_guard.state,
@@ -149,7 +141,7 @@ impl CloudStateInner {
                 last_upload_at,
                 last_upload_error,
                 pending_route_count,
-                total_uploaded_route_count: self.total_uploaded.load(Ordering::Relaxed) as i64,
+                total_uploaded_route_count,
                 dek_rotation_generation: None,
                 cloud_base_url: self.cloud_base_url.clone(),
                 pairing_state: pairing_guard.state,
@@ -185,9 +177,7 @@ impl CloudStateInner {
         *creds_guard = None;
         drop(creds_guard);
 
-        self.last_upload_at_ms.store(0, Ordering::Relaxed);
         *self.last_upload_error.lock().await = None;
-        self.total_uploaded.store(0, Ordering::Relaxed);
 
         self.hub.broadcast(
             "cloud_status_changed",
@@ -220,7 +210,6 @@ impl CloudStateInner {
         *guard = None;
         drop(guard);
 
-        self.last_upload_at_ms.store(0, Ordering::Relaxed);
         *self.last_upload_error.lock().await = Some("revoked".to_string());
 
         self.hub.broadcast(

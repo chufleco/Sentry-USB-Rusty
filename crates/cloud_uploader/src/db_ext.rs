@@ -107,6 +107,20 @@ pub fn pending_count(store: &DriveStore) -> i64 {
         })
 }
 
+/// Returns `(uploaded_count, last_upload_unix_seconds)`. The `> 0` filter
+/// excludes the [`PERMANENT_SKIP_SENTINEL`] (`-1`) value.
+pub fn upload_summary(store: &DriveStore) -> (i64, Option<i64>) {
+    store.with_locked_conn(|conn| {
+        conn.query_row(
+            "SELECT count(*), max(cloud_uploaded_at) FROM routes \
+             WHERE cloud_uploaded_at > 0",
+            [],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<i64>>(1)?)),
+        )
+        .unwrap_or((0, None))
+    })
+}
+
 #[derive(serde::Serialize, Debug)]
 pub struct QueueEntry {
     pub file: String,
