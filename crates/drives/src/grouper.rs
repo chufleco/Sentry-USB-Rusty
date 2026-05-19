@@ -2423,6 +2423,27 @@ fn split_summary_by_gear_state_legacy<'a>(
 /// contribute proportionally to two drives instead of dumping the full
 /// distance into one. The gap term matches Sentry-Drive's merged-point
 /// walk behavior and is especially important for sparse Tessie clips.
+/// Returns the average engagement (FSD / AS / TACC / Assisted) fraction
+/// across two adjacent clips, distance-weighted. Used to attribute a
+/// fraction of cross-clip-boundary distance to the FSD/AS/TACC/Assisted
+/// subtotals so the summary path's totals match the detail endpoint's
+/// per-pair walk.
+///
+/// Mirrors Go `Scottmg1/Sentry-USB#50::avgEngagementFraction`.
+fn avg_engagement_fraction(prev_dist: f64, prev_total: f64, cur_dist: f64, cur_total: f64) -> f64 {
+    let prev_frac = if prev_total > 0.0 {
+        prev_dist / prev_total
+    } else {
+        0.0
+    };
+    let cur_frac = if cur_total > 0.0 {
+        cur_dist / cur_total
+    } else {
+        0.0
+    };
+    ((prev_frac + cur_frac) / 2.0).clamp(0.0, 1.0)
+}
+
 fn distance_from_summary_clips(clips: &[SubClipSummary]) -> f64 {
     fn is_null_island_pair(lat: f64, lng: f64) -> bool {
         lat.abs() < 1.0 && lng.abs() < 1.0
@@ -2510,6 +2531,25 @@ fn build_summary_from_aggregates(
     let mut seen_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut unique_clip_count: usize = 0;
 
+    // Track previous clip's end-point + per-clip engagement distances so we
+    // can attribute cross-clip-boundary distance to FSD/AS/TACC/Assisted
+    // subtotals. See [[avg_engagement_fraction]] doc + Go PR #50 rationale:
+    // detail endpoint walks merged points end-to-end so cross-clip pairs are
+    // counted in fsd_distance_m/etc when their AP state was active; the
+    // summary path sums per-clip aggregates which excludes cross-clip
+    // distance from FSD/AS/TACC totals → systematic +0.5–2.3% drift between
+    // list and detail percentages. Distribute cross-clip distance
+    // proportionally to each adjacent clip's distance-weighted engagement.
+    let mut prev_end: Option<(f64, f64)> = None;
+    let mut prev_clip_dist: f64 = 0.0;
+    let mut prev_fsd_dist: f64 = 0.0;
+    let mut prev_as_dist: f64 = 0.0;
+    let mut prev_tacc_dist: f64 = 0.0;
+    let mut prev_assisted_dist: f64 = 0.0;
+    fn is_null_island_pair(lat: f64, lng: f64) -> bool {
+        lat.abs() < 1.0 && lng.abs() < 1.0
+    }
+
     for clip in clips {
         let a = &clip.summary.aggregates;
         let f = clip.fraction;
@@ -2525,6 +2565,36 @@ fn build_summary_from_aggregates(
         autosteer_dist_m += a.autosteer_distance_m * f;
         tacc_dist_m += a.tacc_distance_m * f;
         assisted_dist_m += a.assisted_distance_m * f;
+
+        // Cross-clip boundary AP distance distribution. Skip when no
+        // previous clip OR either endpoint is missing/null-island.
+        if let (Some((p_lat, p_lng)), Some(c_lat), Some(c_lng)) =
+            (prev_end, a.start_lat, a.start_lng)
+        {
+            if !is_null_island_pair(p_lat, p_lng) && !is_null_island_pair(c_lat, c_lng) {
+                let cross_dist = haversine_m(p_lat, p_lng, c_lat, c_lng);
+                let fsd_frac = avg_engagement_fraction(
+                    prev_fsd_dist, prev_clip_dist,
+                    a.fsd_distance_m, a.distance_m,
+                );
+                let as_frac = avg_engagement_fraction(
+                    prev_as_dist, prev_clip_dist,
+                    a.autosteer_distance_m, a.distance_m,
+                );
+                let tacc_frac = avg_engagement_fraction(
+                    prev_tacc_dist, prev_clip_dist,
+                    a.tacc_distance_m, a.distance_m,
+                );
+                let assisted_frac = avg_engagement_fraction(
+                    prev_assisted_dist, prev_clip_dist,
+                    a.assisted_distance_m, a.distance_m,
+                );
+                fsd_dist_m += cross_dist * fsd_frac;
+                autosteer_dist_m += cross_dist * as_frac;
+                tacc_dist_m += cross_dist * tacc_frac;
+                assisted_dist_m += cross_dist * assisted_frac;
+            }
+        }
 
         // Per-file (not per-sub-clip) aggregates.
         let is_first_subclip_of_file = seen_files.insert(clip.summary.file.as_str());
@@ -2545,6 +2615,22 @@ fn build_summary_from_aggregates(
         if let (Some(lat), Some(lng)) = (a.end_lat, a.end_lng) {
             end_point = Some([lat, lng]);
         }
+
+        // Update prev_* state for the next iteration. Mirror
+        // distance_from_summary_clips: fall back to start point if end
+        // point is missing.
+        prev_end = if let (Some(lat), Some(lng)) = (a.end_lat, a.end_lng) {
+            Some((lat, lng))
+        } else if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
+            Some((lat, lng))
+        } else {
+            prev_end
+        };
+        prev_clip_dist = a.distance_m;
+        prev_fsd_dist = a.fsd_distance_m;
+        prev_as_dist = a.autosteer_distance_m;
+        prev_tacc_dist = a.tacc_distance_m;
+        prev_assisted_dist = a.assisted_distance_m;
     }
 
     let avg_speed_mps = if speed_count > 0.0 {
