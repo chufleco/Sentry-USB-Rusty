@@ -483,7 +483,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         <Row
           icon={<WifiOff className="h-3.5 w-3.5" />}
           label="WiFi"
-          sub="not connected"
+          sub="Not connected"
         />
       )}
 
@@ -523,7 +523,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
             <Cable className="h-3.5 w-3.5" />
           </span>
           <span className="text-xs text-slate-600">Ethernet</span>
-          <span className="ml-auto text-[10px] text-slate-600">not connected</span>
+          <span className="ml-auto text-[10px] text-slate-600">Not connected</span>
         </div>
       )}
     </StatusTile>

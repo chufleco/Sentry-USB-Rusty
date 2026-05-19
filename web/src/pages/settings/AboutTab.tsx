@@ -23,7 +23,7 @@ export function AboutTab({ status, sbc, hostname, uptimeSec, onOpenWizard }: Pro
     <PrefGrid min={300}>
       <PrefCard icon={<Info className="h-3.5 w-3.5" />} halo="slate" title="System">
         <Row label="Version" value={<span className="t-mono">{version ?? "…"}</span>} />
-        <Row label="Channel" value={<Pill kind="slate">stable</Pill>} />
+        <Row label="Channel" value={<Pill kind="slate">Stable</Pill>} />
         {sbc && <Row label="SBC" value={sbc} />}
         {hostname && (
           <Row label="Hostname" value={<span className="t-mono">{hostname}</span>} />
