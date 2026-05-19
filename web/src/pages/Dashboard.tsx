@@ -314,7 +314,7 @@ export default function Dashboard() {
       <CloudPairingSection />
 
       {/* Row 1: Status tiles */}
-      <div className="columns-1 gap-2 sm:columns-2 lg:columns-3 [&>*]:mb-2 [&>*]:break-inside-avoid">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {/* System tile: Uptime + CPU Temp + USB Drives */}
         <div className="glass-card p-3">
           <div className="flex items-start gap-3">
@@ -481,7 +481,7 @@ export default function Dashboard() {
       </div>
 
       {/* Row 2: Storage Usage + Archive Progress side by side */}
-      <div className="columns-1 gap-2 sm:columns-2 [&>*]:mb-2 [&>*]:break-inside-avoid">
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
         {/* Storage Usage */}
         <div className="glass-card p-3">
           <div className="mb-2 flex items-center justify-between">
