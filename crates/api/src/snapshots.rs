@@ -87,11 +87,12 @@ pub async fn list_snapshots(
         // --block-size=1`) because snapshots are XFS reflink copies
         // of cam_disk.bin that share nearly all extents with the
         // live image. Apparent size would report the full file
-        // length (e.g. 64 GB) for a snapshot that only uniquely
-        // owns a few MB of changed blocks, hugely overstating what
-        // the user would reclaim by deleting it. `du -sB1` reports
-        // actual disk usage in bytes, so a freshly-taken snapshot
-        // shows ~0 GB and grows as cam_disk diverges from it.
+        // length (e.g. 64 GB) for every snapshot, regardless of how
+        // many blocks it actually owns. `du -sB1` reports allocated
+        // bytes — but note this number still counts blocks shared
+        // with other snapshots and with cam_disk.bin, so it is NOT
+        // "what you'd reclaim by deleting just this snapshot." Use
+        // `total_allocated_bytes` below for the dedup'd aggregate.
         let du_out = sentryusb_shell::run(
             "du", &["-sB1", &path.to_string_lossy()],
         ).await.unwrap_or_default();
@@ -112,8 +113,27 @@ pub async fn list_snapshots(
     // what users actually want (delete the oldest to free space).
     entries.sort_by_key(|e| e.created_unix);
 
+    // Aggregate allocated bytes across all snapshots in a SINGLE du
+    // invocation so XFS reflink-shared extents are deduplicated. Summing
+    // per-snapshot sizes client-side double-counts shared blocks N times
+    // (every snap.bin reflinks most of cam_disk.bin), producing totals
+    // larger than the partition itself.
+    let total_allocated_bytes: u64 = if entries.is_empty() {
+        0
+    } else {
+        let du_out = sentryusb_shell::run(
+            "du", &["-sB1", SNAPSHOTS_DIR],
+        ).await.unwrap_or_default();
+        du_out
+            .split_whitespace()
+            .next()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    };
+
     (StatusCode::OK, Json(serde_json::json!({
         "snapshots": entries,
+        "total_allocated_bytes": total_allocated_bytes,
     })))
 }
 

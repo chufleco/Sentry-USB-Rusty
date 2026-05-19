@@ -1,5 +1,9 @@
 #!/bin/bash -eu
 
+LOG_FILE=${LOG_FILE:-/mutable/archiveloop.log}
+function log () {
+  echo "$( date ):" "$@" >> "$LOG_FILE" 2>/dev/null || true
+}
 
 NAME=$(basename "$1")
 

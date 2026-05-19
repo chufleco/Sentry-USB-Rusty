@@ -42,6 +42,7 @@ function relativeTime(unix: number): string {
 
 export default function Snapshots() {
   const [snapshots, setSnapshots] = useState<SnapshotEntry[]>([])
+  const [totalAllocatedBytes, setTotalAllocatedBytes] = useState<number>(0)
   const [free, setFree] = useState<FreeSpace | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -62,6 +63,11 @@ export default function Snapshots() {
       if (!listRes.ok) throw new Error("Failed to load snapshots")
       const listData = await listRes.json()
       setSnapshots(Array.isArray(listData?.snapshots) ? listData.snapshots : [])
+      setTotalAllocatedBytes(
+        typeof listData?.total_allocated_bytes === "number"
+          ? listData.total_allocated_bytes
+          : 0,
+      )
       if (spaceRes.ok) {
         const spaceData = await spaceRes.json()
         setFree(spaceData)
@@ -84,11 +90,6 @@ export default function Snapshots() {
     else if (sortMode === "largest") arr.sort((a, b) => b.size_bytes - a.size_bytes)
     return arr
   }, [snapshots, sortMode])
-
-  const totalSnapshotBytes = useMemo(
-    () => snapshots.reduce((sum, s) => sum + (s.size_bytes || 0), 0),
-    [snapshots],
-  )
 
   async function handleDelete(id: string) {
     setDeleting((prev) => new Set(prev).add(id))
@@ -161,7 +162,7 @@ export default function Snapshots() {
           </div>
           {snapshots.length > 0 && (
             <p className="mt-2 text-xs text-slate-500">
-              Snapshots account for {formatBytes(totalSnapshotBytes)} of the used
+              Snapshots account for {formatBytes(totalAllocatedBytes)} of the used
               space ({snapshots.length} {snapshots.length === 1 ? "snapshot" : "snapshots"}).
             </p>
           )}
