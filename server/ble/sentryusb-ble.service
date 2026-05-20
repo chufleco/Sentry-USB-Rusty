@@ -25,6 +25,13 @@ Type=simple
 ExecStartPre=-/bin/bash -c 'f=/tmp/ble_keep_awake_active; [ -e "$f" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ] && rm -f "$f"; exit 0'
 ExecStartPre=/usr/sbin/rfkill unblock bluetooth
 ExecStartPre=-/usr/bin/hciconfig hci0 up
+# Wait for BlueZ DBus before invoking btmgmt below. btmgmt acquires the
+# kernel BT management socket via BlueZ, and at boot time runs the risk
+# of starting before bluetoothd has claimed the socket. When that happens
+# btmgmt blocks indefinitely instead of returning an error, eating the
+# full 90s systemd start-pre timeout. Doing the org.bluez ready-check
+# *first* makes btmgmt non-blocking on every restart path.
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; echo "Waiting for org.bluez... ($i/30)"; sleep 1; done'
 # Re-enable controller-level LE advertising. The btmgmt flag persists in
 # kernel state and ends up OFF after certain restart paths (service crash,
 # manual restart, bond-dir reset). With it OFF, BlueZ's RegisterAdvertisement
@@ -33,9 +40,9 @@ ExecStartPre=-/usr/bin/hciconfig hci0 up
 # existing users, but any NEW device trying to discover the Pi (first-time
 # setup, re-pair after bond wipe, additional family-member phone, future
 # iOS client) will silently fail with "Pi not found nearby." The leading
-# '-' makes systemd treat a missing btmgmt as non-fatal.
-ExecStartPre=-/usr/bin/btmgmt advertising on
-ExecStartPre=/bin/bash -c 'for i in $(seq 1 30); do busctl status org.bluez >/dev/null 2>&1 && break; echo "Waiting for org.bluez... ($i/30)"; sleep 1; done'
+# '-' makes systemd treat a missing btmgmt as non-fatal, and `timeout 5`
+# is belt-and-suspenders against any future BlueZ-readiness race.
+ExecStartPre=-/usr/bin/timeout 5 /usr/bin/btmgmt advertising on
 ExecStart=/usr/bin/python3 /root/bin/sentryusb-ble.py
 Restart=always
 RestartSec=5
