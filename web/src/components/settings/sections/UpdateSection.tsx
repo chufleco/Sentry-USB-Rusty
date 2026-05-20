@@ -299,12 +299,13 @@ export function UpdateSection({ onInstallStart }: Props) {
         halo={headerHalo}
         title="Software Updates"
         badge={
-          stableUpdate ? (
-            // API version strings already carry the "v" prefix (e.g. "v2.7.3").
-            <Pill kind="accent">{stableUpdate.version}</Pill>
-          ) : (
-            <Pill kind="slate">{version ?? "…"}</Pill>
-          )
+          // Always show the *current* installed version here. The available
+          // update's version is shown in the "Stable:"/"Pre-release:" card
+          // below; surfacing it in the badge made it look like the pending
+          // release was already installed. Accent just flags that one is waiting.
+          <Pill kind={stableUpdate || prereleaseUpdate ? "accent" : "slate"}>
+            {version ?? "…"}
+          </Pill>
         }
       >
         <p className="t-xs">
