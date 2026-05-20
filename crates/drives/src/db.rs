@@ -949,10 +949,19 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
     );
     let json = serde_json::to_string(&visible)
         .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
+    // MAX(updated_at) lets the validity check detect in-place route updates
+    // (same row count, different aggregates — e.g. archiveloop reprocess,
+    // or a grouper change shipped via OTA without bumping
+    // DRIVE_LIST_CACHE_ALGO_VERSION). Without this marker, the cache stays
+    // "valid" while the live grouper would produce a different drive list.
+    let max_updated_at: i64 = conn
+        .query_row("SELECT COALESCE(MAX(updated_at), 0) FROM routes", [], |r| r.get(0))
+        .unwrap_or(0);
     schema::meta_set(conn, "drive_list_cache", &json)?;
     schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
     schema::meta_set(conn, "drive_list_cache_tags_count", &tags_count.to_string())?;
     schema::meta_set(conn, "drive_list_cache_algo", DRIVE_LIST_CACHE_ALGO_VERSION)?;
+    schema::meta_set(conn, "drive_list_cache_max_updated_at", &max_updated_at.to_string())?;
 
     // Cache drive stats from grouped drives so `/api/drives` and
     // `/api/drives/stats` are consistent on drive count and mileage.
@@ -1057,6 +1066,26 @@ fn is_drive_cache_valid(conn: &Connection) -> Result<bool> {
 
     let algo = schema::meta_get(conn, "drive_list_cache_algo")?;
     if algo.as_deref() != Some(DRIVE_LIST_CACHE_ALGO_VERSION) {
+        return Ok(false);
+    }
+
+    // Detect in-place route updates (same row count, changed aggregates).
+    // Without this, an archiveloop reprocess pass — or an OTA where the
+    // grouper changes but DRIVE_LIST_CACHE_ALGO_VERSION isn't bumped —
+    // leaves the cache serving stale drive boundaries while the live
+    // grouper would produce a different list. Field-reproduced 2026-05-19
+    // on v2.7.5: cache held 213 drives from a prior state; fresh grouper
+    // computed 144; `/api/drives/{id}` 404'd for IDs 144-212 because they
+    // existed in the cache but not in the live grouping.
+    //
+    // Treat a missing stored value as invalid so caches written by
+    // pre-fix builds get rebuilt on first read after the upgrade.
+    let stored_max_ua = schema::meta_get(conn, "drive_list_cache_max_updated_at")?
+        .and_then(|s| s.parse::<i64>().ok());
+    let current_max_ua: i64 = conn
+        .query_row("SELECT COALESCE(MAX(updated_at), 0) FROM routes", [], |r| r.get(0))
+        .unwrap_or(-1);
+    if stored_max_ua != Some(current_max_ua) {
         return Ok(false);
     }
 
