@@ -260,7 +260,7 @@ impl DriveStore {
     /// slashes). Called once per ProcessDirectory run.
     pub fn processed_set(&self) -> Result<std::collections::HashSet<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT file FROM processed_files")?;
+        let mut stmt = conn.prepare_cached("SELECT file FROM processed_files")?;
         let files = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -499,7 +499,7 @@ impl DriveStore {
 
         let mut drive_tags = std::collections::HashMap::<String, Vec<String>>::new();
         {
-            let mut stmt = conn.prepare("SELECT drive_key, tag FROM drive_tags")?;
+            let mut stmt = conn.prepare_cached("SELECT drive_key, tag FROM drive_tags")?;
             let rows = stmt
                 .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
             for r in rows {
@@ -543,7 +543,7 @@ impl DriveStore {
     /// Tags for a drive, or an empty vec.
     pub fn get_drive_tags(&self, drive_key: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT tag FROM drive_tags WHERE drive_key = ?1 ORDER BY tag",
         )?;
         let out = stmt
@@ -556,7 +556,7 @@ impl DriveStore {
     /// Full drive_key → tags map.
     pub fn get_all_drive_tags(&self) -> Result<std::collections::HashMap<String, Vec<String>>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare(
+        let mut stmt = conn.prepare_cached(
             "SELECT drive_key, tag FROM drive_tags ORDER BY drive_key, tag",
         )?;
         let rows =
@@ -572,7 +572,7 @@ impl DriveStore {
     /// Every tag name in use, sorted and deduplicated.
     pub fn get_all_tag_names(&self) -> Result<Vec<String>> {
         let conn = self.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT DISTINCT tag FROM drive_tags ORDER BY tag")?;
+        let mut stmt = conn.prepare_cached("SELECT DISTINCT tag FROM drive_tags ORDER BY tag")?;
         let tags = stmt
             .query_map([], |row| row.get::<_, String>(0))?
             .filter_map(|r| r.ok())
@@ -850,11 +850,28 @@ fn open_readonly_connection(path: &str) -> Result<Connection> {
 }
 
 fn apply_pragmas(conn: &Connection) -> Result<()> {
+    // mmap_size = 64 MB: SQLite mmaps the DB file up to this size, which
+    // eliminates the pager-buffer copy on BLOB-heavy reads (e.g.
+    // select_all_route_summaries scanning thousands of routes). 64 MB
+    // fits comfortably in 32-bit ARMv7's ~3 GB user-space VA, so it's
+    // safe across every SBC the project supports.
+    //
+    // cache_size = -8000: 8 MB page cache (negative value = KB). Default
+    // is 2 MB which is too small to keep the rebuild_drive_list_cache
+    // working set hot on a populated DB. Bumped to 8 MB; still trivial
+    // relative to Pi RAM budgets.
+    //
+    // temp_store = MEMORY: keep ORDER BY / GROUP BY temp tables in RAM
+    // instead of /tmp. On read-only-root Pi setups /tmp is tmpfs anyway,
+    // so this is equivalent in effect, but it's explicit and safe.
     conn.execute_batch(
         "PRAGMA journal_mode = WAL;
          PRAGMA synchronous = NORMAL;
          PRAGMA foreign_keys = ON;
-         PRAGMA busy_timeout = 5000;",
+         PRAGMA busy_timeout = 5000;
+         PRAGMA mmap_size = 67108864;
+         PRAGMA cache_size = -8000;
+         PRAGMA temp_store = MEMORY;",
     )?;
     Ok(())
 }
@@ -944,7 +961,7 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
     let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
     let mut tags_count: i64 = 0;
     {
-        let mut stmt = conn.prepare("SELECT drive_key, tag FROM drive_tags")?;
+        let mut stmt = conn.prepare_cached("SELECT drive_key, tag FROM drive_tags")?;
         let rows = stmt.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
@@ -1134,45 +1151,10 @@ fn insert_or_update_route(
 
     let point_count = r.points.len() as i64;
 
-    let p: Vec<Box<dyn ToSql>> = vec![
-        Box::new(norm_file.to_string()),
-        Box::new(r.date.clone()),
-        Box::new(point_count),
-        Box::new(r.raw_park_count as i64),
-        Box::new(r.raw_frame_count as i64),
-        Box::new(a.distance_m),
-        Box::new(first_lat),
-        Box::new(first_lon),
-        Box::new(pb),
-        Box::new(gb),
-        Box::new(ab),
-        Box::new(sb),
-        Box::new(acb),
-        Box::new(rb),
-        Box::new(now),
-        Box::new(a.max_speed_mps),
-        Box::new(a.avg_speed_mps),
-        Box::new(a.speed_sample_count),
-        Box::new(a.valid_point_count),
-        Box::new(a.fsd_engaged_ms),
-        Box::new(a.autosteer_engaged_ms),
-        Box::new(a.tacc_engaged_ms),
-        Box::new(a.fsd_distance_m),
-        Box::new(a.autosteer_distance_m),
-        Box::new(a.tacc_distance_m),
-        Box::new(a.assisted_distance_m),
-        Box::new(a.fsd_disengagements),
-        Box::new(a.fsd_accel_pushes),
-        Box::new(a.start_lat),
-        Box::new(a.start_lng),
-        Box::new(a.end_lat),
-        Box::new(a.end_lng),
-        Box::new(r.source.clone()),
-        Box::new(r.external_signature.clone()),
-        Box::new(r.tessie_autopilot_percent),
-    ];
-    let refs: Vec<&dyn ToSql> = p.iter().map(|b| &**b as &dyn ToSql).collect();
-
+    // `params![]` builds a stack-allocated `[&dyn ToSql; N]`, replacing
+    // the prior `Vec<Box<dyn ToSql>>` + `Vec<&dyn ToSql>` pattern which
+    // heap-allocated 35 small boxes plus two Vecs per insert. Called once
+    // per ingested clip (50+/min during Tesla recording).
     tx.execute(
         "INSERT INTO routes(
             file, date_dir, point_count, raw_park_count, raw_frame_count,
@@ -1230,14 +1212,50 @@ fn insert_or_update_route(
             source              = excluded.source,
             external_signature  = excluded.external_signature,
             tessie_autopilot_percent = excluded.tessie_autopilot_percent",
-        refs.as_slice(),
+        params![
+            norm_file,
+            &r.date,
+            point_count,
+            r.raw_park_count as i64,
+            r.raw_frame_count as i64,
+            a.distance_m,
+            first_lat,
+            first_lon,
+            pb,
+            gb,
+            ab,
+            sb,
+            acb,
+            rb,
+            now,
+            a.max_speed_mps,
+            a.avg_speed_mps,
+            a.speed_sample_count,
+            a.valid_point_count,
+            a.fsd_engaged_ms,
+            a.autosteer_engaged_ms,
+            a.tacc_engaged_ms,
+            a.fsd_distance_m,
+            a.autosteer_distance_m,
+            a.tacc_distance_m,
+            a.assisted_distance_m,
+            a.fsd_disengagements,
+            a.fsd_accel_pushes,
+            a.start_lat,
+            a.start_lng,
+            a.end_lat,
+            a.end_lng,
+            &r.source,
+            &r.external_signature,
+            r.tessie_autopilot_percent,
+        ],
     )?;
     Ok(())
 }
 
 /// Select all routes into `Vec<Route>` — fully decoded BLOB columns.
 fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT file, date_dir, raw_park_count, raw_frame_count,
                 points_blob, gear_states_blob, ap_states_blob,
                 speeds_blob, accel_blob, gear_runs_blob,
@@ -1370,7 +1388,7 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
 /// rows or routes whose 60s window had no samples; the consumer
 /// handles that via the `Option` shape inside `RouteTelemetryAggregates`.
 fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT file, date_dir, raw_park_count, raw_frame_count, gear_runs_blob,
                 distance_m, max_speed_mps, avg_speed_mps, speed_sample_count,
                 valid_point_count, fsd_engaged_ms, autosteer_engaged_ms,

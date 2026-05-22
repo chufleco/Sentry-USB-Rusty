@@ -36,6 +36,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// per-drive rollup takes the latest across the drive's clips.
 /// All nullable — cars without TPMS or pre-TPMS-sampler drives
 /// simply stay NULL and the UI hides the row.
+///
+/// `idx_routes_start_ts` cleanup: this PR drops the index from
+/// V1_SCHEMA (it indexes the always-NULL `routes.start_ts` column —
+/// pure B-tree maintenance overhead with no query path to benefit)
+/// and adds an unconditional `DROP INDEX IF EXISTS` near the top of
+/// `migrate()`. Unconditional rather than gated because both
+/// pre-telemetry-v6 DBs AND telemetry-v6 DBs still contain the dead
+/// index from the old V1_SCHEMA; a version gate would miss the
+/// latter cohort. `IF EXISTS` makes the call a no-op on fresh DBs.
 pub const CURRENT_SCHEMA_VERSION: i32 = 7;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
@@ -68,7 +77,9 @@ const V1_SCHEMA: &[&str] = &[
     ) WITHOUT ROWID",
 
     "CREATE INDEX IF NOT EXISTS idx_routes_date_dir ON routes(date_dir)",
-    "CREATE INDEX IF NOT EXISTS idx_routes_start_ts ON routes(start_ts)",
+    // Note: idx_routes_start_ts removed in v6 — see CURRENT_SCHEMA_VERSION
+    // doc. The column stays NULL on insert, so the index has nothing to
+    // index. v6 migrate() drops any pre-existing copy of this index.
 
     "CREATE TABLE IF NOT EXISTS processed_files (
         file      TEXT PRIMARY KEY,
@@ -206,6 +217,17 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             .with_context(|| format!("migrate: applying DDL {:?}", truncate(stmt, 60)))?;
     }
 
+    // Drop the legacy `idx_routes_start_ts` index that pre-v6 V1_SCHEMA
+    // shipped. `routes.start_ts` has only ever been written NULL (see
+    // `db.rs::insert_or_update_route` — start_ts is bound to SQL NULL),
+    // so the index has nothing to index but charges B-tree maintenance
+    // on every insert. Unconditional + `IF EXISTS` handles every
+    // cohort in one shot: fresh DBs (no-op, index never existed),
+    // pre-v6 DBs (drops the index), telemetry-v6/v7 DBs (drops the
+    // index they inherited from the old V1_SCHEMA). The column itself
+    // stays.
+    conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])?;
+
     // v6 standalone tables. Idempotent (`IF NOT EXISTS`) so safe on
     // every open and on first-run alongside V1_SCHEMA.
     for stmt in V6_NEW_TABLES {
@@ -278,6 +300,23 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 deleted_processed,
             );
         }
+    }
+
+    // v6 cleanup: drop the always-NULL `idx_routes_start_ts` index.
+    // `routes.start_ts` is bound to SQL NULL on every insert, so the
+    // index has nothing to index — pure B-tree maintenance overhead
+    // per insert. Gated on schema_version so the DROP runs at most once
+    // per upgrade. Fresh DBs (schema_version = None) never created the
+    // index because V1_SCHEMA no longer ships it; they skip this block.
+    let stored_version_for_v6 = meta_get(conn, "schema_version")?;
+    let needs_v6_cleanup = matches!(
+        stored_version_for_v6.as_deref(),
+        Some(v) if stored_less_than(v, 6),
+    );
+    if needs_v6_cleanup {
+        conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])
+            .context("migrate v6: dropping idx_routes_start_ts")?;
+        tracing::info!("schema v6: dropped idx_routes_start_ts (always-NULL column index)");
     }
 
     // schema_version handling:
@@ -784,5 +823,67 @@ mod tests {
             params![1_700_000_000_i64, "state"],
         );
         assert!(dup.is_err(), "duplicate ts must violate PRIMARY KEY");
+    }
+
+    /// Returns 1 if the named index exists in sqlite_master, else 0.
+    fn index_exists(conn: &Connection, name: &str) -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND name = ?1",
+            params![name],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migrate_drops_dead_index_on_upgrade() {
+        // Stand up a DB that has the legacy `idx_routes_start_ts` index
+        // (as pre-v6 V1_SCHEMA shipped) and confirm migrate() drops it.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        // Re-create the legacy index that pre-v6 schemas shipped.
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_routes_start_ts ON routes(start_ts)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(index_exists(&conn, "idx_routes_start_ts"), 1);
+
+        migrate(&conn).unwrap();
+
+        assert_eq!(
+            index_exists(&conn, "idx_routes_start_ts"),
+            0,
+            "migrate must drop idx_routes_start_ts",
+        );
+    }
+
+    #[test]
+    fn migrate_drops_dead_index_is_idempotent() {
+        // After the first migrate, the index is gone. A second migrate
+        // must not error if the index is absent.
+        let conn = open();
+        migrate(&conn).unwrap();
+        assert_eq!(index_exists(&conn, "idx_routes_start_ts"), 0);
+        migrate(&conn).unwrap();
+        assert_eq!(index_exists(&conn, "idx_routes_start_ts"), 0);
+    }
+
+    #[test]
+    fn migrate_fresh_db_never_creates_dead_index() {
+        // A fresh DB must not ship the dead index. V1_SCHEMA no longer
+        // includes the CREATE INDEX, so migrate() on an empty DB leaves
+        // sqlite_master without idx_routes_start_ts.
+        let conn = open();
+        migrate(&conn).unwrap();
+        assert_eq!(
+            index_exists(&conn, "idx_routes_start_ts"),
+            0,
+            "fresh DB must not create the legacy index",
+        );
+        // idx_routes_date_dir is still expected (it indexes a real column).
+        assert_eq!(index_exists(&conn, "idx_routes_date_dir"), 1);
     }
 }
