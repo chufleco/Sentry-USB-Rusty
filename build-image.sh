@@ -167,7 +167,7 @@ cp "$BINARY_PATH" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb
 chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-binary"
 
 if [ -n "${CTTS_BINARY:-}" ] && [ -f "$CTTS_BINARY" ]; then
-    info "Injecting cttseraser FUSE binary..."
+    info "Injecting cttseraser binary (opt-in ctts stripper)..."
     cp "$CTTS_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
     chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
 fi

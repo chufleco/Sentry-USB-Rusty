@@ -255,10 +255,10 @@ async fn main() {
     // Build the API router
     let mut app = sentryusb_api::build_router(app_state.clone());
 
-    // Serve TeslaCam video files through the cttseraser FUSE mount, which
-    // strips the `ctts` atom from Tesla MP4s so Chromium-based browsers can
-    // play them. The setup crate (`sentryusb_setup::cttseraser_mount`) mounts
-    // it over the snapshot symlink tree at `/mutable/TeslaCam`.
+    // Serve TeslaCam video files via the bind mount of /mutable/TeslaCam
+    // at /var/www/html/TeslaCam. Modern browsers (Chrome 80+, Firefox 70+,
+    // Safari iOS 13+, ExoPlayer) parse Tesla's `ctts` atom natively, so
+    // no FUSE wrapper is needed.
     app = app.nest_service(
         "/TeslaCam",
         tower_http::services::ServeDir::new("/var/www/html/TeslaCam"),

@@ -1,18 +1,16 @@
-//! TeslaCam FUSE mount wiring — port of `configure-web.sh`.
+//! TeslaCam web mount wiring — port of `configure-web.sh`.
 //!
-//! The Go/bash project compiled `cttseraser.cpp` here; the Rust port ships
-//! a native `cttseraser` binary built separately (installed by install-pi.sh
-//! or the pi-gen image at /usr/local/bin/cttseraser). This phase wires
-//! the binary into the system:
-//!   * writes `/sbin/mount.ctts` so fstab's `mount.ctts#` syntax resolves
-//!   * enables `user_allow_other` in /etc/fuse.conf
-//!   * creates the /mutable/TeslaCam source + /var/www/html/TeslaCam target
-//!   * adds the fstab entry that actually mounts it
-//!   * installs the `auto.www` autofs map when music/lightshow/boombox disk
-//!     images exist
+//! Wires the bind mount of /mutable/TeslaCam at /var/www/html/TeslaCam,
+//! which is where the Axum server's ServeDir route reads from. Prior
+//! versions of this phase configured a cttseraser FUSE mount to strip
+//! the `ctts` atom from MP4 files for browsers that couldn't parse it;
+//! modern browsers (Chrome 80+, Firefox 70+, Safari iOS 13+, ExoPlayer)
+//! handle the atom natively, so the FUSE layer is replaced with a
+//! kernel-level bind mount for correctness, throughput, and reliability.
 //!
-//! Without this phase the cttseraser binary is installed but **never mounted**,
-//! so Chrome's recordings bypass the ctts fixup entirely.
+//! The cttseraser binary and `/sbin/mount.ctts` helper are still installed
+//! by the build scripts as opt-in scaffolding; this module simply does not
+//! reference them by default.
 
 use std::path::Path;
 use std::time::Duration;
@@ -21,38 +19,39 @@ use anyhow::{Context, Result};
 
 use crate::SetupEmitter;
 
-/// Path at which install-pi.sh / pi-gen drops the Rust cttseraser binary.
-/// `/usr/local/bin/cttseraser` is a symlink to `/opt/sentryusb/cttseraser`.
-const CTTSERASER_BIN: &str = "/usr/local/bin/cttseraser";
+/// Canonical fstab entry that bind-mounts the TeslaCam source tree at the
+/// path the Axum ServeDir route reads from.
+const FSTAB_BIND_LINE: &str =
+    "/mutable/TeslaCam /var/www/html/TeslaCam none bind,nofail,x-systemd.requires=/mutable 0 0";
 
 pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
-    // Idempotency check — if the fstab entry, mount helper, and fuse conf
-    // are all already in place, we have nothing to do.
+    // Idempotency check — if the canonical bind entry is already present
+    // and no legacy cttseraser entry remains, nothing to do.
     let fstab = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
-    let fstab_has_mount = fstab.lines().any(|l| !l.starts_with('#') && l.contains("mount.ctts#"));
-    let mount_helper_ok = std::fs::read_to_string("/sbin/mount.ctts")
-        .map(|c| c.contains(CTTSERASER_BIN) || c.contains("cttseraser"))
-        .unwrap_or(false);
-    let fuse_ok = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|c| c.lines().any(|l| l.trim() == "user_allow_other"))
-        .unwrap_or(false);
+    let fstab_has_bind = fstab.lines().any(|l| {
+        !l.trim_start().starts_with('#')
+            && l.contains("/mutable/TeslaCam")
+            && l.contains("/var/www/html/TeslaCam")
+            && l.contains("bind")
+    });
+    let fstab_has_legacy = fstab
+        .lines()
+        .any(|l| !l.trim_start().starts_with('#') && l.contains("mount.ctts#"));
 
-    if fstab_has_mount && mount_helper_ok && fuse_ok {
+    if fstab_has_bind && !fstab_has_legacy {
         return Ok(false);
     }
 
-    emitter.begin_phase("web_mount", "TeslaCam FUSE mount");
+    emitter.begin_phase("web_mount", "TeslaCam mount");
     emitter.progress("configuring web (SentryUSB mode)");
 
-    // Install the runtime packages the Rust binary needs. We skip the
-    // build toolchain (g++, libfuse-dev) that the bash script pulled in
-    // purely to compile cttseraser.cpp on-device; the Rust binary is
-    // already compiled for us.
+    // Install runtime packages for the network status APIs. The bind mount
+    // itself requires no userspace tooling beyond `mount(8)` (built-in).
     sentryusb_shell::run_with_timeout(
         Duration::from_secs(300),
         "apt-get",
-        &["-y", "install", "fuse3", "net-tools", "wireless-tools", "ethtool"],
-    ).await.context("failed to install FUSE + networking runtime packages")?;
+        &["-y", "install", "net-tools", "wireless-tools", "ethtool"],
+    ).await.context("failed to install networking runtime packages")?;
 
     // Nginx fight — SentryUSB owns port 80.
     if sentryusb_shell::run("systemctl", &["is-active", "--quiet", "nginx"]).await.is_ok() {
@@ -62,24 +61,26 @@ pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
         let _ = sentryusb_shell::run("systemctl", &["disable", "nginx"]).await;
     }
 
-    // `/sbin/mount.ctts` — one-line wrapper that FUSE's mount helper
-    // protocol invokes via the `mount.ctts#` fstab syntax.
-    std::fs::write(
-        "/sbin/mount.ctts",
-        format!("#!/bin/bash -eu\n{} \"$@\" -o allow_other\n", CTTSERASER_BIN),
-    )?;
-    let _ = sentryusb_shell::run("chmod", &["+x", "/sbin/mount.ctts"]).await;
-
     // Source + target dirs.
     std::fs::create_dir_all("/mutable/TeslaCam")?;
     std::fs::create_dir_all("/var/www/html/TeslaCam")?;
 
-    // Replace any stale mount.ctts entry with the canonical one.
-    add_or_replace_fstab_ctts()?;
+    // Replace any legacy cttseraser entry with the bind-mount entry, then
+    // clear systemd's cached failed state so the unit activates immediately
+    // (without requiring a reboot on upgrade).
+    install_bind_mount_fstab()?;
+    let _ = sentryusb_shell::run("systemctl", &["daemon-reload"]).await;
+    let _ = sentryusb_shell::run(
+        "systemctl",
+        &["reset-failed", "var-www-html-TeslaCam.mount"],
+    ).await;
+    let _ = sentryusb_shell::run(
+        "systemctl",
+        &["start", "var-www-html-TeslaCam.mount"],
+    ).await;
 
-    // Allow non-root processes to traverse the FUSE mount. Without this
-    // even `read only = yes` Samba shares of /var/www/html/TeslaCam 403.
-    enable_user_allow_other()?;
+    // (Samba reads from /mutable/TeslaCam directly, so no FUSE allow_other
+    // configuration is required for it.)
 
     // Optional auto.www autofs for music/lightshow/boombox disk images.
     if Path::new("/backingfiles/music_disk.bin").exists()
@@ -103,61 +104,27 @@ pub async fn configure_web_mount(emitter: &SetupEmitter) -> Result<bool> {
     Ok(true)
 }
 
-/// Drop any existing `mount.ctts` fstab line and add the canonical one.
-fn add_or_replace_fstab_ctts() -> Result<()> {
-    const ENTRY: &str = "mount.ctts#/mutable/TeslaCam /var/www/html/TeslaCam fuse defaults,nofail,x-systemd.requires=/mutable 0 0";
+/// Strip any existing TeslaCam mount entry (legacy cttseraser or prior bind)
+/// from /etc/fstab and add the canonical bind-mount entry.
+fn install_bind_mount_fstab() -> Result<()> {
     let content = std::fs::read_to_string("/etc/fstab").unwrap_or_default();
     let kept: Vec<&str> = content
         .lines()
-        .filter(|l| !l.trim_start().starts_with("mount.ctts#"))
+        .filter(|l| {
+            let t = l.trim_start();
+            if t.starts_with('#') {
+                return true;
+            }
+            // Drop any existing line that targets /var/www/html/TeslaCam.
+            !l.contains("/var/www/html/TeslaCam")
+        })
         .collect();
     let mut new = kept.join("\n");
     if !new.is_empty() && !new.ends_with('\n') {
         new.push('\n');
     }
-    new.push_str(ENTRY);
+    new.push_str(FSTAB_BIND_LINE);
     new.push('\n');
     std::fs::write("/etc/fstab", new)?;
-    Ok(())
-}
-
-/// Uncomment `#user_allow_other` in /etc/fuse.conf, or add it if the line
-/// doesn't exist. Idempotent.
-fn enable_user_allow_other() -> Result<()> {
-    let path = "/etc/fuse.conf";
-    let existing = std::fs::read_to_string(path).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == "user_allow_other") {
-        return Ok(());
-    }
-
-    let mut found_commented = false;
-    let new: String = existing
-        .lines()
-        .map(|l| {
-            if l.trim_start() == "#user_allow_other" {
-                found_commented = true;
-                "user_allow_other".to_string()
-            } else {
-                l.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let mut out = if found_commented {
-        new
-    } else {
-        // Append if the file exists but doesn't have the option at all.
-        let mut s = existing;
-        if !s.is_empty() && !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str("user_allow_other");
-        s
-    };
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    std::fs::write(path, out)?;
     Ok(())
 }

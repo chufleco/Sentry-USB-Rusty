@@ -7,7 +7,6 @@ python3-pip
 nginx
 fcgiwrap
 libnginx-mod-http-fancyindex
-libfuse-dev
 exfatprogs
 ntpsec-ntpdig
 rsync

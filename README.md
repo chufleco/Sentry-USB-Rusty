@@ -53,7 +53,7 @@ Output: `deploy/sentryusb-*.img.gz`, flash with Raspberry Pi Imager.
 - `crates/shell` — shell command helpers
 - `crates/usb_gadget` — configfs gadget control
 - `crates/ws` — WebSocket hub
-- `crates/cttseraser` — FUSE helper for CTTS frame atom stripping
+- `crates/cttseraser` — opt-in CTTS atom stripper (bind mount is the default; this is scaffolding for advanced users with very old browser stacks)
 - `server/ble/` — Python BLE GATT peripheral (iOS app pairing)
 - `run/`, `setup/pi/`, `tools/`, `tests/` — shell helpers & pi-gen stage scripts
 - `pi-gen-sources/` — Raspberry Pi OS image build configuration
