@@ -25,7 +25,7 @@ cp -r web/dist crates/sentryusb/static
 
 Two binaries ship with the project:
 - `sentryusb` — main daemon (HTTP + WebSocket + setup orchestrator)
-- `cttseraser` — FUSE helper that rewrites `ctts` atoms in Tesla dashcam MP4s
+- `cttseraser` — opt-in FUSE binary that rewrites `ctts` atoms in Tesla MP4s (no longer in the default serving path; bind mount used instead)
 
 ### Cross-compile for the Pi
 

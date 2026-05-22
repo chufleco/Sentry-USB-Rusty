@@ -159,15 +159,15 @@ for _tc_bin in tesla-control tesla-keygen; do
 done
 
 # ── Install cttseraser FUSE binary (TeslaCam ctts stripper) ──
-# build-image.sh drops the cross-compiled Rust binary under files/; the
-# runtime wiring (/sbin/mount.ctts, fstab entry, user_allow_other) happens
-# during the setup wizard. Without this block the image has the wrapper
-# but no binary behind it.
+# build-image.sh drops the cross-compiled Rust binary under files/ so it is
+# available as opt-in scaffolding; the setup wizard no longer activates it
+# by default (bind mount is used instead). Without this block, advanced
+# users who want ctts stripping would have no binary to manually mount.
 if [ -f "files/cttseraser" ]; then
     install -m 755 "files/cttseraser" "${ROOTFS_DIR}/opt/sentryusb/cttseraser"
     ln -sf /opt/sentryusb/cttseraser "${ROOTFS_DIR}/usr/local/bin/cttseraser"
 else
-    echo "WARNING: cttseraser binary not found in files/ — TeslaCam ctts fixup will be disabled"
+    echo "WARNING: cttseraser binary not found in files/ — opt-in ctts stripping unavailable"
 fi
 
 # ── Install remountfs_rw helper (needed by BLE daemon to save PIN on read-only rootfs) ──

@@ -214,9 +214,9 @@ systemctl daemon-reload
 systemctl enable sentryusb
 ok "sentryusb.service installed and enabled"
 
-# ── Step 3b: cttseraser FUSE helper ────────────────────────────────
+# ── Step 3b: cttseraser (opt-in ctts stripper) ──────────────────────
 
-info "Installing cttseraser FUSE helper..."
+info "Installing cttseraser binary (opt-in ctts stripper)..."
 CTTS_INSTALL="$INSTALL_DIR/cttseraser"
 if [ -n "${1:-}" ] && [ -f "$(dirname "$1")/cttseraser" ]; then
     cp "$(dirname "$1")/cttseraser" "$CTTS_INSTALL"
@@ -232,7 +232,7 @@ else
         chmod +x "$CTTS_INSTALL"
         ok "cttseraser downloaded"
     else
-        warn "cttseraser binary not available — legacy FUSE feature disabled"
+        warn "cttseraser binary not available — opt-in ctts stripping unavailable"
     fi
 fi
 ln -sf "$CTTS_INSTALL" /usr/local/bin/cttseraser 2>/dev/null || true

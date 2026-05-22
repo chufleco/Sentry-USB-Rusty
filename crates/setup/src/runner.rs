@@ -244,9 +244,9 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     // readonly phase so /etc/auto.master.d is writable.
     crate::automount::configure_automount(&emitter).await?;
 
-    // TeslaCam FUSE mount wiring (cttseraser). Writes /sbin/mount.ctts,
-    // fstab entry, enables user_allow_other. Must run before readonly so
-    // /etc/fstab and /etc/fuse.conf are writable.
+    // TeslaCam bind-mount wiring. Writes /etc/fstab bind entry and
+    // activates var-www-html-TeslaCam.mount. Must run before readonly
+    // so /etc/fstab is still writable.
     crate::cttseraser_mount::configure_web_mount(&emitter).await?;
 
     // RTC.
