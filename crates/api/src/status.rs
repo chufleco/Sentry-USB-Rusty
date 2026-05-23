@@ -247,11 +247,17 @@ struct StorageBreakdown {
 pub async fn get_storage_breakdown(
     State(_state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let (cam, music, lightshow, boombox) = tokio::join!(
+        disk_usage("/backingfiles/cam_disk.bin"),
+        disk_usage("/backingfiles/music_disk.bin"),
+        disk_usage("/backingfiles/lightshow_disk.bin"),
+        disk_usage("/backingfiles/boombox_disk.bin"),
+    );
     let mut sb = StorageBreakdown {
-        cam_size: disk_usage("/backingfiles/cam_disk.bin"),
-        music_size: disk_usage("/backingfiles/music_disk.bin"),
-        lightshow_size: disk_usage("/backingfiles/lightshow_disk.bin"),
-        boombox_size: disk_usage("/backingfiles/boombox_disk.bin"),
+        cam_size: cam,
+        music_size: music,
+        lightshow_size: lightshow,
+        boombox_size: boombox,
         snapshots_size: 0,
         total_space: 0,
         free_space: 0,
@@ -523,12 +529,15 @@ fn iface_is_up(dev: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn disk_usage(path: &str) -> i64 {
+async fn disk_usage(path: &str) -> i64 {
     // On Linux, use stat to get st_blocks * 512 for actual disk usage
-    // (handles sparse files and reflink copies correctly)
-    if let Ok(out) = std::process::Command::new("stat")
+    // (handles sparse files and reflink copies correctly).
+    // Async to avoid blocking the tokio worker thread on /api/status
+    // polls — hit ~every 15 s by the SC companion app per device.
+    if let Ok(out) = tokio::process::Command::new("stat")
         .args(["--format=%b", path])
         .output()
+        .await
     {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout);

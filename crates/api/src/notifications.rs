@@ -305,8 +305,9 @@ async fn register_code_with_backend(
     creds: &NotificationCredentials,
     code: &str,
 ) -> Result<(), String> {
-    let hostname = std::process::Command::new("hostname")
+    let hostname = tokio::process::Command::new("hostname")
         .output()
+        .await
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())

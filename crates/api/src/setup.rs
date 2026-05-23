@@ -193,8 +193,9 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
                 let line = format!("ERROR: setup failed: {:#}", e);
                 let stamped = format!(
                     "{} : {}",
-                    std::process::Command::new("date")
+                    tokio::process::Command::new("date")
                         .output()
+                        .await
                         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                         .unwrap_or_else(|_| "???".to_string()),
                     line,
