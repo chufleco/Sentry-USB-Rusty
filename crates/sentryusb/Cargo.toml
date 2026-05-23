@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { workspace = true }
+libc = "0.2"
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }

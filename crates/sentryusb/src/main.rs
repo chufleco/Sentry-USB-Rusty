@@ -140,6 +140,23 @@ async fn main() {
         migrate::run_startup_migration().await;
     });
 
+    // Periodic malloc_trim — releases heap pages back to the kernel that
+    // glibc would otherwise keep cached in its per-arena free lists.
+    // Combined with MALLOC_ARENA_MAX=2 (set in the systemd unit) this
+    // keeps RSS bounded during/after burst workloads like clip ingest.
+    // No-op on non-glibc targets.
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+        tick.tick().await; // skip the first immediate tick
+        loop {
+            tick.tick().await;
+            // SAFETY: malloc_trim is async-signal-safe and thread-safe
+            // per glibc docs. Returns 1 if memory was released, 0 if not.
+            unsafe { libc::malloc_trim(0); }
+        }
+    });
+
     // Initialize auth
     let auth = sentryusb_api::init_auth();
     phase!("auth_initialized");
