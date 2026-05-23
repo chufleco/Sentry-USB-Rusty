@@ -30,3 +30,8 @@ opt-level = "s"
 lto = "thin"
 strip = true
 codegen-units = 1
+# Drops unwinding tables (~5-10 KB on ARM) and shrinks the binary further.
+# No code uses `std::panic::catch_unwind` (grep -r confirms), so the
+# behavioral change is a no-op: any panic now `abort()`s the process,
+# which systemd restarts via Restart=always already in the unit file.
+panic = "abort"
