@@ -35,6 +35,14 @@ impl Hub {
 
     /// Broadcasts a typed message to all connected clients.
     pub fn broadcast(&self, msg_type: &str, data: impl Serialize) {
+        // Skip the JSON serialize work entirely when nobody is listening.
+        // `receiver_count` is the live count of `broadcast::Receiver` handles
+        // owned by connected WS clients; it's the same source of truth the
+        // `tx.send` below would use to decide deliverability, just observed
+        // ahead of the encoding pass.
+        if self.tx.receiver_count() == 0 {
+            return;
+        }
         let msg = Message {
             msg_type: msg_type.to_string(),
             data: match serde_json::to_value(data) {
