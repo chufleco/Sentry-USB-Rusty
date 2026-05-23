@@ -25,14 +25,13 @@ cp -r web/dist crates/sentryusb/static
 
 Two binaries ship with the project:
 - `sentryusb` — main daemon (HTTP + WebSocket + setup orchestrator)
-- `cttseraser` — opt-in FUSE binary that rewrites `ctts` atoms in Tesla MP4s (no longer in the default serving path; bind mount used instead)
+- `sentryusb-tesla-telemetry` — BLE telemetry sampler (lazy-started after pairing)
 
 ### Cross-compile for the Pi
 
 64-bit (Pi 3/4/5/Zero 2):
 ```
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
-cross build --release --target aarch64-unknown-linux-gnu -p cttseraser
 ```
 
 32-bit (Pi Zero W / armhf):
@@ -79,8 +78,8 @@ bash install-pi.sh /tmp/sentryusb
 GitHub Releases are expected to host these artifacts (naming consumed by
 `install-pi.sh` and `build-image.sh`):
 
-- `sentryusb-linux-arm64`
+- `sentryusb-linux-arm64-a53` / `-a72` / `-a76` (per-CPU aarch64 variants)
+- `sentryusb-linux-arm64` (backward-compat alias = a72 build)
 - `sentryusb-linux-armv7`
 - `sentryusb-linux-armv6`
-- `cttseraser-linux-arm64`
-- `cttseraser-linux-armv7`
+- `sentryusb-tesla-telemetry-linux-*` (one per CPU variant)

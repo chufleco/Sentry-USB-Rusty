@@ -80,11 +80,9 @@ command -v docker &>/dev/null || error "Docker is required. Install it first."
 #
 # Populates two parallel arrays:
 #   VARIANT_PATHS[i]  — local path to the sentryusb binary for SUFFIXES[i]
-#   CTTS_PATHS[i]     — local path to cttseraser for SUFFIXES[i] (optional)
 #   TELEMETRY_PATHS[i]— local path to telemetry sampler for SUFFIXES[i] (optional)
 # These get injected into pi-gen's stage_sentryusb/files/ in Step 4.
 VARIANT_PATHS=()
-CTTS_PATHS=()
 TELEMETRY_PATHS=()
 
 if [ -n "$LOCAL_BINARY" ]; then
@@ -94,8 +92,8 @@ if [ -n "$LOCAL_BINARY" ]; then
     info "Using local binary: $LOCAL_BINARY (staged under all ${#SUFFIXES[@]} variant slot(s))"
     for sfx in "${SUFFIXES[@]}"; do
         VARIANT_PATHS+=("$LOCAL_BINARY")
-        # cttseraser/telemetry not derivable from a single arbitrary binary;
-        # they get fetched from releases below if available.
+        # telemetry isn't derivable from a single arbitrary binary;
+        # it gets fetched from releases below if available.
     done
 elif command -v cross &>/dev/null && command -v node &>/dev/null; then
     info "Building binaries from source (${#SUFFIXES[@]} variant(s))..."
@@ -118,19 +116,15 @@ elif command -v cross &>/dev/null && command -v node &>/dev/null; then
         (
             cd "$SCRIPT_DIR"
             cargo clean --release --target "$RUST_TARGET" -p sentryusb 2>/dev/null || true
-            cargo clean --release --target "$RUST_TARGET" -p cttseraser 2>/dev/null || true
             cargo clean --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry 2>/dev/null || true
             RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb
-            RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p cttseraser
             RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry
         )
         STASH="/tmp/sentryusb-image-build/${sfx}"
         mkdir -p "$STASH"
         cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb" "$STASH/sentryusb"
-        cp "$SCRIPT_DIR/target/$RUST_TARGET/release/cttseraser" "$STASH/cttseraser"
         cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-tesla-telemetry" "$STASH/sentryusb-tesla-telemetry"
         VARIANT_PATHS+=("$STASH/sentryusb")
-        CTTS_PATHS+=("$STASH/cttseraser")
         TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry")
     done
     ok "Built ${#SUFFIXES[@]} variant(s)"
@@ -141,10 +135,8 @@ else
         mkdir -p "$STASH"
         curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-$sfx" -o "$STASH/sentryusb" \
             || error "Failed to download sentryusb-$sfx. Build locally with:\n  cargo install cross\n  cd web && npm ci && npm run build"
-        curl -fsSL "https://github.com/$REPO/releases/latest/download/cttseraser-$sfx" -o "$STASH/cttseraser" 2>/dev/null || true
         curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-tesla-telemetry-$sfx" -o "$STASH/sentryusb-tesla-telemetry" 2>/dev/null || true
         VARIANT_PATHS+=("$STASH/sentryusb")
-        [ -s "$STASH/cttseraser" ] && CTTS_PATHS+=("$STASH/cttseraser") || CTTS_PATHS+=("")
         [ -s "$STASH/sentryusb-tesla-telemetry" ] && TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry") || TELEMETRY_PATHS+=("")
     done
     ok "Downloaded ${#SUFFIXES[@]} variant(s)"
@@ -214,21 +206,8 @@ for i in "${!SUFFIXES[@]}"; do
     info "  → staged sentryusb-${sfx}"
 done
 
-# cttseraser and telemetry: one set per variant when available. For local-
-# binary mode (no per-variant cttseraser exists) the loop is skipped — the
-# image just won't have cttseraser, which is fine since it's the legacy
-# opt-in path anyway.
-if [ "${#CTTS_PATHS[@]}" -gt 0 ]; then
-    for i in "${!SUFFIXES[@]}"; do
-        sfx="${SUFFIXES[$i]}"
-        src="${CTTS_PATHS[$i]:-}"
-        if [ -n "$src" ] && [ -f "$src" ]; then
-            cp "$src" "$STAGE_FILES/cttseraser-${sfx}"
-            chmod +x "$STAGE_FILES/cttseraser-${sfx}"
-        fi
-    done
-fi
-
+# Telemetry sampler: one binary per variant when available. For local-
+# binary mode (no per-variant telemetry binary exists) the loop is skipped.
 if [ "${#TELEMETRY_PATHS[@]}" -gt 0 ]; then
     for i in "${!SUFFIXES[@]}"; do
         sfx="${SUFFIXES[$i]}"

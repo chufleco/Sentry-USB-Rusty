@@ -247,7 +247,7 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     // TeslaCam bind-mount wiring. Writes /etc/fstab bind entry and
     // activates var-www-html-TeslaCam.mount. Must run before readonly
     // so /etc/fstab is still writable.
-    crate::cttseraser_mount::configure_web_mount(&emitter).await?;
+    crate::teslacam_mount::configure_web_mount(&emitter).await?;
 
     // RTC.
     crate::system::configure_rtc(&env, &emitter).await?;

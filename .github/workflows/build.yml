@@ -124,7 +124,7 @@ jobs:
         # corruption before the much slower cargo build step.
         run: cargo fetch --target ${{ matrix.target }}
 
-      - name: Build release binaries (sentryusb + cttseraser + telemetry sampler)
+      - name: Build release binaries (sentryusb + telemetry sampler)
         # RUSTFLAGS overrides the per-target rustflags in .cargo/config.toml
         # so each aarch64 matrix entry produces a binary tuned to its
         # specific Cortex-A microarchitecture. armv6 has cpu="" → we skip
@@ -135,7 +135,6 @@ jobs:
               export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
           fi
           cargo build --release --target ${{ matrix.target }} -p sentryusb
-          cargo build --release --target ${{ matrix.target }} -p cttseraser
           cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
@@ -143,9 +142,9 @@ jobs:
           CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binaries
-        # All three artifacts use the same `artifact_suffix` so the in-app
+        # Both artifacts use the same `artifact_suffix` so the in-app
         # updater (update.rs) and the picker script can fetch them via a
-        # predictable URL pattern: sentryusb-${suffix}, cttseraser-${suffix},
+        # predictable URL pattern: sentryusb-${suffix},
         # sentryusb-tesla-telemetry-${suffix}.
         #
         # The a72 job ALSO uploads under the legacy unsuffixed name
@@ -156,11 +155,9 @@ jobs:
         run: |
           mkdir -p release
           cp target/${{ matrix.target }}/release/sentryusb release/sentryusb-${{ matrix.artifact_suffix }}
-          cp target/${{ matrix.target }}/release/cttseraser release/cttseraser-${{ matrix.artifact_suffix }}
           cp target/${{ matrix.target }}/release/sentryusb-tesla-telemetry release/sentryusb-tesla-telemetry-${{ matrix.artifact_suffix }}
           if [ "${{ matrix.artifact_suffix }}" = "linux-arm64-a72" ]; then
               cp target/${{ matrix.target }}/release/sentryusb release/sentryusb-linux-arm64
-              cp target/${{ matrix.target }}/release/cttseraser release/cttseraser-linux-arm64
               cp target/${{ matrix.target }}/release/sentryusb-tesla-telemetry release/sentryusb-tesla-telemetry-linux-arm64
           fi
           ls -lh release/

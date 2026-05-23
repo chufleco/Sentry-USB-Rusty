@@ -214,30 +214,7 @@ systemctl daemon-reload
 systemctl enable sentryusb
 ok "sentryusb.service installed and enabled"
 
-# ── Step 3b: cttseraser (opt-in ctts stripper) ──────────────────────
-
-info "Installing cttseraser binary (opt-in ctts stripper)..."
-CTTS_INSTALL="$INSTALL_DIR/cttseraser"
-if [ -n "${1:-}" ] && [ -f "$(dirname "$1")/cttseraser" ]; then
-    cp "$(dirname "$1")/cttseraser" "$CTTS_INSTALL"
-    chmod +x "$CTTS_INSTALL"
-    ok "cttseraser installed from local path"
-else
-    # cttseraser isn't perf-critical — any of the per-CPU variants works
-    # equally well, so pick the first one we downloaded above. (The list
-    # ordering is fixed by ARCH_FAMILY so this is deterministic.)
-    CTTS_SUFFIX=$(echo $SUFFIXES | awk '{print $1}')
-    CTTS_URL="https://github.com/${REPO}/releases/latest/download/cttseraser-${CTTS_SUFFIX}"
-    if curl -fsSL "$CTTS_URL" -o "$CTTS_INSTALL" 2>/dev/null; then
-        chmod +x "$CTTS_INSTALL"
-        ok "cttseraser downloaded"
-    else
-        warn "cttseraser binary not available — opt-in ctts stripping unavailable"
-    fi
-fi
-ln -sf "$CTTS_INSTALL" /usr/local/bin/cttseraser 2>/dev/null || true
-
-# ── Step 3c: BLE daemon (Python) ───────────────────────────────────
+# ── Step 3b: BLE daemon (Python) ───────────────────────────────────
 
 info "Installing SentryUSB BLE daemon..."
 BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/main/server/ble"
@@ -270,7 +247,7 @@ else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
 fi
 
-# ── Step 3d: archiveloop ↔ gadget shim scripts ─────────────────────
+# ── Step 3c: archiveloop ↔ gadget shim scripts ─────────────────────
 #
 # archiveloop (shell) calls /root/bin/enable_gadget.sh and disable_gadget.sh
 # directly. On a pre-existing Go install those are real configfs scripts; if

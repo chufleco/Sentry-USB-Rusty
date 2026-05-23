@@ -15,7 +15,7 @@ pub mod network;
 pub mod readonly;
 pub mod scripts;
 pub mod automount;
-pub mod cttseraser_mount;
+pub mod teslacam_mount;
 pub mod fix_networking;
 pub mod verify;
 pub mod runner;

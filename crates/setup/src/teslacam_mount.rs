@@ -1,16 +1,15 @@
-//! TeslaCam web mount wiring — port of `configure-web.sh`.
+//! TeslaCam web mount wiring.
 //!
 //! Wires the bind mount of /mutable/TeslaCam at /var/www/html/TeslaCam,
 //! which is where the Axum server's ServeDir route reads from. Prior
 //! versions of this phase configured a cttseraser FUSE mount to strip
 //! the `ctts` atom from MP4 files for browsers that couldn't parse it;
-//! modern browsers (Chrome 80+, Firefox 70+, Safari iOS 13+, ExoPlayer)
-//! handle the atom natively, so the FUSE layer is replaced with a
-//! kernel-level bind mount for correctness, throughput, and reliability.
-//!
-//! The cttseraser binary and `/sbin/mount.ctts` helper are still installed
-//! by the build scripts as opt-in scaffolding; this module simply does not
-//! reference them by default.
+//! modern browsers handle the atom natively, so the FUSE layer was
+//! replaced with a kernel-level bind mount for correctness, throughput,
+//! and reliability. The cttseraser binary and helper are no longer
+//! shipped — this module detects and removes any legacy `mount.ctts#`
+//! fstab entry on first run after upgrade, so installs that came up
+//! pre-bind-mount still migrate cleanly.
 
 use std::path::Path;
 use std::time::Duration;

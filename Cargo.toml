@@ -10,7 +10,6 @@ members = [
     "crates/notify",
     "crates/usb_gadget",
     "crates/setup",
-    "crates/cttseraser",
     "crates/cloud_crypto",
     "crates/cloud_uploader",
     "crates/tesla_telemetry",
