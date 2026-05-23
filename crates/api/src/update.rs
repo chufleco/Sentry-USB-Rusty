@@ -173,32 +173,81 @@ fn update_repo() -> String {
     format!("{}/{}", owner, DEFAULT_UPDATE_REPO_NAME)
 }
 
-/// Detect the *userspace* architecture (not kernel arch).
+/// Detect the release suffix matching the currently-running CPU variant.
+///
+/// Three-tier resolution:
+///   1. `/opt/sentryusb/active-variant` — written by the boot picker
+///      (sentryusb-pick-binary). If present, this is authoritative — it's
+///      exactly the variant that's running right now, so re-downloading
+///      the same suffix guarantees the update lands on a binary the picker
+///      will pick again.
+///   2. Live CPU detection mirroring the picker's rules (HWCAP atomics →
+///      a76, CPU part 0xD08 → a72, else a53). Used when the picker hasn't
+///      written the active-variant file yet (e.g., during the first
+///      migration update from an old single-binary install).
+///   3. Architecture-family fallback via dpkg/uname for armv7/armv6/amd64
+///      — those targets don't have per-CPU variants.
 ///
 /// On Pi OS a 64-bit kernel can be paired with a 32-bit (armhf) userspace,
-/// in which case `uname -m` reports `aarch64` but the linux-arm64 binary
-/// can't actually load — exec returns ENOENT because the dynamic linker
-/// `/lib/ld-linux-aarch64.so.1` isn't installed. Trust dpkg first
-/// (always available on Debian-based Pi OS) and only fall back to
-/// `uname -m` when dpkg isn't there.
-async fn detect_release_suffix() -> anyhow::Result<&'static str> {
-    if let Ok(out) = sentryusb_shell::run("dpkg", &["--print-architecture"]).await {
-        match out.trim() {
-            "arm64" => return Ok("linux-arm64"),
-            "armhf" => return Ok("linux-armv7"),
-            "armel" => return Ok("linux-armv6"),
-            "amd64" => return Ok("linux-amd64"),
-            other => anyhow::bail!("unsupported userspace architecture: {}", other),
+/// in which case `uname -m` reports `aarch64` but the aarch64 binary can't
+/// actually load — exec returns ENOENT because the dynamic linker
+/// `/lib/ld-linux-aarch64.so.1` isn't installed. Trust dpkg first when
+/// determining the architecture family.
+async fn detect_release_suffix() -> anyhow::Result<String> {
+    // Tier 1: ask the picker what it chose at boot.
+    if let Ok(s) = std::fs::read_to_string("/opt/sentryusb/active-variant") {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.to_string());
         }
     }
-    let arch = sentryusb_shell::run("uname", &["-m"]).await?;
-    match arch.trim() {
-        "aarch64" => Ok("linux-arm64"),
-        "armv7l" => Ok("linux-armv7"),
-        "armv6l" => Ok("linux-armv6"),
-        "x86_64" => Ok("linux-amd64"),
-        other => anyhow::bail!("unsupported architecture: {}", other),
+
+    // Tier 3 first (cheap arch-family check) — gates whether we even
+    // need to do per-CPU detection. If we're on armv7/armv6/amd64,
+    // there's only one variant per family.
+    let family = if let Ok(out) = sentryusb_shell::run("dpkg", &["--print-architecture"]).await {
+        match out.trim() {
+            "arm64" => "aarch64",
+            "armhf" => return Ok("linux-armv7".to_string()),
+            "armel" => return Ok("linux-armv6".to_string()),
+            "amd64" => return Ok("linux-amd64".to_string()),
+            other => anyhow::bail!("unsupported userspace architecture: {}", other),
+        }
+    } else {
+        let arch = sentryusb_shell::run("uname", &["-m"]).await?;
+        match arch.trim() {
+            "aarch64" => "aarch64",
+            "armv7l" => return Ok("linux-armv7".to_string()),
+            "armv6l" => return Ok("linux-armv6".to_string()),
+            "x86_64" => return Ok("linux-amd64".to_string()),
+            other => anyhow::bail!("unsupported architecture: {}", other),
+        }
+    };
+
+    // Tier 2: aarch64 per-CPU detection — mirrors sentryusb-pick-binary's
+    // rules so an updater-side detection on a pre-picker install lands on
+    // the same variant the picker would have chosen.
+    debug_assert_eq!(family, "aarch64");
+    if let Ok(cpuinfo) = std::fs::read_to_string("/proc/cpuinfo") {
+        // HWCAP_ATOMICS = LSE = ARMv8.1+ = Cortex-A76 and newer.
+        for line in cpuinfo.lines() {
+            if line.starts_with("Features") && line.split_whitespace().any(|w| w == "atomics") {
+                return Ok("linux-arm64-a76".to_string());
+            }
+        }
+        // 0xD08 = Cortex-A72 (Pi 4 / RK3399 perf cluster).
+        for line in cpuinfo.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("CPU part") {
+                let part = trimmed.split(':').nth(1).unwrap_or("").trim().to_ascii_lowercase();
+                if part == "0xd08" {
+                    return Ok("linux-arm64-a72".to_string());
+                }
+            }
+        }
     }
+    // Default for aarch64: Cortex-A53 (Pi 3, Pi Zero 2 W, Allwinner H618).
+    Ok("linux-arm64-a53".to_string())
 }
 
 async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
@@ -245,7 +294,24 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     ).await?;
 
     sentryusb_shell::run("chmod", &["+x", tmp]).await?;
-    sentryusb_shell::run("mv", &[tmp, "/opt/sentryusb/sentryusb"]).await?;
+
+    // Write to the per-variant path so the picker symlink keeps resolving
+    // to a valid binary. Layout:
+    //   /opt/sentryusb/sentryusb-{suffix}            ← we write here
+    //   /opt/sentryusb/sentryusb-current → ↑         ← picker symlink
+    //   /opt/sentryusb/sentryusb         → -current  ← back-compat symlink
+    //
+    // Detection: if /opt/sentryusb/sentryusb-current exists (new layout),
+    // write to the variant path. Otherwise we're on a pre-multi-binary
+    // install — write to the legacy /opt/sentryusb/sentryusb path so the
+    // existing systemd unit still finds the binary. (The next install-pi.sh
+    // run will migrate the layout.)
+    let dest = if std::path::Path::new("/opt/sentryusb/sentryusb-current").exists() {
+        format!("/opt/sentryusb/sentryusb-{}", suffix)
+    } else {
+        "/opt/sentryusb/sentryusb".to_string()
+    };
+    sentryusb_shell::run("mv", &[tmp, &dest]).await?;
 
     // ── Tesla BLE telemetry sampler binary ──
     //

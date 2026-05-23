@@ -20,24 +20,44 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
+        # aarch64 is split into three CPU-tuned variants so each Pi runs
+        # code matched to its microarchitecture. The runtime picker script
+        # (pi-gen-sources/.../files/sentryusb-pick-binary) selects the
+        # right one at boot based on /proc/cpuinfo:
+        #   * a76 → Pi 5 (Cortex-A76, ARMv8.2 with LSE atomics)
+        #   * a72 → Pi 4, Radxa ROCK 4C+ perf cluster (Cortex-A72)
+        #   * a53 → Pi 3, Pi Zero 2 W, Allwinner H618 boards (Cortex-A53)
+        # The cpu field is consumed via the RUSTFLAGS env in the build step.
         include:
-          - name: ARM64 (Pi 3/4/5/Zero2W 64-bit)
+          - name: ARM64 a53 (Pi 3 / Pi Zero 2 W / Allwinner H618)
             target: aarch64-unknown-linux-gnu
+            cpu: cortex-a53
             linker: aarch64-linux-gnu-gcc
             gcc: gcc-aarch64-linux-gnu
-            artifact: sentryusb-linux-arm64
-            artifact_suffix: linux-arm64
+            artifact_suffix: linux-arm64-a53
+          - name: ARM64 a72 (Pi 4 / Radxa ROCK 4C+)
+            target: aarch64-unknown-linux-gnu
+            cpu: cortex-a72
+            linker: aarch64-linux-gnu-gcc
+            gcc: gcc-aarch64-linux-gnu
+            artifact_suffix: linux-arm64-a72
+          - name: ARM64 a76 (Pi 5)
+            target: aarch64-unknown-linux-gnu
+            cpu: cortex-a76
+            linker: aarch64-linux-gnu-gcc
+            gcc: gcc-aarch64-linux-gnu
+            artifact_suffix: linux-arm64-a76
           - name: ARMv7 (Pi 2/3/Zero2W 32-bit)
             target: armv7-unknown-linux-gnueabihf
+            cpu: cortex-a7
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
-            artifact: sentryusb-linux-armv7
             artifact_suffix: linux-armv7
           - name: ARMv6 (Pi Zero W/1)
             target: arm-unknown-linux-gnueabihf
+            cpu: ""
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
-            artifact: sentryusb-linux-armv6
             artifact_suffix: linux-armv6
     steps:
       - uses: actions/checkout@v6
@@ -63,7 +83,10 @@ jobs:
           # to the embedded frontend change. rust-embed's rerun-if-changed
           # is unreliable across cache restores, so any change that ends up
           # in crates/sentryusb/static must force a clean cargo rebuild.
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
+          # The cpu suffix is part of the key because aarch64-a53 /-a72 /-a76
+          # all share the same target triple but produce distinct binaries
+          # (different RUSTFLAGS), so they must NOT share a target/ dir.
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -102,7 +125,15 @@ jobs:
         run: cargo fetch --target ${{ matrix.target }}
 
       - name: Build release binaries (sentryusb + cttseraser + telemetry sampler)
+        # RUSTFLAGS overrides the per-target rustflags in .cargo/config.toml
+        # so each aarch64 matrix entry produces a binary tuned to its
+        # specific Cortex-A microarchitecture. armv6 has cpu="" → we skip
+        # the override and inherit whatever rustc's default is (no per-CPU
+        # tuning for armv6; one binary covers Pi Zero W and Pi 1).
         run: |
+          if [ -n "${{ matrix.cpu }}" ]; then
+              export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
+          fi
           cargo build --release --target ${{ matrix.target }} -p sentryusb
           cargo build --release --target ${{ matrix.target }} -p cttseraser
           cargo build --release --target ${{ matrix.target }} -p sentryusb-tesla-telemetry
@@ -112,20 +143,32 @@ jobs:
           CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binaries
+        # All three artifacts use the same `artifact_suffix` so the in-app
+        # updater (update.rs) and the picker script can fetch them via a
+        # predictable URL pattern: sentryusb-${suffix}, cttseraser-${suffix},
+        # sentryusb-tesla-telemetry-${suffix}.
+        #
+        # The a72 job ALSO uploads under the legacy unsuffixed name
+        # (sentryusb-linux-arm64 etc.) so pre-multi-binary installs whose
+        # in-app updater still asks for the old URL keep working — they get
+        # the a72-tuned binary, which runs correctly on every aarch64 Pi.
+        # The user opts into per-CPU tuning by re-running install-pi.sh.
         run: |
           mkdir -p release
-          cp target/${{ matrix.target }}/release/sentryusb release/${{ matrix.artifact }}
+          cp target/${{ matrix.target }}/release/sentryusb release/sentryusb-${{ matrix.artifact_suffix }}
           cp target/${{ matrix.target }}/release/cttseraser release/cttseraser-${{ matrix.artifact_suffix }}
-          # Telemetry sampler — uploaded with the same suffix scheme as the
-          # main binary so update.rs and migrate.rs can pull it by predictable
-          # URL alongside the main sentryusb download.
           cp target/${{ matrix.target }}/release/sentryusb-tesla-telemetry release/sentryusb-tesla-telemetry-${{ matrix.artifact_suffix }}
+          if [ "${{ matrix.artifact_suffix }}" = "linux-arm64-a72" ]; then
+              cp target/${{ matrix.target }}/release/sentryusb release/sentryusb-linux-arm64
+              cp target/${{ matrix.target }}/release/cttseraser release/cttseraser-linux-arm64
+              cp target/${{ matrix.target }}/release/sentryusb-tesla-telemetry release/sentryusb-tesla-telemetry-linux-arm64
+          fi
           ls -lh release/
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: ${{ matrix.artifact }}-bundle
+          name: sentryusb-${{ matrix.artifact_suffix }}-bundle
           path: release/*
 
   test:

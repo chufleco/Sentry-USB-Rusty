@@ -48,7 +48,10 @@ done
 
 if $BUILD_32BIT; then
     ARCH_LABEL="32-bit (armhf — Pi Zero W)"
-    BINARY_SUFFIX="linux-armv7"
+    # 32-bit: single binary; SUFFIXES list has one entry to keep the
+    # loop logic below uniform with the 64-bit path.
+    SUFFIXES=("linux-armv7")
+    CPUS=("cortex-a7")
     RUST_TARGET="armv7-unknown-linux-gnueabihf"
     # Tesla vehicle-command is Go; cross-compile targets map independently
     # from our Rust targets. GOARM=6 keeps the tesla binaries runnable on
@@ -58,7 +61,10 @@ if $BUILD_32BIT; then
     CONFIG_FILE="pi-gen-config-32bit"
 else
     ARCH_LABEL="64-bit (arm64 — Pi 3/4/5/Zero 2)"
-    BINARY_SUFFIX="linux-arm64"
+    # 64-bit: three per-CPU-tuned variants. The runtime picker selects
+    # the right one at every service start.
+    SUFFIXES=("linux-arm64-a53" "linux-arm64-a72" "linux-arm64-a76")
+    CPUS=("cortex-a53" "cortex-a72" "cortex-a76")
     RUST_TARGET="aarch64-unknown-linux-gnu"
     GO_ARCH="arm64"
     GO_ARM=""
@@ -70,47 +76,84 @@ info "Building $ARCH_LABEL image"
 # Check prerequisites
 command -v docker &>/dev/null || error "Docker is required. Install it first."
 
-# ── Step 1: Get the SentryUSB binary ──
-BINARY_PATH=""
+# ── Step 1: Get the SentryUSB binary variants ──
+#
+# Populates two parallel arrays:
+#   VARIANT_PATHS[i]  — local path to the sentryusb binary for SUFFIXES[i]
+#   CTTS_PATHS[i]     — local path to cttseraser for SUFFIXES[i] (optional)
+#   TELEMETRY_PATHS[i]— local path to telemetry sampler for SUFFIXES[i] (optional)
+# These get injected into pi-gen's stage_sentryusb/files/ in Step 4.
+VARIANT_PATHS=()
+CTTS_PATHS=()
+TELEMETRY_PATHS=()
+
 if [ -n "$LOCAL_BINARY" ]; then
-    BINARY_PATH="$LOCAL_BINARY"
-    info "Using local binary: $BINARY_PATH"
-else
-    info "Building binary from source..."
-    if command -v cross &>/dev/null && command -v node &>/dev/null; then
-        (
-            cd "$SCRIPT_DIR/web"
-            npm ci --no-audit --no-fund 2>&1 | tail -3
-            npm run build 2>&1 | tail -3
-            # Copy web build into the crate's embedded static/ directory
-            rm -rf "$SCRIPT_DIR/crates/sentryusb/static"
-            mkdir -p "$SCRIPT_DIR/crates/sentryusb/static"
-            cp -r dist/. "$SCRIPT_DIR/crates/sentryusb/static/"
-        )
+    # Local-binary mode: one binary on the CLI, stage it under all variants.
+    # The picker fallback chain handles boards that would prefer a more
+    # specific variant — they just fall back to whatever's actually there.
+    info "Using local binary: $LOCAL_BINARY (staged under all ${#SUFFIXES[@]} variant slot(s))"
+    for sfx in "${SUFFIXES[@]}"; do
+        VARIANT_PATHS+=("$LOCAL_BINARY")
+        # cttseraser/telemetry not derivable from a single arbitrary binary;
+        # they get fetched from releases below if available.
+    done
+elif command -v cross &>/dev/null && command -v node &>/dev/null; then
+    info "Building binaries from source (${#SUFFIXES[@]} variant(s))..."
+    (
+        cd "$SCRIPT_DIR/web"
+        npm ci --no-audit --no-fund 2>&1 | tail -3
+        npm run build 2>&1 | tail -3
+        rm -rf "$SCRIPT_DIR/crates/sentryusb/static"
+        mkdir -p "$SCRIPT_DIR/crates/sentryusb/static"
+        cp -r dist/. "$SCRIPT_DIR/crates/sentryusb/static/"
+    )
+    # Cross-compile once per CPU variant. RUSTFLAGS overrides the
+    # per-target-cpu setting in .cargo/config.toml; the target/ subdir
+    # used by cargo is keyed only by triple, so we move the output to a
+    # per-CPU stash to avoid clobbering between iterations.
+    for i in "${!SUFFIXES[@]}"; do
+        sfx="${SUFFIXES[$i]}"
+        cpu="${CPUS[$i]}"
+        info "  → building ${sfx} (target-cpu=${cpu})..."
         (
             cd "$SCRIPT_DIR"
-            cross build --release --target "$RUST_TARGET" -p sentryusb
-            cross build --release --target "$RUST_TARGET" -p cttseraser
-            cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry
+            cargo clean --release --target "$RUST_TARGET" -p sentryusb 2>/dev/null || true
+            cargo clean --release --target "$RUST_TARGET" -p cttseraser 2>/dev/null || true
+            cargo clean --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry 2>/dev/null || true
+            RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb
+            RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p cttseraser
+            RUSTFLAGS="-C target-cpu=${cpu}" cross build --release --target "$RUST_TARGET" -p sentryusb-tesla-telemetry
         )
-        BINARY_PATH="$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb"
-        CTTS_BINARY="$SCRIPT_DIR/target/$RUST_TARGET/release/cttseraser"
-        TELEMETRY_BINARY="$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-tesla-telemetry"
-        ok "Binary built: $BINARY_PATH"
-    else
-        info "cross/Node not available locally. Downloading from GitHub releases..."
-        BINARY_PATH="/tmp/sentryusb-$BINARY_SUFFIX"
-        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-$BINARY_SUFFIX" -o "$BINARY_PATH" \
-            || error "Failed to download binary. Build locally with:\n  cargo install cross\n  cd web && npm ci && npm run build\n  cross build --release --target $RUST_TARGET -p sentryusb"
-        CTTS_BINARY="/tmp/cttseraser-$BINARY_SUFFIX"
-        curl -fsSL "https://github.com/$REPO/releases/latest/download/cttseraser-$BINARY_SUFFIX" -o "$CTTS_BINARY" 2>/dev/null || true
-        TELEMETRY_BINARY="/tmp/sentryusb-tesla-telemetry-$BINARY_SUFFIX"
-        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-tesla-telemetry-$BINARY_SUFFIX" -o "$TELEMETRY_BINARY" 2>/dev/null || true
-        ok "Binary downloaded"
-    fi
+        STASH="/tmp/sentryusb-image-build/${sfx}"
+        mkdir -p "$STASH"
+        cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb" "$STASH/sentryusb"
+        cp "$SCRIPT_DIR/target/$RUST_TARGET/release/cttseraser" "$STASH/cttseraser"
+        cp "$SCRIPT_DIR/target/$RUST_TARGET/release/sentryusb-tesla-telemetry" "$STASH/sentryusb-tesla-telemetry"
+        VARIANT_PATHS+=("$STASH/sentryusb")
+        CTTS_PATHS+=("$STASH/cttseraser")
+        TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry")
+    done
+    ok "Built ${#SUFFIXES[@]} variant(s)"
+else
+    info "cross/Node not available locally. Downloading from GitHub releases..."
+    for sfx in "${SUFFIXES[@]}"; do
+        STASH="/tmp/sentryusb-image-build/${sfx}"
+        mkdir -p "$STASH"
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-$sfx" -o "$STASH/sentryusb" \
+            || error "Failed to download sentryusb-$sfx. Build locally with:\n  cargo install cross\n  cd web && npm ci && npm run build"
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/cttseraser-$sfx" -o "$STASH/cttseraser" 2>/dev/null || true
+        curl -fsSL "https://github.com/$REPO/releases/latest/download/sentryusb-tesla-telemetry-$sfx" -o "$STASH/sentryusb-tesla-telemetry" 2>/dev/null || true
+        VARIANT_PATHS+=("$STASH/sentryusb")
+        [ -s "$STASH/cttseraser" ] && CTTS_PATHS+=("$STASH/cttseraser") || CTTS_PATHS+=("")
+        [ -s "$STASH/sentryusb-tesla-telemetry" ] && TELEMETRY_PATHS+=("$STASH/sentryusb-tesla-telemetry") || TELEMETRY_PATHS+=("")
+    done
+    ok "Downloaded ${#SUFFIXES[@]} variant(s)"
 fi
 
-[ -f "$BINARY_PATH" ] || error "Binary not found at $BINARY_PATH"
+# Sanity: at least one main sentryusb binary must exist.
+for p in "${VARIANT_PATHS[@]}"; do
+    [ -f "$p" ] || error "Missing sentryusb variant at $p"
+done
 
 # ── Step 1b: Build tesla-control + tesla-keygen ────────────────────────
 # These binaries drive Tesla vehicles over BLE — they power the `awake_start`
@@ -162,21 +205,45 @@ bash "$SCRIPT_DIR/pi-gen-sources/prepare.sh"
 cp "$SCRIPT_DIR/pi-gen-sources/$CONFIG_FILE" "$WORK_DIR/config"
 
 # ── Step 4: Inject the pre-built binaries and BLE daemon ──
-info "Injecting SentryUSB binary into image build..."
-cp "$BINARY_PATH" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-binary"
-chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-binary"
+info "Injecting SentryUSB binary variants into image build..."
+STAGE_FILES="$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files"
+for i in "${!SUFFIXES[@]}"; do
+    sfx="${SUFFIXES[$i]}"
+    cp "${VARIANT_PATHS[$i]}" "$STAGE_FILES/sentryusb-${sfx}"
+    chmod +x "$STAGE_FILES/sentryusb-${sfx}"
+    info "  → staged sentryusb-${sfx}"
+done
 
-if [ -n "${CTTS_BINARY:-}" ] && [ -f "$CTTS_BINARY" ]; then
-    info "Injecting cttseraser FUSE binary..."
-    cp "$CTTS_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
-    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/cttseraser"
+# cttseraser and telemetry: one set per variant when available. For local-
+# binary mode (no per-variant cttseraser exists) the loop is skipped — the
+# image just won't have cttseraser, which is fine since it's the legacy
+# opt-in path anyway.
+if [ "${#CTTS_PATHS[@]}" -gt 0 ]; then
+    for i in "${!SUFFIXES[@]}"; do
+        sfx="${SUFFIXES[$i]}"
+        src="${CTTS_PATHS[$i]:-}"
+        if [ -n "$src" ] && [ -f "$src" ]; then
+            cp "$src" "$STAGE_FILES/cttseraser-${sfx}"
+            chmod +x "$STAGE_FILES/cttseraser-${sfx}"
+        fi
+    done
 fi
 
-if [ -n "${TELEMETRY_BINARY:-}" ] && [ -f "$TELEMETRY_BINARY" ]; then
-    info "Injecting Tesla BLE telemetry sampler binary..."
-    cp "$TELEMETRY_BINARY" "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-tesla-telemetry"
-    chmod +x "$WORK_DIR/stage_sentryusb/00-sentryusb-tweaks/files/sentryusb-tesla-telemetry"
+if [ "${#TELEMETRY_PATHS[@]}" -gt 0 ]; then
+    for i in "${!SUFFIXES[@]}"; do
+        sfx="${SUFFIXES[$i]}"
+        src="${TELEMETRY_PATHS[$i]:-}"
+        if [ -n "$src" ] && [ -f "$src" ]; then
+            cp "$src" "$STAGE_FILES/sentryusb-tesla-telemetry-${sfx}"
+            chmod +x "$STAGE_FILES/sentryusb-tesla-telemetry-${sfx}"
+        fi
+    done
 fi
+
+# Picker script: the runtime selector that decides which variant runs.
+cp "$SCRIPT_DIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" \
+    "$STAGE_FILES/sentryusb-pick-binary"
+chmod +x "$STAGE_FILES/sentryusb-pick-binary"
 
 if [ -n "$TESLA_CONTROL_PATH" ] && [ -f "$TESLA_CONTROL_PATH" ]; then
     info "Injecting tesla-control and tesla-keygen..."

@@ -62,60 +62,81 @@ if [ ! -L /sentryusb ]; then
 fi
 ok "/sentryusb -> $(readlink /sentryusb)"
 
-# ── Step 2: Install SentryUSB Binary ────────────────────────────────
+# ── Step 2: Install SentryUSB Binary(es) + Picker ──────────────────
+#
+# On aarch64 we stage three per-CPU-tuned variants (a53/a72/a76) so each
+# Pi runs code matched to its microarchitecture. The runtime picker
+# (sentryusb-pick-binary, installed below) symlinks the best one to
+# sentryusb-current at every service start.
+#
+# On armv7/armv6 there's no microarchitectural split — single variant.
+# Same picker handles all four cases via /proc/cpuinfo detection.
 
 mkdir -p "$INSTALL_DIR"
 
-if [ -n "${1:-}" ] && [ -f "${1:-}" ]; then
-    info "Installing binary from local path: $1"
-    cp "$1" "$INSTALL_DIR/$BINARY_NAME"
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
-    ok "Binary installed from $1"
+# Detect userspace arch first. The aarch64 case stages multiple binaries;
+# the others stage one. Same detection logic the picker uses at boot,
+# duplicated here only to decide which release files to download.
+if command -v dpkg >/dev/null 2>&1; then
+    DPKG_ARCH=$(dpkg --print-architecture)
+    case "$DPKG_ARCH" in
+        arm64)  ARCH_FAMILY="aarch64" ;;
+        armhf)  ARCH_FAMILY="armv7" ;;
+        armel)  ARCH_FAMILY="armv6" ;;
+        amd64)  ARCH_FAMILY="amd64" ;;
+        *)      error_exit "Unsupported userspace architecture: $DPKG_ARCH" ;;
+    esac
 else
-    info "Downloading latest SentryUSB binary from GitHub..."
+    case "$(uname -m)" in
+        aarch64) ARCH_FAMILY="aarch64" ;;
+        armv7l)  ARCH_FAMILY="armv7" ;;
+        armv6l)  ARCH_FAMILY="armv6" ;;
+        x86_64)  ARCH_FAMILY="amd64" ;;
+        *)       error_exit "Unsupported architecture: $(uname -m)" ;;
+    esac
+fi
 
-    # Detect *userspace* architecture, not kernel arch. On Pi OS, a 64-bit
-    # kernel can run with a 32-bit (armhf) userspace, in which case
-    # `uname -m` reports `aarch64` but our aarch64 binary won't load —
-    # the kernel returns ENOENT on exec because the dynamic linker
-    # /lib/ld-linux-aarch64.so.1 isn't installed. Trust dpkg first
-    # (always available on Debian-based Pi OS) and fall back to
-    # `uname -m` only when dpkg isn't there.
-    if command -v dpkg >/dev/null 2>&1; then
-        DPKG_ARCH=$(dpkg --print-architecture)
-        case "$DPKG_ARCH" in
-            arm64)  SUFFIX="linux-arm64" ;;
-            armhf)  SUFFIX="linux-armv7" ;;
-            armel)  SUFFIX="linux-armv6" ;;
-            amd64)  SUFFIX="linux-amd64" ;;
-            *)      error_exit "Unsupported userspace architecture: $DPKG_ARCH" ;;
-        esac
-    else
-        ARCH=$(uname -m)
-        case "$ARCH" in
-            aarch64) SUFFIX="linux-arm64" ;;
-            armv7l)  SUFFIX="linux-armv7" ;;
-            armv6l)  SUFFIX="linux-armv6" ;;
-            x86_64)  SUFFIX="linux-amd64" ;;
-            *)       error_exit "Unsupported architecture: $ARCH" ;;
-        esac
-    fi
+# Map the family → suffixes we need to download. aarch64 expands to three.
+case "$ARCH_FAMILY" in
+    aarch64) SUFFIXES="linux-arm64-a53 linux-arm64-a72 linux-arm64-a76" ;;
+    armv7)   SUFFIXES="linux-armv7" ;;
+    armv6)   SUFFIXES="linux-armv6" ;;
+    amd64)   SUFFIXES="linux-amd64" ;;
+esac
 
-    DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${SUFFIX}"
-    TMP="/tmp/${BINARY_NAME}-new"
+if [ -n "${1:-}" ] && [ -f "${1:-}" ]; then
+    # Local-binary mode — installer was invoked with a path to a binary on
+    # disk. Skip downloads and stage that one binary under all matching
+    # CPU suffixes so the picker always finds something. (This is a
+    # convenience for local dev builds; production installs use the
+    # download path below.)
+    info "Installing binary from local path: $1"
+    for sfx in $SUFFIXES; do
+        cp "$1" "$INSTALL_DIR/$BINARY_NAME-$sfx"
+        chmod +x "$INSTALL_DIR/$BINARY_NAME-$sfx"
+    done
+    ok "Local binary staged under $(echo $SUFFIXES | tr ' ' '\n' | wc -l) variant(s)"
+else
+    info "Downloading SentryUSB binary variants from GitHub..."
 
-    for attempt in $(seq 1 5); do
-        if curl -fsSL "$DOWNLOAD_URL" -o "$TMP" 2>/dev/null; then
-            chmod +x "$TMP"
-            mv "$TMP" "$INSTALL_DIR/$BINARY_NAME"
-            ok "Binary downloaded and installed"
-            break
+    for sfx in $SUFFIXES; do
+        DOWNLOAD_URL="https://github.com/${REPO}/releases/latest/download/${BINARY_NAME}-${sfx}"
+        TMP="/tmp/${BINARY_NAME}-${sfx}.new"
+        success=false
+        for attempt in $(seq 1 5); do
+            if curl -fsSL "$DOWNLOAD_URL" -o "$TMP" 2>/dev/null; then
+                chmod +x "$TMP"
+                mv "$TMP" "$INSTALL_DIR/$BINARY_NAME-$sfx"
+                ok "Downloaded $BINARY_NAME-$sfx"
+                success=true
+                break
+            fi
+            warn "Download of $sfx failed (attempt $attempt/5), retrying..."
+            sleep 3
+        done
+        if [ "$success" != true ]; then
+            error_exit "Failed to download $BINARY_NAME-$sfx after 5 attempts"
         fi
-        if [ "$attempt" -eq 5 ]; then
-            error_exit "Failed to download binary after 5 attempts"
-        fi
-        warn "Download failed (attempt $attempt/5), retrying..."
-        sleep 3
     done
 
     RELEASE_TAG=$(curl -fsSL --max-time 10 \
@@ -128,9 +149,31 @@ else
     fi
 fi
 
+# ── Picker script (selects the right binary at every service start) ──
+PICKER_URL="https://raw.githubusercontent.com/${REPO}/main/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary"
+PICKER_DST="/usr/local/bin/sentryusb-pick-binary"
+PICKER_LOCAL_FALLBACK="$(dirname "${1:-/dev/null}")/sentryusb-pick-binary"
+if [ -f "$PICKER_LOCAL_FALLBACK" ]; then
+    install -m 755 "$PICKER_LOCAL_FALLBACK" "$PICKER_DST"
+    ok "Picker installed from local path"
+elif curl -fsSL --max-time 10 "$PICKER_URL" -o "$PICKER_DST" 2>/dev/null; then
+    chmod +x "$PICKER_DST"
+    ok "Picker downloaded to $PICKER_DST"
+else
+    error_exit "Failed to install sentryusb-pick-binary — daemon won't start without it"
+fi
+
+# Run the picker once now so the -current symlink + active-variant file
+# exist before systemd tries to start the service.
+"$PICKER_DST" || error_exit "sentryusb-pick-binary failed on first run — check journalctl"
+
+# Back-compat symlink at the old path so any third-party tooling or shell
+# wrappers referencing /opt/sentryusb/sentryusb keep working.
+ln -sfn "$INSTALL_DIR/sentryusb-current" "$INSTALL_DIR/$BINARY_NAME"
+
 # Ensure binary is on PATH
 if [ ! -L /usr/local/bin/sentryusb ]; then
-    ln -sf "$INSTALL_DIR/$BINARY_NAME" /usr/local/bin/sentryusb
+    ln -sf "$INSTALL_DIR/sentryusb-current" /usr/local/bin/sentryusb
 fi
 
 # ── Step 3: Systemd Service ─────────────────────────────────────────
@@ -148,10 +191,18 @@ Conflicts=nginx.service
 Type=simple
 ExecStartPre=-/bin/systemctl stop nginx
 ExecStartPre=-/bin/systemctl disable nginx
-ExecStart=/opt/sentryusb/sentryusb --port 80
+# Re-pick the best per-CPU binary on every start so a hardware swap
+# (re-flashing the SD card into a different Pi) is handled automatically.
+ExecStartPre=/usr/local/bin/sentryusb-pick-binary
+ExecStart=/opt/sentryusb/sentryusb-current --port 80
 Restart=always
 RestartSec=5
 Environment=RUST_LOG=info
+# Cap glibc malloc arenas to 2. Default on multicore ARM is 8× nproc
+# arenas, each holding a fragmented heap fork that the kernel never
+# reclaims. Steady-state RSS on Pi-class hardware drops ~40-50% with
+# this cap, with no measurable throughput impact for our workload.
+Environment=MALLOC_ARENA_MAX=2
 StandardOutput=journal
 StandardError=journal
 
@@ -172,7 +223,11 @@ if [ -n "${1:-}" ] && [ -f "$(dirname "$1")/cttseraser" ]; then
     chmod +x "$CTTS_INSTALL"
     ok "cttseraser installed from local path"
 else
-    CTTS_URL="https://github.com/${REPO}/releases/latest/download/cttseraser-${SUFFIX}"
+    # cttseraser isn't perf-critical — any of the per-CPU variants works
+    # equally well, so pick the first one we downloaded above. (The list
+    # ordering is fixed by ARCH_FAMILY so this is deterministic.)
+    CTTS_SUFFIX=$(echo $SUFFIXES | awk '{print $1}')
+    CTTS_URL="https://github.com/${REPO}/releases/latest/download/cttseraser-${CTTS_SUFFIX}"
     if curl -fsSL "$CTTS_URL" -o "$CTTS_INSTALL" 2>/dev/null; then
         chmod +x "$CTTS_INSTALL"
         ok "cttseraser downloaded"
@@ -354,6 +409,6 @@ echo -e "  Open the web UI to complete setup via the wizard."
 echo -e "  All setup (partitions, drives, etc.) is handled by the binary."
 echo ""
 echo -e "  Config:  /root/sentryusb.conf"
-echo -e "  Binary:  ${INSTALL_DIR}/${BINARY_NAME}"
+echo -e "  Binary:  ${INSTALL_DIR}/sentryusb-current → $(readlink "${INSTALL_DIR}/sentryusb-current" 2>/dev/null || echo "<picker has not run yet>")"
 echo -e "  Logs:    journalctl -u sentryusb -f"
 echo ""

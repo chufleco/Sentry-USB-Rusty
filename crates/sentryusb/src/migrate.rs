@@ -263,26 +263,51 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
   systemctl enable sentryusb-telemetry 2>/dev/null || true
 
   if [ ! -x /root/bin/sentryusb-tesla-telemetry ]; then
-    # Match the suffix scheme update.rs uses. Mirror its userspace-arch
-    # detection (dpkg first, falling back to uname -m) so a 64-bit kernel
-    # with 32-bit userspace doesn't fetch an unloadable binary.
-    _arch=$(dpkg --print-architecture 2>/dev/null || true)
-    case "$_arch" in
-      arm64)  _suffix=linux-arm64 ;;
-      armhf)  _suffix=linux-armv7 ;;
-      armel)  _suffix=linux-armv6 ;;
-      amd64)  _suffix=linux-amd64 ;;
-      *)
-        _arch=$(uname -m 2>/dev/null || echo "")
-        case "$_arch" in
-          aarch64) _suffix=linux-arm64 ;;
-          armv7l)  _suffix=linux-armv7 ;;
-          armv6l)  _suffix=linux-armv6 ;;
-          x86_64)  _suffix=linux-amd64 ;;
-          *)       _suffix="" ;;
-        esac
-        ;;
-    esac
+    # Match the suffix scheme update.rs uses. Three-tier: active-variant
+    # file (written by sentryusb-pick-binary) → live CPU detection → arch
+    # family fallback. The aarch64 suffix is per-CPU (-a53/-a72/-a76) so
+    # the telemetry binary's tuning matches the main daemon's tuning.
+    _suffix=""
+    if [ -s /opt/sentryusb/active-variant ]; then
+      _suffix=$(cat /opt/sentryusb/active-variant 2>/dev/null | tr -d '[:space:]')
+    fi
+    if [ -z "$_suffix" ]; then
+      _arch=$(dpkg --print-architecture 2>/dev/null || true)
+      case "$_arch" in
+        armhf)  _suffix=linux-armv7 ;;
+        armel)  _suffix=linux-armv6 ;;
+        amd64)  _suffix=linux-amd64 ;;
+        arm64)
+          # Sub-detect for aarch64: HWCAP atomics → a76, CPU part 0xD08 → a72,
+          # else a53. Same rules as sentryusb-pick-binary.
+          if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+            _suffix=linux-arm64-a76
+          elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
+            _suffix=linux-arm64-a72
+          else
+            _suffix=linux-arm64-a53
+          fi
+          ;;
+        *)
+          _arch=$(uname -m 2>/dev/null || echo "")
+          case "$_arch" in
+            armv7l)  _suffix=linux-armv7 ;;
+            armv6l)  _suffix=linux-armv6 ;;
+            x86_64)  _suffix=linux-amd64 ;;
+            aarch64)
+              if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+                _suffix=linux-arm64-a76
+              elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
+                _suffix=linux-arm64-a72
+              else
+                _suffix=linux-arm64-a53
+              fi
+              ;;
+            *)       _suffix="" ;;
+          esac
+          ;;
+      esac
+    fi
     if [ -n "$_suffix" ]; then
       _tele_url="https://github.com/{repo}/releases/latest/download/sentryusb-tesla-telemetry-${{_suffix}}"
       if curl -sfI --max-time 10 "$_tele_url" >/dev/null 2>&1; then

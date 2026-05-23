@@ -69,6 +69,30 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
             hw.push(item("Power/throttling", "pass", None));
         }
     }
+    // ── Picked binary (multi-binary scheme) ──
+    //
+    // /opt/sentryusb/active-variant is written by sentryusb-pick-binary at
+    // every service start. Presence indicates the new multi-binary layout
+    // is active; the value identifies which per-CPU variant got picked.
+    // First place to look when triaging "why is my Pi 5 not getting LSE
+    // atomics" or "did my upgrade migrate to the new layout."
+    match std::fs::read_to_string("/opt/sentryusb/active-variant") {
+        Ok(s) => {
+            let variant = s.trim().to_string();
+            if variant.is_empty() {
+                hw.push(item("Binary variant", "warn", Some("active-variant file empty".to_string())));
+            } else {
+                hw.push(item("Binary variant", "pass", Some(variant)));
+            }
+        }
+        Err(_) => {
+            hw.push(item(
+                "Binary variant",
+                "warn",
+                Some("active-variant missing (single-binary layout — re-run install-pi.sh to migrate)".to_string()),
+            ));
+        }
+    }
     categories.push(HealthCategory { name: "Hardware".to_string(), items: hw });
 
     // ── Storage ───────────────────────────────────────────────────────────

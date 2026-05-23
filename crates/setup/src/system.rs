@@ -379,9 +379,14 @@ fn sed_delete_line_matching<F: Fn(&str) -> bool>(path: &str, pred: F) -> Result<
 }
 
 /// Install the sentryusb systemd service.
-pub fn install_systemd_service(binary_path: &str) -> Result<()> {
-    let service = format!(
-        r#"[Unit]
+///
+/// `binary_path` is accepted for backward compatibility with older callers
+/// but is no longer used directly — the multi-binary scheme stages
+/// per-CPU variants under /opt/sentryusb/ and lets the picker script
+/// (sentryusb-pick-binary) symlink the right one to sentryusb-current
+/// at every service start.
+pub fn install_systemd_service(_binary_path: &str) -> Result<()> {
+    let service = r#"[Unit]
 Description=SentryUSB web server
 After=network.target
 
@@ -389,7 +394,11 @@ After=network.target
 Type=simple
 Conflicts=nginx.service
 ExecStartPre=-/usr/bin/systemctl stop nginx
-ExecStart={binary_path} --port 80
+# Pick the best per-CPU binary for this Pi at every start. The script
+# atomically updates the sentryusb-current symlink; ExecStart launches
+# whatever it resolved to. Runs as a no-op cost on each start (~50ms).
+ExecStartPre=/usr/local/bin/sentryusb-pick-binary
+ExecStart=/opt/sentryusb/sentryusb-current --port 80
 Restart=always
 RestartSec=3
 Environment=RUST_LOG=info
@@ -401,8 +410,7 @@ Environment=MALLOC_ARENA_MAX=2
 
 [Install]
 WantedBy=multi-user.target
-"#
-    );
+"#;
 
     std::fs::write("/etc/systemd/system/sentryusb.service", service)?;
     Ok(())

@@ -1,21 +1,20 @@
-# Cross-compilation targets for Raspberry Pi
+# Cross-compilation targets for Raspberry Pi.
+#
+# Linker config is per-target here. The target-cpu tuning is a SAFE DEFAULT
+# for local dev cross-builds (cortex-a72 on aarch64 — runs everywhere from
+# Pi 3 through Pi 5; cortex-a7 on armv7 — runs on every Pi 2+). CI builds
+# the release matrix override these defaults via the RUSTFLAGS env var to
+# produce per-CPU-tuned variants (a53/a72/a76 for aarch64). The runtime
+# picker script (sentryusb-pick-binary) chooses the right variant at boot.
+#
+# DO NOT add target-feature flags here without auditing each enabled
+# feature for cross-SoC compatibility — the local-dev default must keep
+# running on every Pi in the supported set.
 
 [target.aarch64-unknown-linux-gnu]
 linker = "aarch64-linux-gnu-gcc"
-# Scheduler/pipeline tuning for Cortex-A72 (Pi 4 baseline). This is a
-# microarchitectural hint to LLVM, NOT an ISA-extension gate — no
-# A72-only instructions are emitted, so the resulting binary runs at
-# full speed on every aarch64 Pi (Cortex-A53 on Pi 3B+ and Zero 2 W,
-# A72 on Pi 4, A76 on Pi 5). DO NOT add `target-feature` flags here
-# without auditing each enabled feature for cross-SoC compatibility.
 rustflags = ["-C", "target-cpu=cortex-a72"]
 
 [target.armv7-unknown-linux-gnueabihf]
 linker = "arm-linux-gnueabihf-gcc"
-# Scheduler/pipeline tuning for Cortex-A7 (Pi 2, Pi 3 in 32-bit mode,
-# Pi Zero 2 W). Like the aarch64 case above, this is a tuning hint
-# only and does not gate on A7-specific ISA extensions. No armv6
-# (Pi Zero W / Pi 1) target exists in this repo — if one is ever
-# added, this rustflags line MUST be moved into a per-target block
-# so the armv6 build doesn't inherit A7 tuning.
 rustflags = ["-C", "target-cpu=cortex-a7"]
