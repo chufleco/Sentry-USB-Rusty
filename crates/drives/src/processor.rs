@@ -149,6 +149,11 @@ impl Processor {
             "total": total,
         }));
 
+        // Reused across iterations to avoid one String alloc per clip.
+        // Cap matches typical relative path lengths so most clips don't
+        // trigger a realloc inside the push loop.
+        let mut full_path = String::with_capacity(self.clip_dir.len() + 128);
+
         for (i, file) in unprocessed.iter().enumerate() {
             {
                 let mut status = self.status.lock().await;
@@ -156,9 +161,15 @@ impl Processor {
                 status.processed_files = i;
             }
 
-            // Extract GPS from the file.
-            let full_path = format!("{}/{}", self.clip_dir, file);
-            let date = file.split('/').next().unwrap_or("").to_string();
+            // Build the full path into the reused buffer.
+            full_path.clear();
+            full_path.push_str(&self.clip_dir);
+            full_path.push('/');
+            full_path.push_str(file);
+
+            // `add_route` accepts `date_dir: &str` — no need to materialize
+            // an owned String just to take a slice of it.
+            let date: &str = file.split('/').next().unwrap_or("");
             match extract::extract_gps_from_file(&full_path) {
                 Ok(gps) => {
                     if !gps.points.is_empty() {
@@ -169,7 +180,7 @@ impl Processor {
                     // transaction per clip — durable on return.
                     match self.store.add_route(
                         file,
-                        &date,
+                        date,
                         &gps.points,
                         &gps.gear_states,
                         &gps.autopilot_states,
