@@ -42,20 +42,38 @@ pub struct Sample {
     pub tire_fr_psi: Option<f64>,
     pub tire_rl_psi: Option<f64>,
     pub tire_rr_psi: Option<f64>,
+    /// Odometer in miles (Tesla native unit). Sampled every awake
+    /// cycle — ticks continuously while driving.
+    pub odometer_mi: Option<f64>,
+    /// Tesla OS version ("2026.2.9.10"). Only populated on cycles
+    /// that include the throttled software-update fetch (see
+    /// `sample_state`'s `include_software` flag).
+    pub software_version: Option<String>,
     pub source: String,
 }
 
 /// Full sample via `state climate` + `state charge`. Wakes the car
 /// briefly if it's asleep — only call when we already know the car
 /// is awake (recent clip writes).
-pub async fn sample_state(vin: &str) -> Result<Sample> {
+///
+/// `include_software` controls whether the (relatively expensive)
+/// software-update fetch runs this cycle. The OS version only
+/// changes on OTAs, so the main loop throttles this to ~15 min via
+/// `SOFTWARE_VERSION_INTERVAL`.
+pub async fn sample_state(vin: &str, include_software: bool) -> Result<Sample> {
     let climate = run_state(vin, "climate").await?;
     let charge = run_state(vin, "charge").await?;
-    // tire-pressure is best-effort: cars without TPMS, or the rare
-    // model that doesn't expose this category, return an error
-    // instead of populating fields. Don't let it fail the whole
-    // sample — just record None for the four tires.
+    // tire-pressure / drive / software-update are best-effort:
+    // cars or SDK versions that don't expose them return an error
+    // instead of populating fields. Don't let any of them fail the
+    // whole sample — just leave their fields as None.
     let tires = run_state(vin, "tire-pressure").await.ok();
+    let drive = run_state(vin, "drive").await.ok();
+    let software = if include_software {
+        run_state(vin, "software-update").await.ok()
+    } else {
+        None
+    };
     let now = now_secs();
     // NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
     // battery cell temperature. Both charge_state and climate_state
@@ -81,20 +99,41 @@ pub async fn sample_state(vin: &str) -> Result<Sample> {
             &climate,
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
-        // TPMS — Tesla emits these as `tpms_pressure_fl|fr|rl|rr` in
-        // PSI on cars that have TPMS. tires=None when the call failed.
+        // TPMS — Tesla emits `tpms_pressure_*` in BAR (matches the
+        // raw protobuf semantics and how teslamate / other open-source
+        // tools treat the value). Convert to PSI at sample time so
+        // every downstream consumer (DB column, API response, UI)
+        // sees the unit named on the field. A raw value of 3.0 bar
+        // becomes 43.5 PSI, matching what the Tesla app shows on US
+        // vehicles.
         tire_fl_psi: tires
             .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureFl", "tpms_pressure_fl"])),
+            .and_then(|t| pick_f64(t, &["tpmsPressureFl", "tpms_pressure_fl"]))
+            .map(bar_to_psi),
         tire_fr_psi: tires
             .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureFr", "tpms_pressure_fr"])),
+            .and_then(|t| pick_f64(t, &["tpmsPressureFr", "tpms_pressure_fr"]))
+            .map(bar_to_psi),
         tire_rl_psi: tires
             .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureRl", "tpms_pressure_rl"])),
+            .and_then(|t| pick_f64(t, &["tpmsPressureRl", "tpms_pressure_rl"]))
+            .map(bar_to_psi),
         tire_rr_psi: tires
             .as_ref()
-            .and_then(|t| pick_f64(t, &["tpmsPressureRr", "tpms_pressure_rr"])),
+            .and_then(|t| pick_f64(t, &["tpmsPressureRr", "tpms_pressure_rr"]))
+            .map(bar_to_psi),
+        // Odometer lives in drive_state.
+        odometer_mi: drive
+            .as_ref()
+            .and_then(|d| pick_f64(d, &["odometer", "odometerMi"])),
+        // Tesla OS version. Tesla exposes the *currently installed*
+        // version on different fields depending on SDK build —
+        // `carVersion` / `car_version` (top-level vehicle state) or
+        // `version` inside the software-update payload. Try the most
+        // likely names; degrade to None on unknown shapes.
+        software_version: software.as_ref().and_then(|s| {
+            pick_string(s, &["carVersion", "car_version", "version"])
+        }),
         source: "state".into(),
     })
 }
@@ -170,6 +209,33 @@ fn pick_bool(v: &Value, names: &[&str]) -> Option<bool> {
     None
 }
 
+/// String-flavored version of `pick_f64` — same top-level + one-level
+/// nested probe pattern.
+fn pick_string(v: &Value, names: &[&str]) -> Option<String> {
+    for name in names {
+        if let Some(s) = direct_string(v, name) {
+            return Some(s);
+        }
+    }
+    if let Value::Object(map) = v {
+        for child in map.values() {
+            for name in names {
+                if let Some(s) = direct_string(child, name) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn direct_string(v: &Value, name: &str) -> Option<String> {
+    match v.get(name)? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        _ => None,
+    }
+}
+
 fn direct_f64(v: &Value, name: &str) -> Option<f64> {
     match v.get(name)? {
         Value::Number(n) => n.as_f64(),
@@ -189,6 +255,12 @@ fn direct_bool(v: &Value, name: &str) -> Option<bool> {
         },
         _ => None,
     }
+}
+
+/// Bar → PSI. 1 bar = 14.5038 psi (NIST). Rounded to 1 decimal so
+/// the DB doesn't carry FP noise we can't observe at display time.
+fn bar_to_psi(bar: f64) -> f64 {
+    ((bar * 14.5038) * 10.0).round() / 10.0
 }
 
 fn now_secs() -> i64 {

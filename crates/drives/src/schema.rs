@@ -36,7 +36,26 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// per-drive rollup takes the latest across the drive's clips.
 /// All nullable — cars without TPMS or pre-TPMS-sampler drives
 /// simply stay NULL and the UI hides the row.
-pub const CURRENT_SCHEMA_VERSION: i32 = 7;
+///
+/// v7 -> v8: TPMS unit fix. v7 sampler stored raw `state
+/// tire-pressure` values as `tire_*_psi` but Tesla actually returns
+/// BAR — typical readings showed up as 3.0 instead of the expected
+/// ~43 PSI. v8 multiplies any historically-stored value < 5 by
+/// 14.5038 in both `telemetry_samples` and `routes`. The bound is
+/// safe because a real PSI reading can't be < 5 on a drivable tire,
+/// and a real bar reading can't be > 5 (would be ~73 PSI, double
+/// every spec).
+///
+/// v8 -> v9: add `odometer_mi` and `software_version` to
+/// `telemetry_samples`; add `odometer_mi_start` / `odometer_mi_end` /
+/// `software_version` to `routes`. Odometer is sampled every cycle
+/// (it ticks constantly while driving); software version is sampled
+/// at a 15-min throttle so we don't waste BLE air time on a field
+/// that changes once per OTA. The per-drive rollup uses
+/// `software_version` to map to a FSD release (via a hardcoded
+/// lookup) — but only displayed on drives where FSD was actually
+/// engaged at some point.
+pub const CURRENT_SCHEMA_VERSION: i32 = 9;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -198,6 +217,28 @@ pub const V7_ROUTE_TPMS_COLUMNS: &[(&str, &str)] = &[
     ("tire_rr_psi", "REAL"),
 ];
 
+/// v9 odometer + software_version on `telemetry_samples`.
+/// `odometer_mi` is Tesla's native unit. `software_version` is the
+/// Tesla OS version string (e.g. "2026.2.9.10"). The sampler only
+/// re-fetches software_version every ~15 min, so most sample rows
+/// will have it NULL — the per-route aggregator picks the latest
+/// non-null in each window.
+pub const V9_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
+    ("odometer_mi", "REAL"),
+    ("software_version", "TEXT"),
+];
+
+/// v9 rollups on `routes`. Odometer start/end let the UI show a
+/// per-trip mileage delta that's more accurate than GPS distance
+/// (GPS over-estimates curves, drops in tunnels, can drift).
+/// `software_version` rides through so the FSD-version mapping can
+/// happen at display time per drive.
+pub const V9_ROUTE_COLUMNS: &[(&str, &str)] = &[
+    ("odometer_mi_start", "REAL"),
+    ("odometer_mi_end", "REAL"),
+    ("software_version", "TEXT"),
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -223,6 +264,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
         .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
         .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+        .chain(V9_ROUTE_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -236,7 +278,10 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // tables. Fresh DBs land via V6_NEW_TABLES which doesn't include
     // them — caught here on the first migrate after the v7 bump.
     let existing_tele = list_telemetry_columns(conn)?;
-    for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS.iter() {
+    for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS
+        .iter()
+        .chain(V9_TELEMETRY_COLUMNS.iter())
+    {
         if existing_tele.contains(*name) {
             continue;
         }
@@ -277,6 +322,30 @@ pub fn migrate(conn: &Connection) -> Result<()> {
                 deleted_routes,
                 deleted_processed,
             );
+        }
+    }
+
+    // v7 -> v8: scrub TPMS values that were stored in BAR rather
+    // than PSI by the v7 sampler. Idempotent + gated on a stored
+    // version < 8 marker — if the column is already in PSI (>= 5)
+    // the WHERE clause matches nothing and the UPDATE is a no-op
+    // anyway, but the version gate keeps us from re-running on
+    // every open in steady state.
+    let stored_version_for_v8 = meta_get(conn, "schema_version")?;
+    let needs_v8_fix = matches!(
+        stored_version_for_v8.as_deref(),
+        Some(v) if stored_less_than(v, 8),
+    );
+    if needs_v8_fix {
+        let bar_to_psi_sql = |table: &str, col: &str| -> String {
+            format!(
+                "UPDATE {table} SET {col} = ROUND({col} * 14.5038, 1) \
+                 WHERE {col} IS NOT NULL AND {col} < 5"
+            )
+        };
+        for col in ["tire_fl_psi", "tire_fr_psi", "tire_rl_psi", "tire_rr_psi"] {
+            let _ = conn.execute(&bar_to_psi_sql("telemetry_samples", col), []);
+            let _ = conn.execute(&bar_to_psi_sql("routes", col), []);
         }
     }
 
@@ -386,7 +455,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7"),
+            Some("9"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -417,12 +486,13 @@ mod tests {
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -447,12 +517,13 @@ mod tests {
             .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -479,12 +550,13 @@ mod tests {
             .iter()
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -591,7 +663,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -642,7 +714,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -695,7 +767,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
     }
 
@@ -738,8 +810,74 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("7")
+            Some("9")
         );
+    }
+
+    #[test]
+    fn migrate_v8_converts_bar_tpms_to_psi() {
+        // Stand up a v7 DB with mixed-unit tpms values: some still in
+        // BAR (the bug — values < 5) and some that happen to be in
+        // PSI already. v8 should convert the bar values and leave
+        // the PSI ones alone.
+        let conn = open();
+        migrate(&conn).unwrap();
+        // Pretend the DB came from v7 by rolling the marker back.
+        meta_set(&conn, "schema_version", "7").unwrap();
+
+        // Bar (typical: 3.0 = 43.5 PSI) — should be converted.
+        conn.execute(
+            "INSERT INTO telemetry_samples \
+             (ts, source, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![1_700_000_000_i64, "state", 3.0_f64, 3.1_f64, 2.9_f64, 3.0_f64],
+        )
+        .unwrap();
+        // Already-correct PSI — should pass through untouched.
+        conn.execute(
+            "INSERT INTO telemetry_samples \
+             (ts, source, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![1_700_000_100_i64, "state", 42.0_f64, 43.0_f64, 41.5_f64, 42.5_f64],
+        )
+        .unwrap();
+        // Mixed NULL row — should stay all NULL.
+        conn.execute(
+            "INSERT INTO telemetry_samples (ts, source) VALUES (?1, ?2)",
+            params![1_700_000_200_i64, "body_controller"],
+        )
+        .unwrap();
+
+        migrate(&conn).unwrap();
+
+        let converted: f64 = conn
+            .query_row(
+                "SELECT tire_fl_psi FROM telemetry_samples WHERE ts = 1700000000",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            (converted - 43.5).abs() < 0.1,
+            "3.0 bar should become ~43.5 PSI, got {}",
+            converted,
+        );
+        let untouched: f64 = conn
+            .query_row(
+                "SELECT tire_fl_psi FROM telemetry_samples WHERE ts = 1700000100",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(untouched, 42.0, "already-PSI values must not be re-converted");
+        let null: Option<f64> = conn
+            .query_row(
+                "SELECT tire_fl_psi FROM telemetry_samples WHERE ts = 1700000200",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(null.is_none(), "null tire values must stay null");
     }
 
     #[test]

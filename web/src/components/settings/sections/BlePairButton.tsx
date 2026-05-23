@@ -54,6 +54,8 @@ interface BleLatestSample {
   tire_fr_psi?: number | null
   tire_rl_psi?: number | null
   tire_rr_psi?: number | null
+  odometer_mi?: number | null
+  software_version?: string | null
   source?: string
 }
 
@@ -643,11 +645,6 @@ export function BlePairButton() {
               {outputOpen ? "Hide output" : "Show output"}
             </button>
           )}
-        {bleState === "paired" && sampleCount10min > 0 && (
-          <span className="t-xs text-slate-500">
-            {sampleCount10min} sample{sampleCount10min === 1 ? "" : "s"} / 10m
-          </span>
-        )}
       </div>
 
       {outputOpen && (
@@ -734,26 +731,16 @@ function TelemetryOutputPanel({
 
       {hasSample && sample && (
         <div className="space-y-1.5">
-          <div className="flex items-baseline justify-between">
-            <span className="text-slate-500">Sample taken</span>
-            <span
-              className={cn(
-                "font-mono",
-                isStale ? "text-amber-400" : "text-slate-300",
-              )}
-            >
-              {sample.seconds_ago !== undefined
-                ? `${sample.seconds_ago}s ago`
-                : "-"}
-              <span className="ml-2 text-slate-600">
-                ({sample.source ?? "?"})
-              </span>
-            </span>
-          </div>
           <Row label="Battery" value={fmtPct(sample.battery_pct)} />
+          {sample.odometer_mi != null && (
+            <Row label="Odometer" value={fmtOdo(sample.odometer_mi, metric)} />
+          )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
           <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
+          {sample.software_version && (
+            <Row label="Tesla OS" value={sample.software_version} />
+          )}
           {/* Battery cell temperature intentionally omitted: Tesla
               doesn't expose it via state-query APIs (BLE or REST).
               Only battery_heater_on (a boolean) is available. */}
@@ -834,6 +821,16 @@ function fmtBool(v: boolean | null | undefined): string {
  *  read tire pressure in PSI even when other units are metric. */
 function fmtPsi(v: number | null | undefined): string {
   return v == null ? "—" : `${Math.round(v)} psi`
+}
+
+/** Odometer in miles (Tesla's native unit). When the user prefers
+ *  metric, convert at display time so the source-of-truth in the DB
+ *  stays single-unit. */
+function fmtOdo(v: number | null | undefined, metric: boolean): string {
+  if (v == null) return "—"
+  return metric
+    ? `${(v * 1.609344).toFixed(1)} km`
+    : `${v.toFixed(1)} mi`
 }
 
 /** Compact relative-time formatter for the live indicator. */

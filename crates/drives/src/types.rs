@@ -262,6 +262,25 @@ pub struct DriveSummary {
     pub tire_rl_psi: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tire_rr_psi: Option<f64>,
+    // v9 odometer + software/FSD version. Per-drive odometer delta
+    // is the more reliable "distance" number than GPS (no curve
+    // overestimation, no drift). FSD version is only emitted when
+    // the drive actually had FSD engaged AND we know what release
+    // the car was running.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odometer_mi_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odometer_mi_end: Option<f64>,
+    /// `end - start`, rounded to one decimal — UI convenience scalar.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odometer_mi_driven: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub software_version: Option<String>,
+    /// Mapped FSD release ("v14.3.2" / "?"). None unless the drive
+    /// had FSD engaged at some point; populated by the rollup using
+    /// `fsd_versions::fsd_version_for`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fsd_version: Option<String>,
     // Provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -441,6 +460,14 @@ pub struct RouteTelemetryAggregates {
     pub tire_fr_psi: Option<f64>,
     pub tire_rl_psi: Option<f64>,
     pub tire_rr_psi: Option<f64>,
+    /// v9 odometer (miles, Tesla native unit). First / last non-null
+    /// reading within the clip's window.
+    pub odometer_mi_start: Option<f64>,
+    pub odometer_mi_end: Option<f64>,
+    /// v9 Tesla OS version string ("2026.2.9.10"). Latest non-null
+    /// sample in the window — software_version is throttle-sampled
+    /// so most clip windows will have it NULL.
+    pub software_version: Option<String>,
 }
 
 /// BLOB-free row shape used by the summary endpoints. Carries the

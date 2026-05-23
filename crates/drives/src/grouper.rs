@@ -925,6 +925,11 @@ fn build_summary(
         tire_fr_psi: None,
         tire_rl_psi: None,
         tire_rr_psi: None,
+        odometer_mi_start: None,
+        odometer_mi_end: None,
+        odometer_mi_driven: None,
+        software_version: None,
+        fsd_version: None,
         // Default null source to "sei" so the JSON contract matches Go
         // (`hide_tessie_overlapping_sei` and the FSD analytics filter
         // both compare to the literal "sei" string).
@@ -2578,7 +2583,11 @@ fn build_summary_from_aggregates(
         );
 
     // ── v6 BLE telemetry rollup across this drive's unique clips ──
-    let telemetry = roll_up_telemetry(clips);
+    // `had_fsd` controls whether the FSD-version badge is emitted —
+    // we only want to claim a version on drives where FSD was
+    // actually engaged at some point during the trip.
+    let had_fsd = fsd_engaged_ms > 0.0;
+    let telemetry = roll_up_telemetry_with_fsd(clips, had_fsd);
 
     let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
     let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
@@ -2628,6 +2637,11 @@ fn build_summary_from_aggregates(
         tire_fr_psi: telemetry.tire_fr_psi,
         tire_rl_psi: telemetry.tire_rl_psi,
         tire_rr_psi: telemetry.tire_rr_psi,
+        odometer_mi_start: telemetry.odometer_mi_start,
+        odometer_mi_end: telemetry.odometer_mi_end,
+        odometer_mi_driven: telemetry.odometer_mi_driven,
+        software_version: telemetry.software_version,
+        fsd_version: telemetry.fsd_version,
         // Match Go: null/empty source becomes "sei".
         source: Some(
             first_clip
@@ -2670,9 +2684,22 @@ struct DriveTelemetryRollup {
     tire_fr_psi: Option<f64>,
     tire_rl_psi: Option<f64>,
     tire_rr_psi: Option<f64>,
+    /// v9 odometer + software/FSD.
+    odometer_mi_start: Option<f64>,
+    odometer_mi_end: Option<f64>,
+    odometer_mi_driven: Option<f64>,
+    software_version: Option<String>,
+    fsd_version: Option<String>,
 }
 
-fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
+/// Rolls per-clip telemetry into per-drive scalars. `had_fsd` (drive
+/// actually engaged FSD at some point) gates the FSD-version badge —
+/// the product requirement is to only claim an FSD release on
+/// drives that actually used FSD.
+fn roll_up_telemetry_with_fsd(
+    clips: &[SubClipSummary],
+    had_fsd: bool,
+) -> DriveTelemetryRollup {
     // Dedupe per parent file (same logic as the time-attributable
     // aggregates above) so a clip split into two sub-segments doesn't
     // get its telemetry counted twice.
@@ -2690,6 +2717,10 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
     let mut tire_fr: Option<f64> = None;
     let mut tire_rl: Option<f64> = None;
     let mut tire_rr: Option<f64> = None;
+    // Odometer: first non-null start, last non-null end.
+    let mut odo_start: Option<f64> = None;
+    let mut odo_end: Option<f64> = None;
+    let mut software_version: Option<String> = None;
 
     for clip in clips {
         if !seen.insert(clip.summary.file.as_str()) {
@@ -2720,6 +2751,15 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
         if t.tire_fr_psi.is_some() { tire_fr = t.tire_fr_psi; }
         if t.tire_rl_psi.is_some() { tire_rl = t.tire_rl_psi; }
         if t.tire_rr_psi.is_some() { tire_rr = t.tire_rr_psi; }
+        if odo_start.is_none() {
+            odo_start = t.odometer_mi_start;
+        }
+        if let Some(v) = t.odometer_mi_end {
+            odo_end = Some(v);
+        }
+        if let Some(v) = &t.software_version {
+            software_version = Some(v.clone());
+        }
     }
 
     let battery_pct_used = match (battery_pct_start, battery_pct_end) {
@@ -2743,6 +2783,28 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
         tire_fr_psi: tire_fr.map(round2),
         tire_rl_psi: tire_rl.map(round2),
         tire_rr_psi: tire_rr.map(round2),
+        odometer_mi_start: odo_start.map(round2),
+        odometer_mi_end: odo_end.map(round2),
+        odometer_mi_driven: match (odo_start, odo_end) {
+            (Some(s), Some(e)) if e >= s => Some(round2(e - s)),
+            _ => None,
+        },
+        // FSD version only when (a) we know the OS version and
+        // (b) the drive actually had FSD engaged at some point.
+        // Unknown OS version with FSD engaged → "?" (so the badge
+        // still appears so the user knows it was an FSD drive).
+        fsd_version: if had_fsd {
+            Some(
+                software_version
+                    .as_deref()
+                    .and_then(crate::fsd_versions::fsd_version_for)
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "?".to_string()),
+            )
+        } else {
+            None
+        },
+        software_version,
     }
 }
 
@@ -3309,7 +3371,7 @@ mod tests {
 
     #[test]
     fn rollup_empty_drive_returns_all_none() {
-        let r = roll_up_telemetry(&[]);
+        let r = roll_up_telemetry_with_fsd(&[], false);
         assert!(r.battery_pct_start.is_none());
         assert!(r.battery_pct_end.is_none());
         assert!(r.battery_pct_used.is_none());
@@ -3338,7 +3400,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry(&clips);
+        let r = roll_up_telemetry_with_fsd(&clips, false);
         assert_eq!(r.battery_pct_start, Some(80.0));
         assert_eq!(r.battery_pct_end, Some(78.0));
         assert_eq!(r.battery_pct_used, Some(2.0));
@@ -3363,7 +3425,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry(&clips);
+        let r = roll_up_telemetry_with_fsd(&clips, false);
         assert_eq!(r.interior_temp_min_c, Some(17.0));
         assert_eq!(r.interior_temp_max_c, Some(28.0));
     }
@@ -3387,7 +3449,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry(&clips);
+        let r = roll_up_telemetry_with_fsd(&clips, false);
         assert_eq!(r.hvac_runtime_s, Some(135));
     }
 
@@ -3413,7 +3475,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry(&clips);
+        let r = roll_up_telemetry_with_fsd(&clips, false);
         assert_eq!(r.battery_pct_start, Some(60.0));
         assert_eq!(r.battery_pct_end, Some(55.0));
         assert_eq!(r.battery_pct_used, Some(5.0));
@@ -3432,7 +3494,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
             SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
         ];
-        let r = roll_up_telemetry(&clips);
+        let r = roll_up_telemetry_with_fsd(&clips, false);
         assert_eq!(r.hvac_runtime_s, Some(30), "dedupe: hvac counted once, not twice");
         assert_eq!(r.battery_pct_start, Some(70.0));
         assert_eq!(r.battery_pct_end, Some(69.0));

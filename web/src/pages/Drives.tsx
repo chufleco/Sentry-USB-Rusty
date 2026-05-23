@@ -60,6 +60,15 @@ interface DriveSummary {
   tireFrPsi?: number
   tireRlPsi?: number
   tireRrPsi?: number
+  // v9 odometer + FSD version. odometerMiDriven is precomputed
+  // server-side (end - start, rounded). softwareVersion is the
+  // raw Tesla OS string; fsdVersion is the mapped FSD release and
+  // only appears on drives that actually had FSD engaged.
+  odometerMiStart?: number
+  odometerMiEnd?: number
+  odometerMiDriven?: number
+  softwareVersion?: string
+  fsdVersion?: string
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
@@ -157,6 +166,10 @@ function TelemetryStrip({ d, metric }: {
     tireFrPsi?: number
     tireRlPsi?: number
     tireRrPsi?: number
+    odometerMiStart?: number
+    odometerMiEnd?: number
+    odometerMiDriven?: number
+    fsdVersion?: string
   }
   metric: boolean
 }) {
@@ -172,11 +185,39 @@ function TelemetryStrip({ d, metric }: {
     d.interiorTempMaxC != null ||
     d.exteriorTempAvgC != null ||
     d.hvacRuntimeS != null ||
+    d.odometerMiDriven != null ||
+    d.fsdVersion != null ||
     hasTpms
   if (!hasAny) return null
 
   return (
     <div className="mt-1 flex flex-wrap gap-x-2.5 gap-y-0.5 text-[11px] text-slate-500">
+      {d.odometerMiDriven != null && d.odometerMiDriven > 0 && (
+        <span
+          className="inline-flex items-center gap-1"
+          title={
+            d.odometerMiStart != null && d.odometerMiEnd != null
+              ? metric
+                ? `${(d.odometerMiStart * 1.609344).toFixed(1)} → ${(d.odometerMiEnd * 1.609344).toFixed(1)} km`
+                : `${d.odometerMiStart.toFixed(1)} → ${d.odometerMiEnd.toFixed(1)} mi`
+              : undefined
+          }
+        >
+          <Gauge className="h-3 w-3 text-indigo-400/80" />
+          {metric
+            ? `${(d.odometerMiDriven * 1.609344).toFixed(1)} km odo`
+            : `${d.odometerMiDriven.toFixed(1)} mi odo`}
+        </span>
+      )}
+      {d.fsdVersion != null && (
+        <span
+          className="inline-flex items-center gap-1"
+          title={`FSD version active during this drive (${d.fsdVersion === "?" ? "Tesla OS version not in lookup table" : "from software_version mapping"})`}
+        >
+          <Zap className="h-3 w-3 text-emerald-400/80" />
+          FSD {d.fsdVersion}
+        </span>
+      )}
       {d.batteryPctUsed != null && d.batteryPctUsed > 0 && (
         <span
           className="inline-flex items-center gap-1"

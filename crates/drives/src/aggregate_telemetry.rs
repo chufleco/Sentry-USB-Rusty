@@ -135,6 +135,41 @@ pub fn compute_telemetry_for_window(
     let tire_rl_psi = latest_tire("tire_rl_psi")?;
     let tire_rr_psi = latest_tire("tire_rr_psi")?;
 
+    // Odometer: first / last non-null in the window. Together they
+    // give a per-clip mileage delta, which the per-drive rollup
+    // then chains across all clips for the trip's actual distance.
+    let odometer_mi_start: Option<f64> = conn
+        .query_row(
+            "SELECT odometer_mi FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 AND odometer_mi IS NOT NULL \
+             ORDER BY ts ASC LIMIT 1",
+            params![start_ts, end_ts],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let odometer_mi_end: Option<f64> = conn
+        .query_row(
+            "SELECT odometer_mi FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 AND odometer_mi IS NOT NULL \
+             ORDER BY ts DESC LIMIT 1",
+            params![start_ts, end_ts],
+            |r| r.get(0),
+        )
+        .optional()?;
+
+    // Software version: latest non-null in the window. Throttled
+    // sampling means most clips won't have it; the per-drive rollup
+    // takes the latest across the drive's clips.
+    let software_version: Option<String> = conn
+        .query_row(
+            "SELECT software_version FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 AND software_version IS NOT NULL \
+             ORDER BY ts DESC LIMIT 1",
+            params![start_ts, end_ts],
+            |r| r.get(0),
+        )
+        .optional()?;
+
     // hvac_runtime only meaningful when at least one sample populated
     // the hvac_on column. If every sample's hvac_on is NULL (the
     // body-controller-state sampler path doesn't fill it), leave the
@@ -163,6 +198,9 @@ pub fn compute_telemetry_for_window(
         tire_fr_psi,
         tire_rl_psi,
         tire_rr_psi,
+        odometer_mi_start,
+        odometer_mi_end,
+        software_version,
     })
 }
 
@@ -203,8 +241,11 @@ pub fn write_route_telemetry(
             tire_fl_psi       = ?7,
             tire_fr_psi       = ?8,
             tire_rl_psi       = ?9,
-            tire_rr_psi       = ?10
-         WHERE file = ?11",
+            tire_rr_psi       = ?10,
+            odometer_mi_start = ?11,
+            odometer_mi_end   = ?12,
+            software_version  = ?13
+         WHERE file = ?14",
         params![
             agg.battery_pct_start,
             agg.battery_pct_end,
@@ -216,6 +257,9 @@ pub fn write_route_telemetry(
             agg.tire_fr_psi,
             agg.tire_rl_psi,
             agg.tire_rr_psi,
+            agg.odometer_mi_start,
+            agg.odometer_mi_end,
+            agg.software_version,
             file,
         ],
     )?;

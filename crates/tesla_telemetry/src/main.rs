@@ -44,6 +44,13 @@ const AWAKE_INTERVAL: Duration = Duration::from_secs(15);
 /// Uses `body-controller-state` which doesn't wake the car.
 const ASLEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// Minimum gap between two `state software-update` fetches. The OS
+/// version only changes on OTAs, so every-cycle polling would waste
+/// BLE air time and force the car awake more often than needed. We
+/// re-check every 15 min so a drive that starts shortly after an OTA
+/// still gets the new version recorded.
+const SOFTWARE_VERSION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+
 /// Asleep-mode backoff for the first few attempts after the daemon
 /// starts (or after the state flips Awake → Asleep). Goal: give the
 /// user feedback within a minute of pairing without spamming the
@@ -89,6 +96,10 @@ async fn main() -> Result<()> {
     // after pairing or after the car goes to sleep are fast (30s, 60s,
     // 2m, 5m) before settling at the 15-min steady-state cadence.
     let mut asleep_attempts: usize = 0;
+    // Unix seconds of the last successful (or attempted) software
+    // version fetch. Drives the SOFTWARE_VERSION_INTERVAL throttle.
+    // 0 = never fetched, so the first awake sample includes it.
+    let mut last_software_check: i64 = 0;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -111,7 +122,7 @@ async fn main() -> Result<()> {
                 if held_radio { release_radio().await; }
                 return Ok(());
             }
-            sleep = tick(&conn, &mut held_radio, &mut asleep_attempts) => {
+            sleep = tick(&conn, &mut held_radio, &mut asleep_attempts, &mut last_software_check) => {
                 tokio::time::sleep(sleep).await;
             }
         }
@@ -126,6 +137,7 @@ async fn tick(
     conn: &Connection,
     held_radio: &mut bool,
     asleep_attempts: &mut usize,
+    last_software_check: &mut i64,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -183,8 +195,25 @@ async fn tick(
                 }
             }
 
-            match sample::sample_state(&cfg.vin).await {
-                Ok(s) => persist(conn, s),
+            // Throttle the software-update fetch: every cycle is
+            // wasteful (OS version only changes on OTAs), so only
+            // include it once per SOFTWARE_VERSION_INTERVAL.
+            let now_ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(0);
+            let include_software = now_ts - *last_software_check
+                >= SOFTWARE_VERSION_INTERVAL.as_secs() as i64;
+            match sample::sample_state(&cfg.vin, include_software).await {
+                Ok(s) => {
+                    if include_software {
+                        // Bump the gate even on a None result so we
+                        // don't retry the (possibly slow) call every
+                        // cycle when the car doesn't expose it.
+                        *last_software_check = now_ts;
+                    }
+                    persist(conn, s);
+                }
                 Err(e) => {
                     warn!("sample_state failed: {e}");
                     // Keep the radio — transient failure (car

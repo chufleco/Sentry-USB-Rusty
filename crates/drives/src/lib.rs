@@ -1,6 +1,7 @@
 pub mod aggregate;
 pub mod aggregate_telemetry;
 pub mod backfill;
+pub mod fsd_versions;
 pub mod blob;
 pub mod db;
 pub mod extract;

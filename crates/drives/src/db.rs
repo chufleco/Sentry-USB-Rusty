@@ -1382,7 +1382,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 battery_pct_start, battery_pct_end,
                 interior_temp_min, interior_temp_max, exterior_temp_avg,
                 hvac_runtime_s,
-                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi
+                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+                odometer_mi_start, odometer_mi_end, software_version
          FROM routes
          ORDER BY file",
     )?;
@@ -1429,6 +1430,12 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<f64>>(33)?,
                 row.get::<_, Option<f64>>(34)?,
             ),
+            // v9 odometer + software version
+            (
+                row.get::<_, Option<f64>>(35)?,
+                row.get::<_, Option<f64>>(36)?,
+                row.get::<_, Option<String>>(37)?,
+            ),
         ))
     })?;
 
@@ -1467,6 +1474,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             exterior_temp_avg,
             hvac_runtime_s,
             (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
+            (odometer_mi_start, odometer_mi_end, software_version),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -1512,6 +1520,9 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 tire_fr_psi,
                 tire_rl_psi,
                 tire_rr_psi,
+                odometer_mi_start,
+                odometer_mi_end,
+                software_version,
             },
         });
     }
