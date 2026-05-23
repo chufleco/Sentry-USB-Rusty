@@ -220,15 +220,33 @@ pub async fn send_to_all(
 /// notifications. Passes the extra context through to providers that
 /// can use it (currently just Sentry Connect); others ignore the extras
 /// and use title + message.
+/// Process-wide shared client for outbound notification dispatches.
+/// Built once on first send; reused for the lifetime of the process so
+/// we don't repeatedly stand up a fresh TLS pool + DNS cache + idle
+/// connection pool per sentry event.
+static NOTIFY_CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+
+fn notify_client() -> &'static reqwest::Client {
+    NOTIFY_CLIENT.get_or_init(|| {
+        // Panic-on-error rather than fall back to `Client::default()`: the
+        // default builder discards our 30s/10s timeouts, so a TLS init
+        // failure would silently produce a no-timeout client that can
+        // hang a tokio worker indefinitely on a misconfigured push
+        // endpoint. Failing loudly at first send surfaces the real
+        // problem instead of pretending notifications still work.
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest Client::build failed (TLS init?)")
+    })
+}
+
 pub async fn send_to_all_with_context(
     config: &NotifyConfig,
     req: &NotifyRequest<'_>,
 ) -> Vec<(String, Result<()>)> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .unwrap_or_default();
+    let client = notify_client();
 
     let title = req.title;
     let message = req.message;
