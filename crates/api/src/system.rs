@@ -246,21 +246,36 @@ pub async fn ble_status(
     (StatusCode::OK, Json(serde_json::json!({"status": "paired"})))
 }
 
-/// GET /api/system/speedtest — stream 64MB of random data for bandwidth testing
-pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
-    use axum::body::Body;
+/// GET /api/system/speedtest — stream 64MB of random data for bandwidth testing.
+///
+/// The 64 KB chunk is filled once at first request and reused for the
+/// lifetime of the process. Bandwidth tests don't need cryptographic
+/// uniqueness per byte — they just need network throughput pressure —
+/// so pre-filling eliminates ~8.2M `rand::random::<u64>()` calls per
+/// invocation (1000 chunks × 8192 random u64s) which were the actual
+/// bottleneck, not the allocation.
+static SPEEDTEST_CHUNK: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
-    let stream = tokio_stream::iter((0..1000).map(|_| {
+fn speedtest_chunk() -> &'static Vec<u8> {
+    SPEEDTEST_CHUNK.get_or_init(|| {
         let mut buf = vec![0u8; 65536];
-        // Fill with pseudo-random (doesn't need to be cryptographic)
         for chunk in buf.chunks_mut(8) {
             let val = rand::random::<u64>();
             let bytes = val.to_le_bytes();
             let len = chunk.len().min(8);
             chunk[..len].copy_from_slice(&bytes[..len]);
         }
-        Ok::<_, std::convert::Infallible>(buf)
-    }));
+        buf
+    })
+}
+
+pub async fn speedtest(State(_s): State<AppState>) -> impl IntoResponse {
+    use axum::body::Body;
+
+    let chunk = speedtest_chunk();
+    let stream = tokio_stream::iter(
+        (0..1000).map(move |_| Ok::<_, std::convert::Infallible>(chunk.clone()))
+    );
 
     (
         StatusCode::OK,

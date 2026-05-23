@@ -153,16 +153,29 @@ pub async fn get_status(
     }
 
     // WiFi info — skip shell queries when interface is down (saves 5-10s
-    // on ethernet-only systems where wlan0 exists but is unconfigured)
+    // on ethernet-only systems where wlan0 exists but is unconfigured).
+    // The four shell-outs run concurrently — they're independent reads,
+    // so serializing them is wasted wallclock on a slow Pi.
     let wifi_dev = find_net_device("wl*");
     if !wifi_dev.is_empty() && iface_is_up(&wifi_dev) {
-        if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r", &wifi_dev]).await {
+        // Bind arg arrays to lets so the temporaries outlive the join!.
+        let ssid_args = ["-r", wifi_dev.as_str()];
+        let freq_args = ["-r", "-f", wifi_dev.as_str()];
+        let iwc_args = [wifi_dev.as_str()];
+        let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
+        let (ssid_r, freq_r, iwc_r, ip_r) = tokio::join!(
+            sentryusb_shell::run("iwgetid", &ssid_args),
+            sentryusb_shell::run("iwgetid", &freq_args),
+            sentryusb_shell::run("iwconfig", &iwc_args),
+            sentryusb_shell::run("ip", &ip_args),
+        );
+        if let Ok(out) = ssid_r {
             s.wifi_ssid = out.trim().to_string();
         }
-        if let Ok(out) = sentryusb_shell::run("iwgetid", &["-r", "-f", &wifi_dev]).await {
+        if let Ok(out) = freq_r {
             s.wifi_freq = out.trim().to_string();
         }
-        if let Ok(out) = sentryusb_shell::run("iwconfig", &[&wifi_dev]).await {
+        if let Ok(out) = iwc_r {
             for line in out.lines() {
                 if let Some(after) = line.split("Link Quality=").nth(1) {
                     if let Some(qual) = after.split_whitespace().next() {
@@ -181,7 +194,7 @@ pub async fn get_status(
                 }
             }
         }
-        if let Ok(out) = sentryusb_shell::run("ip", &["-4", "addr", "show", &wifi_dev]).await {
+        if let Ok(out) = ip_r {
             for line in out.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("inet ") {
@@ -202,7 +215,14 @@ pub async fn get_status(
         eth_dev = find_net_device("en*");
     }
     if !eth_dev.is_empty() && iface_is_up(&eth_dev) {
-        if let Ok(out) = sentryusb_shell::run("ip", &["-4", "addr", "show", &eth_dev]).await {
+        // Same parallelization win as the WiFi block: independent reads.
+        let eth_ip_args = ["-4", "addr", "show", eth_dev.as_str()];
+        let eth_tool_args = [eth_dev.as_str()];
+        let (ip_r, ethtool_r) = tokio::join!(
+            sentryusb_shell::run("ip", &eth_ip_args),
+            sentryusb_shell::run("ethtool", &eth_tool_args),
+        );
+        if let Ok(out) = ip_r {
             for line in out.lines() {
                 let trimmed = line.trim();
                 if trimmed.starts_with("inet ") {
@@ -212,7 +232,7 @@ pub async fn get_status(
                 }
             }
         }
-        if let Ok(out) = sentryusb_shell::run("ethtool", &[&eth_dev]).await {
+        if let Ok(out) = ethtool_r {
             for line in out.lines() {
                 if line.contains("Speed:") {
                     if let Some(val) = line.split(':').nth(1) {
