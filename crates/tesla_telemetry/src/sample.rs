@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
+use tracing::{info, warn};
 
 const TESLA_CONTROL: &str = "/root/bin/tesla-control";
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
@@ -109,14 +110,59 @@ pub struct Sample {
 /// control doesn't expose as a state category, so there's no point
 /// burning BLE air time on it.
 pub async fn sample_state(vin: &str) -> Result<StateSample> {
-    let climate = run_state(vin, "climate").await?;
-    let charge = run_state(vin, "charge").await?;
-    // tire-pressure / drive are best-effort: cars or SDK versions
-    // that don't expose them return an error instead of populating
-    // fields. Don't let either fail the whole sample — just leave
-    // their fields as None.
-    let tires = run_state(vin, "tire-pressure").await.ok();
-    let drive = run_state(vin, "drive").await.ok();
+    // Time each subcommand so a single grep-able summary line tells
+    // us at a glance which call is failing (and why). The two
+    // best-effort calls (tire-pressure / drive) used to silently
+    // .ok() their errors, which made "TPMS shows but location/
+    // odometer are missing" symptoms invisible in logs. Each
+    // failure is now warned explicitly.
+    let (climate_res, climate_o) = run_state_timed(vin, "climate").await;
+    let (charge_res, charge_o) = run_state_timed(vin, "charge").await;
+    let (tires_res, tires_o) = run_state_timed(vin, "tire-pressure").await;
+    let (drive_res, drive_o) = run_state_timed(vin, "drive").await;
+
+    // One-line summary, grep `state-poll` in journalctl to see the
+    // outcome pattern over time. INFO so it shows at default log
+    // level (no RUST_LOG bump needed).
+    let total_ms = climate_o.elapsed_ms
+        + charge_o.elapsed_ms
+        + tires_o.elapsed_ms
+        + drive_o.elapsed_ms;
+    info!(
+        "state-poll: climate={} charge={} tires={} drive={} [total={}ms]",
+        climate_o.fmt_short(),
+        charge_o.fmt_short(),
+        tires_o.fmt_short(),
+        drive_o.fmt_short(),
+        total_ms,
+    );
+
+    // Per-failure detail with the raw error string. Lets us tell
+    // apart "context deadline exceeded" (BLE saturated — too many
+    // keys connected) from other failure modes like JSON parse
+    // errors or process-spawn failures.
+    for (label, outcome) in [
+        ("climate", &climate_o),
+        ("charge", &charge_o),
+        ("tire-pressure", &tires_o),
+        ("drive", &drive_o),
+    ] {
+        if let Some(err) = &outcome.error {
+            warn!(
+                "state-poll subcommand failed: {} ({}ms): {}",
+                label, outcome.elapsed_ms, err
+            );
+        }
+    }
+
+    // Required calls — climate + charge populate the bulk of the
+    // sample (battery, temps, HVAC). If either fails, bail.
+    let climate = climate_res?;
+    let charge = charge_res?;
+    // Best-effort: populate whatever subset succeeded. Errors were
+    // already warned above.
+    let tires = tires_res.ok();
+    let drive = drive_res.ok();
     let now = now_secs();
     // NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
     // battery cell temperature. Both charge_state and climate_state
@@ -219,7 +265,14 @@ pub async fn sample_state(vin: &str) -> Result<StateSample> {
 /// it can resume state polling without waiting for the next slow
 /// asleep-mode tick.
 pub async fn sample_body_controller(vin: &str) -> Result<BodyControllerSample> {
-    let out = run_tesla_control(vin, &["body-controller-state"]).await?;
+    let start = std::time::Instant::now();
+    let result = run_tesla_control(vin, &["body-controller-state"]).await;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
+    match &result {
+        Ok(_) => info!("body-controller poll: ok({}ms)", elapsed_ms),
+        Err(e) => warn!("body-controller poll: err({}ms): {:#}", elapsed_ms, e),
+    }
+    let out = result?;
     let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or(Value::Null);
     // user_presence enum names vary across SDK versions: try the
     // protobuf-mangled name first, then the snake-cased one. Values
@@ -251,6 +304,41 @@ async fn run_state(vin: &str, category: &str) -> Result<Value> {
     let out = run_tesla_control(vin, &["state", category]).await?;
     serde_json::from_str::<Value>(&out)
         .with_context(|| format!("failed to parse tesla-control state {} output", category))
+}
+
+/// Outcome of a single `run_state` call. Captures success/fail,
+/// wall-clock duration, and the raw error message so the
+/// `sample_state` caller can emit a one-line summary + per-failure
+/// detail line. Diagnostic-only — not persisted anywhere.
+struct InvocationOutcome {
+    elapsed_ms: u64,
+    error: Option<String>,
+}
+
+impl InvocationOutcome {
+    /// Short formatter used inside the summary line. Returns either
+    /// `ok(420ms)` or `err(15000ms)` — keeps the per-poll summary
+    /// readable when scanned in a journalctl pager.
+    fn fmt_short(&self) -> String {
+        if self.error.is_some() {
+            format!("err({}ms)", self.elapsed_ms)
+        } else {
+            format!("ok({}ms)", self.elapsed_ms)
+        }
+    }
+}
+
+/// Wraps `run_state` to capture timing + error text for the
+/// diagnostic summary. The Result is returned unchanged so existing
+/// success/failure handling paths are unaffected.
+async fn run_state_timed(vin: &str, category: &str) -> (Result<Value>, InvocationOutcome) {
+    let start = std::time::Instant::now();
+    let result = run_state(vin, category).await;
+    let outcome = InvocationOutcome {
+        elapsed_ms: start.elapsed().as_millis() as u64,
+        error: result.as_ref().err().map(|e| format!("{e:#}")),
+    };
+    (result, outcome)
 }
 
 async fn run_tesla_control(vin: &str, subcommand: &[&str]) -> Result<String> {

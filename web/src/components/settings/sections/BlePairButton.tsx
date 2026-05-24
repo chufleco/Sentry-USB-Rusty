@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react"
-import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff } from "lucide-react"
+import { Bluetooth, CheckCircle, AlertCircle, Loader2, Wifi, WifiOff, ChevronDown, ChevronUp, Eye, EyeOff, Stethoscope, Copy, Check } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { wsClient } from "@/lib/ws"
 import { PrefCard } from "@/components/settings/PrefCard"
@@ -41,6 +41,16 @@ interface BleConnectedResp {
   /** True when archiveloop reports phase=="archiving" — the most
    *  common reason `radio_owner === "keep_awake"`. */
   archiving: boolean
+}
+
+interface BleDiagnosticsResp {
+  /** Pre-filtered to the per-poll summary + per-subcommand failure
+   *  lines emitted by the sampler. */
+  lines: string[]
+  /** How many lines the journal returned before filtering — useful
+   *  for the "nothing to show" empty state ("journal has 200 lines
+   *  but none match the diagnostic patterns yet"). */
+  total_journal_lines: number
 }
 
 interface BleLatestSample {
@@ -88,6 +98,11 @@ export function BlePairButton() {
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
   const [sampleFetchedAt, setSampleFetchedAt] = useState<number>(0)
+  const [diagOpen, setDiagOpen] = useState(false)
+  const [diagLines, setDiagLines] = useState<string[]>([])
+  const [diagTotalLines, setDiagTotalLines] = useState(0)
+  const [diagLoading, setDiagLoading] = useState(false)
+  const [diagFetchedAt, setDiagFetchedAt] = useState<number>(0)
   const [vinRevealed, setVinRevealed] = useState(false)
   // Unit pref: mirrors Drives.tsx — DRIVE_MAP_UNIT=="km" → metric
   // (km + °C), else imperial (mi + °F). Default to imperial since
@@ -99,6 +114,7 @@ export function BlePairButton() {
   const connPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const tickRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const samplePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const diagPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
   // ---------------------------------------------------------------------------
   // Initial state load
@@ -290,6 +306,44 @@ export function BlePairButton() {
       samplePollRef.current = null
     }
   }, [outputOpen, fetchLatestSample])
+
+  // ---------------------------------------------------------------------------
+  // Diagnostics panel — polls journalctl-derived sampler logs while
+  // the panel is open. 10s cadence (vs the live sample's 5s) because
+  // each fetch shells out journalctl on the Pi which is heavier than
+  // a SQLite SELECT, and per-poll log lines arrive at most every 15s
+  // anyway during awake mode.
+  // ---------------------------------------------------------------------------
+  const fetchDiagnostics = useCallback(async () => {
+    setDiagLoading(true)
+    try {
+      const res = await fetch("/api/system/ble-diagnostics")
+      const d = (await res.json()) as BleDiagnosticsResp
+      setDiagLines(Array.isArray(d?.lines) ? d.lines : [])
+      setDiagTotalLines(d?.total_journal_lines ?? 0)
+      setDiagFetchedAt(Math.floor(Date.now() / 1000))
+    } catch {
+      /* leave previous value */
+    } finally {
+      setDiagLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    if (!diagOpen) {
+      if (diagPollRef.current) {
+        clearInterval(diagPollRef.current)
+        diagPollRef.current = null
+      }
+      return
+    }
+    fetchDiagnostics()
+    diagPollRef.current = setInterval(fetchDiagnostics, 10_000)
+    return () => {
+      if (diagPollRef.current) clearInterval(diagPollRef.current)
+      diagPollRef.current = null
+    }
+  }, [diagOpen, fetchDiagnostics])
 
   // ---------------------------------------------------------------------------
   // Helpers
@@ -645,6 +699,21 @@ export function BlePairButton() {
               {outputOpen ? "Hide output" : "Show output"}
             </button>
           )}
+        {/* Diagnostics — surfaces the sampler's per-poll outcome log
+            (which tesla-control subcommand succeeded / failed, with
+            timings + the raw error string). Always available once
+            paired so users can debug "samples stopped updating" or
+            "TPMS shows but location went stale" symptoms without
+            needing to SSH. */}
+        {bleState === "paired" && (
+          <button
+            onClick={() => setDiagOpen((v) => !v)}
+            className="inline-flex items-center gap-1 self-start rounded-lg bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
+          >
+            <Stethoscope className="h-3 w-3" />
+            {diagOpen ? "Hide diagnostics" : "Diagnostics"}
+          </button>
+        )}
       </div>
 
       {outputOpen && (
@@ -673,7 +742,108 @@ export function BlePairButton() {
           archiving={archiving}
         />
       )}
+
+      {diagOpen && (
+        <DiagnosticsPanel
+          lines={diagLines}
+          totalJournalLines={diagTotalLines}
+          loading={diagLoading}
+          fetchedSecondsAgo={
+            diagFetchedAt > 0 ? Math.max(0, nowTs - diagFetchedAt) : null
+          }
+          onRefresh={fetchDiagnostics}
+        />
+      )}
     </PrefCard>
+  )
+}
+
+/** Live tail of the sampler's diagnostic log lines pulled from
+ *  journalctl on the Pi. Auto-refreshes every 10s while open, with
+ *  a manual refresh button and "copy all" so the user can paste
+ *  failure runs into a bug report or back to support without
+ *  needing SSH access. */
+function DiagnosticsPanel({
+  lines,
+  totalJournalLines,
+  loading,
+  fetchedSecondsAgo,
+  onRefresh,
+}: {
+  lines: string[]
+  totalJournalLines: number
+  loading: boolean
+  fetchedSecondsAgo: number | null
+  onRefresh: () => void
+}) {
+  const [copied, setCopied] = useState(false)
+  const handleCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(lines.join("\n"))
+      setCopied(true)
+      setTimeout(() => setCopied(false), 1500)
+    } catch {
+      /* no clipboard permission — silently no-op */
+    }
+  }
+  // Reverse so the newest line is at the top — matches the
+  // "live tail" mental model and means the user sees fresh
+  // failures without scrolling.
+  const display = [...lines].reverse()
+
+  return (
+    <div className="rounded-lg border border-white/5 bg-black/30 p-3 text-xs">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2">
+          <Stethoscope className="h-3.5 w-3.5 text-blue-400" />
+          <span className="font-semibold text-slate-300">Sampler diagnostics</span>
+          <span className="text-[10px] text-slate-600">
+            {lines.length}/{totalJournalLines} lines
+          </span>
+        </div>
+        <div className="flex items-center gap-2">
+          {fetchedSecondsAgo !== null && (
+            <span className="text-[10px] text-slate-600">
+              refreshed {fetchedSecondsAgo}s ago
+            </span>
+          )}
+          <button
+            onClick={handleCopy}
+            disabled={lines.length === 0}
+            className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
+            title="Copy all visible lines to clipboard"
+          >
+            {copied ? <Check className="h-3 w-3 text-emerald-400" /> : <Copy className="h-3 w-3" />}
+            {copied ? "Copied" : "Copy"}
+          </button>
+          <button
+            onClick={onRefresh}
+            disabled={loading}
+            className="inline-flex items-center gap-1 rounded bg-white/5 px-2 py-0.5 text-[10px] text-slate-400 hover:bg-white/10 disabled:opacity-50"
+          >
+            {loading ? <Loader2 className="h-3 w-3 animate-spin" /> : null}
+            Refresh
+          </button>
+        </div>
+      </div>
+      <p className="mb-2 text-[10px] leading-relaxed text-slate-600">
+        Per-poll outcomes from the BLE sampler. Each <code className="text-slate-500">state-poll</code> line shows climate / charge / tires /
+        drive timing + success. Failure lines explain why a subcommand
+        timed out (e.g. <code className="text-slate-500">context deadline exceeded</code> usually means
+        too many phone keys connected to the car).
+      </p>
+      {lines.length === 0 ? (
+        <p className="rounded bg-white/[0.02] p-3 text-center text-[11px] text-slate-500">
+          {totalJournalLines === 0
+            ? "Journal is empty — has the sampler started yet?"
+            : "No diagnostic lines yet. Wait ~15s for the next poll."}
+        </p>
+      ) : (
+        <pre className="max-h-72 overflow-auto whitespace-pre rounded bg-black/40 p-2 text-[10px] leading-relaxed text-slate-300">
+          {display.join("\n")}
+        </pre>
+      )}
+    </div>
   )
 }
 

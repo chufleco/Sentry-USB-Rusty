@@ -394,6 +394,113 @@ pub async fn ble_latest_sample(
     }
 }
 
+/// GET /api/system/ble-diagnostics
+///
+/// Returns the last N lines from the telemetry sampler's systemd
+/// journal, filtered to the diagnostic lines emitted by `sample.rs`
+/// (`state-poll`, `body-controller poll`, `subcommand failed`).
+/// Used by the "Diagnostics" panel on the BLE pair card so the user
+/// can see which tesla-control subcommand is timing out without
+/// SSH-ing to the Pi.
+///
+/// Why journalctl rather than a custom log file: systemd is already
+/// capturing every line the daemon emits at INFO+ level, with
+/// rotation handled by journald's storage settings. Adding a second
+/// log destination would just duplicate that, and journald handles
+/// the rotation/size-cap concerns for us.
+pub async fn ble_diagnostics(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let output = tokio::task::spawn_blocking(|| {
+        std::process::Command::new("journalctl")
+            .args([
+                "-u",
+                "sentryusb-tesla-telemetry",
+                "-n",
+                "200",
+                "--no-pager",
+                "--output=short-iso",
+            ])
+            .output()
+    })
+    .await;
+
+    let raw = match output {
+        Ok(Ok(out)) if out.status.success() => {
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        }
+        Ok(Ok(out)) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "journalctl failed (exit {}): {}",
+                    out.status.code().unwrap_or(-1),
+                    String::from_utf8_lossy(&out.stderr)
+                ),
+            );
+        }
+        Ok(Err(e)) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to spawn journalctl: {e}"),
+            );
+        }
+        Err(e) => {
+            return crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("diagnostics task panicked: {e}"),
+            );
+        }
+    };
+
+    // Filter to the diagnostic lines we care about so the UI panel
+    // stays readable. Everything else (startup messages, periodic
+    // info chatter) is still in the journal if needed via SSH.
+    //
+    // Patterns chosen to cover the four classes of "why isn't the
+    // sampler updating" that come up in practice:
+    //   1. Subcommand-level: `state-poll`, `body-controller poll`,
+    //      `subcommand failed` — per-tesla-control invocation
+    //      timing + error text.
+    //   2. Sample-level: `sample_state failed`,
+    //      `sample_body_controller failed` — both subcommands
+    //      succeeded but the whole sample didn't persist.
+    //   3. Radio coordination: `radio held by` (keep_awake won the
+    //      lock), `failed to acquire radio lock`,
+    //      `failed to release radio lock` — these explain "values
+    //      are Xs old" gaps that aren't tesla-control's fault.
+    //   4. Lifecycle: phase transitions, presence flips, config
+    //      reloads, DB insert failures.
+    let lines: Vec<&str> = raw
+        .lines()
+        .filter(|l| {
+            l.contains("state-poll")
+                || l.contains("body-controller poll")
+                || l.contains("subcommand failed")
+                || l.contains("sample_state failed")
+                || l.contains("sample_body_controller failed")
+                || l.contains("state drive probe")
+                || l.contains("dropping to body-controller polling")
+                || l.contains("resuming full state polls")
+                || l.contains("radio held by")
+                || l.contains("failed to acquire radio lock")
+                || l.contains("failed to release radio lock")
+                || l.contains("failed to insert telemetry sample")
+                || l.contains("failed to load BLE config")
+                || l.contains("BLE disabled in settings")
+                || l.contains("user_presence flipped")
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "lines": lines,
+            "total_journal_lines": raw.lines().count(),
+        })),
+    )
+}
+
 /// POST /api/system/ble-install
 ///
 /// Idempotent lazy install of `tesla-control` and `tesla-keygen`,

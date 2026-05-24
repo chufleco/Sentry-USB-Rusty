@@ -209,7 +209,16 @@ async fn tick(
                     true
                 }
                 Ok(false) => {
-                    debug!("radio contended during quiet poll, skipping");
+                    // Bumped to info — this is one of the main
+                    // reasons quiet-mode samples go missing (archiveloop's
+                    // keep_awake holds the radio during archive cycles).
+                    // Surfacing it in the diagnostics panel lets the
+                    // user tell "sampler is broken" from "sampler is
+                    // politely waiting its turn".
+                    info!(
+                        "radio held by {:?} during quiet poll, skipping",
+                        lock::current_owner()
+                    );
                     false
                 }
                 Err(e) => {
@@ -300,9 +309,13 @@ async fn tick(
                     stop_ios_gatt().await;
                 }
                 Ok(false) => {
-                    debug!(
-                        "radio held by {:?}, backing off",
-                        lock::current_owner()
+                    // Bumped to info so the diagnostics panel shows
+                    // this — silent backoff used to look identical
+                    // to "sampler is dead" from the UI.
+                    info!(
+                        "radio held by {:?}, backing off {}s",
+                        lock::current_owner(),
+                        RADIO_CONTENDED_BACKOFF.as_secs()
                     );
                     return RADIO_CONTENDED_BACKOFF;
                 }
