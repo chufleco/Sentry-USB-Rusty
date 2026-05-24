@@ -15,6 +15,43 @@ if [ -d "$SENTRY_USB_DIR/web" ] && [ -f "$SENTRY_USB_DIR/web/package.json" ]; th
     cp -r "$SENTRY_USB_DIR/web/dist/"* crates/sentryusb/static/
 fi
 
+# Pre-compress static assets so embed.rs can serve raw .br / .gz bytes
+# without burning per-request CPU on the Pi Zero 2W. Skips already-
+# compressed formats (woff2, png, jpg, ico). Brotli is optional —
+# without it the server falls back to gzip, and without gzip it falls
+# back to identity + the tower-http CompressionLayer.
+if [ -d crates/sentryusb/static ]; then
+    HAS_BROTLI=0
+    if command -v brotli >/dev/null 2>&1; then
+        HAS_BROTLI=1
+    else
+        echo "Note: 'brotli' not found — skipping .br precompression."
+        echo "      Install with: apt install brotli  (or)  brew install brotli"
+    fi
+
+    echo "Pre-compressing static assets..."
+    COUNT=0
+    while IFS= read -r -d '' f; do
+        # Skip if the file is already a compressed sibling or already-
+        # compressed binary format. Anything passing this filter is
+        # text/SVG/JSON/JS/CSS/HTML.
+        case "$f" in
+            *.br|*.gz|*.woff2|*.png|*.jpg|*.jpeg|*.webp|*.ico|*.gif|*.mp4|*.mp3|*.zip) continue ;;
+        esac
+        # Only worth compressing files above ~1 KB. Smaller files have
+        # no compression win and just clutter the binary.
+        SIZE=$(wc -c < "$f")
+        if [ "$SIZE" -lt 1024 ]; then continue; fi
+
+        gzip -9 -k -f "$f"
+        if [ "$HAS_BROTLI" -eq 1 ]; then
+            brotli -q 11 --keep --force "$f"
+        fi
+        COUNT=$((COUNT + 1))
+    done < <(find crates/sentryusb/static -type f -print0)
+    echo "  compressed $COUNT files"
+fi
+
 TARGET="${1:-arm64}"
 
 case "$TARGET" in

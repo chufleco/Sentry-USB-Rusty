@@ -70,7 +70,7 @@ jobs:
       - name: Install cross-compilation tools
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ${{ matrix.gcc }}
+          sudo apt-get install -y -qq ${{ matrix.gcc }} brotli
 
       - name: Cache cargo registry
         uses: actions/cache@v5
@@ -86,7 +86,7 @@ jobs:
           # The cpu suffix is part of the key because aarch64-a53 /-a72 /-a76
           # all share the same target triple but produce distinct binaries
           # (different RUSTFLAGS), so they must NOT share a target/ dir.
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
+          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -116,7 +116,23 @@ jobs:
             echo "::error::crates/sentryusb/static is empty or missing assets after copy"
             exit 1
           fi
-          echo "Frontend rebuilt; embedded $(ls crates/sentryusb/static/assets | wc -l) asset(s)"
+          # Pre-compress text-like assets so embed.rs can serve raw .br /
+          # .gz bytes without burning per-request CPU on the Pi Zero 2W.
+          # Skips already-compressed formats (woff2, png, jpg, ico) and
+          # files under 1 KB where compression isn't worth the binary
+          # bloat.
+          PRECOMP=0
+          while IFS= read -r -d '' f; do
+            case "$f" in
+              *.br|*.gz|*.woff2|*.png|*.jpg|*.jpeg|*.webp|*.ico|*.gif|*.mp4|*.mp3|*.zip) continue ;;
+            esac
+            SIZE=$(wc -c < "$f")
+            if [ "$SIZE" -lt 1024 ]; then continue; fi
+            gzip -9 -k -f "$f"
+            brotli -q 11 --keep --force "$f"
+            PRECOMP=$((PRECOMP + 1))
+          done < <(find crates/sentryusb/static -type f -print0)
+          echo "Frontend rebuilt; embedded $(ls crates/sentryusb/static/assets | wc -l) asset(s); pre-compressed $PRECOMP file(s)"
 
       - name: Validate Cargo.lock
         # cargo fetch resolves the lockfile against Cargo.toml and exits
