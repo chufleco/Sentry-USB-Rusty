@@ -33,6 +33,7 @@ import { DualPinBlock } from "@/components/drives/DualPinBlock"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
 import type { TemperaturePoint } from "@/components/drives/TemperatureChart"
+import type { BatteryPoint } from "@/components/drives/DriveMap"
 
 const DriveChart = lazy(() => import("@/components/drives/DriveChart"))
 const TemperatureChart = lazy(
@@ -106,6 +107,30 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   const [showFsdEvents, setShowFsdEvents] = useState(true)
   const hasFsdEvents = (drive.fsdEvents ?? []).length > 0
 
+  // Per-sample battery time-series for the playback info card on the
+  // map. Sourced from /api/drives/{id}/battery-series — the BLE
+  // sampler polls every 60s, so a typical drive has dozens of samples.
+  // DriveMap looks up the most recent sample at or before the current
+  // scrubber's wall-clock time on every tick; that's a step function,
+  // not interpolation, because battery moves in discrete 1% increments.
+  // Empty array (or skipped fetch) → card omits the battery row.
+  const [batterySeries, setBatterySeries] = useState<BatteryPoint[]>([])
+  useEffect(() => {
+    let cancelled = false
+    fetch(`/api/drives/${drive.id}/battery-series`)
+      .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
+      .then((data: { points?: BatteryPoint[] }) => {
+        if (cancelled) return
+        setBatterySeries(Array.isArray(data.points) ? data.points : [])
+      })
+      .catch(() => {
+        if (!cancelled) setBatterySeries([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [drive.id])
+
   useEffect(() => {
     setTotal(drive.points.length)
   }, [drive.points.length, setTotal])
@@ -170,8 +195,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             source={drive.source}
             startTime={drive.startTime}
             metric={metric}
-            batteryStart={drive.batteryPctStart}
-            batteryEnd={drive.batteryPctEnd}
+            batterySeries={batterySeries}
           />
           {/* Drive tag chip floats over the bottom-left of the map.
               Click to open the popover; when no tags, shows just a

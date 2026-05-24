@@ -18,13 +18,19 @@ interface DriveMapProps {
   // True when the user's DRIVE_MAP_UNIT === "km". Controls the speed
   // unit displayed in the playback card.
   metric?: boolean
-  // Battery percentage at the drive's start / end (drive-level fields
-  // from telemetry aggregation — we don't have per-point battery).
-  // When both are present, the playback card shows a linearly
-  // interpolated battery % at the current scrubber index. When either
-  // is missing, the battery row is omitted from the card.
-  batteryStart?: number
-  batteryEnd?: number
+  // Per-sample battery time-series from
+  // GET /api/drives/{id}/battery-series. The BLE telemetry sampler
+  // polls every 60s in Active mode, so a 30-min drive has ~30 samples.
+  // For each scrubber tick we look up the most recent sample at or
+  // before the current point's wall-clock time — battery changes in
+  // discrete steps, not smoothly, so step-lookup beats interpolation.
+  // Omit the prop (or pass an empty array) to skip the battery row.
+  batterySeries?: BatteryPoint[]
+}
+
+export interface BatteryPoint {
+  ts: number      // unix ms
+  batteryPct?: number
 }
 
 const TILES = {
@@ -158,20 +164,30 @@ function renderPlaybackHTML(
   )
 }
 
-// Linear interpolation between drive-start and drive-end battery
-// percent based on the scrubber's progress through the route. Returns
-// undefined when either end is missing so the caller can omit the
-// battery row from the tooltip rather than show "—%".
-function interpolateBattery(
-  start: number | undefined,
-  end: number | undefined,
-  idx: number,
-  total: number,
+// Step-lookup of the most recent battery sample at or before
+// `currentMs`. Battery changes in 1% steps and the sampler runs
+// at 60s cadence — linear interpolation would invent values
+// between samples, so we use the latest sample as the canonical
+// reading at the scrubber's wall-clock time. Falls back to the
+// first sample when the scrubber is before any sample (so the card
+// always shows something once the series has loaded). Returns
+// undefined when the series is empty or the value is NULL.
+function lookupBatteryAt(
+  series: BatteryPoint[] | undefined,
+  currentMs: number,
 ): number | undefined {
-  if (start === undefined || end === undefined) return undefined
-  if (total <= 1) return start
-  const t = Math.max(0, Math.min(1, idx / (total - 1)))
-  return start + (end - start) * t
+  if (!series || series.length === 0) return undefined
+  // Series is ASC-ordered by ts (the backend's ORDER BY ts ASC).
+  // Walk backwards to find the latest sample with ts <= currentMs.
+  // A binary search would be theoretically nicer; for ~30 samples
+  // on a typical drive the linear scan is cheaper than the branch.
+  for (let i = series.length - 1; i >= 0; i--) {
+    if (series[i].ts <= currentMs) return series[i].batteryPct
+  }
+  // currentMs is before every sample (e.g. scrubber at frame 0,
+  // first sample arrived a few seconds in). Show the earliest
+  // reading rather than nothing — battery doesn't jump in 60s.
+  return series[0].batteryPct
 }
 
 export function DriveMap({
@@ -182,8 +198,7 @@ export function DriveMap({
   source,
   startTime,
   metric = false,
-  batteryStart,
-  batteryEnd,
+  batterySeries,
 }: DriveMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
@@ -270,12 +285,8 @@ export function DriveMap({
     // card sits beside the pulse rather than covering it; Leaflet
     // auto-flips when it would go off the map edge.
     const baseMs = startTime ? new Date(startTime).getTime() : NaN
-    const initialBattery = interpolateBattery(
-      batteryStart,
-      batteryEnd,
-      0,
-      points.length,
-    )
+    const firstPointMs = Number.isFinite(baseMs) ? baseMs + points[0][2] : NaN
+    const initialBattery = lookupBatteryAt(batterySeries, firstPointMs)
     const initialHtml = renderPlaybackHTML(
       points[0],
       fsdStates?.[0],
@@ -340,12 +351,8 @@ export function DriveMap({
     const tooltip = pulse.getTooltip()
     if (tooltip) {
       const baseMs = startTime ? new Date(startTime).getTime() : NaN
-      const battery = interpolateBattery(
-        batteryStart,
-        batteryEnd,
-        i,
-        points.length,
-      )
+      const pointMs = Number.isFinite(baseMs) ? baseMs + points[i][2] : NaN
+      const battery = lookupBatteryAt(batterySeries, pointMs)
       tooltip.setContent(
         renderPlaybackHTML(
           points[i],
@@ -356,7 +363,7 @@ export function DriveMap({
         ),
       )
     }
-  }, [currentIndex, points, fsdStates, startTime, metric, batteryStart, batteryEnd])
+  }, [currentIndex, points, fsdStates, startTime, metric, batterySeries])
 
   const cycleStyle = () => {
     setStyle((s) => (s === "dark" ? "streets" : s === "streets" ? "satellite" : "dark"))
