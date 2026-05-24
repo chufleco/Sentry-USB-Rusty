@@ -221,6 +221,19 @@ async fn main() -> Result<()> {
 
     info!("sentryusb-tesla-telemetry starting");
 
+    // Don't start polling until the system clock looks sane. Without
+    // an RTC battery (most stock Pi setups), the clock can be years
+    // off until systemd-timesyncd contacts an NTP server. Samples
+    // written with bogus timestamps would never match the drive
+    // window (which uses Tesla's correct clip-filename timestamps),
+    // so they'd be stranded in the DB.
+    //
+    // We wait up to 5 minutes for the clock to sync; after that we
+    // start sampling anyway and just accept the risk. The clock
+    // status is also surfaced via `/api/system/clock-status` so the
+    // settings UI can warn the user when sampling is paused.
+    wait_for_clock_sync(Duration::from_secs(300)).await;
+
     let conn = db::open()?;
     let mut held_radio = false;
     // Counts consecutive state polls showing shift_state = Park.
@@ -718,6 +731,78 @@ async fn tick(
             Duration::from_millis(100)
         }
     }
+}
+
+/// Block until the system clock looks plausibly correct, or `timeout`
+/// elapses. "Plausible" = year >= 2025 (anything later than the time
+/// this code was written) OR systemd-timesyncd has set its
+/// "synchronized" marker file. Either condition is sufficient — RTC
+/// users will satisfy the first check immediately on boot.
+///
+/// Why this matters: without an RTC battery, the Pi's clock can be
+/// years off after a cold boot until WiFi reaches an NTP server.
+/// Samples written with bad timestamps are unrecoverable — they fall
+/// outside any real drive window when the aggregator runs later.
+/// So we just don't sample until the clock is sane. Best-effort:
+/// times out after 5 min so we don't block forever in pathological
+/// no-WiFi setups.
+async fn wait_for_clock_sync(timeout: Duration) {
+    if clock_is_sane() {
+        debug!("clock looks sane on startup; no wait needed");
+        return;
+    }
+    info!(
+        "system clock is not synced yet — pausing sampler until \
+         NTP catches up (max {}s). Install an RTC battery on the \
+         Pi's BAT pin to avoid this on subsequent boots.",
+        timeout.as_secs()
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let mut last_log = std::time::Instant::now();
+    let log_every = Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        if clock_is_sane() {
+            info!("system clock is now synced; resuming sampler");
+            return;
+        }
+        if last_log.elapsed() >= log_every {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            info!(
+                "still waiting for clock sync ({}s remaining)",
+                remaining.as_secs()
+            );
+            last_log = std::time::Instant::now();
+        }
+    }
+    warn!(
+        "clock sync timeout reached — starting sampler anyway. \
+         Telemetry written before NTP eventually syncs may not \
+         match drives correctly."
+    );
+}
+
+/// "Is the system clock plausibly correct?" — two signals, either
+/// one is enough:
+///   1. systemd-timesyncd has set its synchronized marker
+///   2. The year is >= 2025 (anything in or after the year this
+///      code was written; rules out the typical 1970 / 2000 / 2014
+///      fallback values that show up on a Pi without RTC)
+fn clock_is_sane() -> bool {
+    // systemd-timesyncd marker — touched the moment a successful NTP
+    // exchange happens, persists across reboots if the rootfs is
+    // writable.
+    if std::path::Path::new("/run/systemd/timesync/synchronized").exists() {
+        return true;
+    }
+    // Year sanity check — a Pi with an RTC battery will pass this
+    // immediately on boot even before NTP runs.
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 2025-01-01 00:00:00 UTC = 1735689600.
+    secs > 1_735_689_600
 }
 
 fn persist(conn: &Connection, sample: Sample) {

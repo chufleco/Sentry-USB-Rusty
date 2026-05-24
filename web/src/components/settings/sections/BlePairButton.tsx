@@ -43,6 +43,16 @@ interface BleConnectedResp {
   archiving: boolean
 }
 
+interface ClockStatusResp {
+  synced: boolean
+  has_rtc: boolean
+  ntp_synced: boolean
+  /** True only when the clock is bad AND there's no RTC battery —
+   *  the only case where the user needs to do something (connect to
+   *  WiFi to let NTP catch up). RTC users always see false. */
+  show_warning: boolean
+}
+
 interface BleAdapter {
   id: string                          // "hci0", "hci1", ...
   source: "onboard" | "external"     // hci0 = onboard, hci1+ = external
@@ -113,6 +123,7 @@ export function BlePairButton() {
   const [adapters, setAdapters] = useState<BleAdaptersResp | null>(null)
   const [adapterSwitching, setAdapterSwitching] = useState(false)
   const [adapterError, setAdapterError] = useState<string | null>(null)
+  const [clockStatus, setClockStatus] = useState<ClockStatusResp | null>(null)
   const [diagOpen, setDiagOpen] = useState(false)
   const [diagLines, setDiagLines] = useState<string[]>([])
   const [diagTotalLines, setDiagTotalLines] = useState(0)
@@ -346,6 +357,37 @@ export function BlePairButton() {
     const iv = setInterval(fetchAdapters, 5_000)
     return () => clearInterval(iv)
   }, [fetchAdapters])
+
+  // Clock-sync status — polled until synced, then stops. The
+  // sampler pauses while the system clock is bogus (avoids stranded
+  // samples that would never match a drive window later). RTC users
+  // never see this warning because their clock is sane from boot.
+  useEffect(() => {
+    let stopped = false
+    let iv: ReturnType<typeof setInterval> | null = null
+    const fetchClock = async () => {
+      try {
+        const res = await fetch("/api/system/clock-status")
+        if (!res.ok) return
+        const d = (await res.json()) as ClockStatusResp
+        if (stopped) return
+        setClockStatus(d)
+        // Once synced, no need to keep polling.
+        if (d.synced && iv) {
+          clearInterval(iv)
+          iv = null
+        }
+      } catch {
+        /* leave previous value */
+      }
+    }
+    fetchClock()
+    iv = setInterval(fetchClock, 5_000)
+    return () => {
+      stopped = true
+      if (iv) clearInterval(iv)
+    }
+  }, [])
 
   const switchAdapter = useCallback(async (id: string) => {
     setAdapterSwitching(true)
@@ -787,6 +829,33 @@ export function BlePairButton() {
           </button>
         )}
       </div>
+
+      {/* Clock-not-synced warning — only when there's no RTC
+          battery to back the clock up across reboots. RTC users
+          never see this. Once NTP catches up the polling effect
+          stops firing and this disappears on its own. */}
+      {clockStatus?.show_warning && (
+        <div className="rounded-lg border border-amber-500/20 bg-amber-500/[0.05] p-3 text-xs">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+            <div>
+              <p className="font-semibold text-amber-300">
+                Pi clock not synced — telemetry paused
+              </p>
+              <p className="mt-1 text-[11px] leading-relaxed text-slate-400">
+                Connect the Pi to WiFi briefly so it can set its clock from
+                the internet. After that the clock keeps running on its own
+                even when you drive away — you only need WiFi this once.
+                <br />
+                <span className="text-slate-500">
+                  Tip: add a $5 coin-cell battery to the Pi's BAT pin to
+                  avoid this on future boots.
+                </span>
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
 
       {outputOpen && (
         <TelemetryOutputPanel

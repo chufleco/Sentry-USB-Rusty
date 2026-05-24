@@ -350,6 +350,58 @@ pub async fn get_rtc_status(State(_s): State<AppState>) -> (StatusCode, Json<ser
     })))
 }
 
+/// GET /api/system/clock-status
+///
+/// Reports whether the Pi's system clock can be trusted for
+/// timestamping samples + matching them to drives later. Used by the
+/// BLE pair card to show a "clock not synced — sampling paused"
+/// warning ONLY when both:
+///   * The system clock looks bogus (year < 2025 = unset / Jan-1-2000
+///     fallback / etc.)
+///   * No RTC battery is installed (with RTC, clock survives reboots
+///     and is fine the moment the kernel comes up)
+///
+/// Users with an RTC battery never see the warning. Users without
+/// one only see it during the brief window between boot and NTP
+/// sync — which on home WiFi is typically seconds.
+///
+/// Response shape:
+/// ```json
+/// {
+///   "synced": true,            // year >= 2025 OR systemd-timesyncd marker
+///   "has_rtc": true,           // /dev/rtc0 exists
+///   "ntp_synced": true,        // /run/systemd/timesync/synchronized exists
+///   "show_warning": false      // !synced && !has_rtc — what the UI should gate on
+/// }
+/// ```
+pub async fn get_clock_status(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ntp_synced =
+        std::path::Path::new("/run/systemd/timesync/synchronized").exists();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 2025-01-01 00:00:00 UTC = 1735689600.
+    let year_looks_recent = secs > 1_735_689_600;
+    let synced = ntp_synced || year_looks_recent;
+    let has_rtc = std::path::Path::new("/dev/rtc0").exists();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "synced": synced,
+            "has_rtc": has_rtc,
+            "ntp_synced": ntp_synced,
+            // The single boolean the UI cares about — don't pester
+            // RTC users, only warn when clock is bad AND there's no
+            // hardware fallback.
+            "show_warning": !synced && !has_rtc,
+        })),
+    )
+}
+
 /// GET /api/system/ssh-pubkey
 pub async fn get_ssh_pubkey(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let pub_key = std::fs::read_to_string("/root/.ssh/id_ed25519.pub")

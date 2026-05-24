@@ -84,6 +84,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-force-poll", post(crate::ble::ble_force_poll))
         .route("/api/system/speedtest", get(crate::system::speedtest))
         .route("/api/system/rtc-status", get(crate::system::get_rtc_status))
+        .route("/api/system/clock-status", get(crate::system::get_clock_status))
         .route("/api/system/ssh-pubkey", get(crate::system::get_ssh_pubkey))
         .route("/api/system/ssh-keygen", post(crate::system::generate_ssh_key))
         .route("/api/system/check-internet", get(crate::update::check_internet))
