@@ -862,9 +862,6 @@ export function BlePairButton() {
           sample={latestSample}
           loading={sampleLoading}
           metric={metric}
-          fetchedSecondsAgo={
-            sampleFetchedAt > 0 ? Math.max(0, nowTs - sampleFetchedAt) : null
-          }
           onRefresh={async () => {
             // Also refetch the connection pill so the user sees
             // immediate visible feedback (Last seen Xm ago updates)
@@ -1101,7 +1098,6 @@ function TelemetryOutputPanel({
   sample,
   loading,
   metric,
-  fetchedSecondsAgo,
   onRefresh,
   radioOwner,
   archiving,
@@ -1109,7 +1105,6 @@ function TelemetryOutputPanel({
   sample: BleLatestSample | null
   loading: boolean
   metric: boolean
-  fetchedSecondsAgo: number | null
   onRefresh: () => void
   radioOwner: string | null
   archiving: boolean
