@@ -19,6 +19,9 @@ interface DrivesToolbarProps {
   onTagSelected: () => void
   onExportSelected: () => void
   onDeleteSelected: () => void
+  // DRIVE_MAP_UNIT === "km" → render the FilterPopover's distance field
+  // in kilometres, matching the unit shown on each drive's row.
+  metric: boolean
 }
 
 export function DrivesToolbar(props: DrivesToolbarProps) {
@@ -29,6 +32,7 @@ export function DrivesToolbar(props: DrivesToolbarProps) {
         drives={props.drives}
         filters={props.filters}
         onChange={props.onFiltersChange}
+        metric={props.metric}
       />
       <div className="ml-auto flex flex-wrap items-center gap-2">
         {props.selectMode ? (

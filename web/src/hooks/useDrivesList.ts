@@ -19,9 +19,11 @@ export type DatePreset =
   | "all"
 
 export interface DrivesFilters {
-  origin?: string
-  destination?: string
   tag?: string
+  // Minimum distance is always persisted in MILES regardless of the
+  // user's DRIVE_MAP_UNIT preference, so the URL param (?minDist=...)
+  // and the filter comparison both stay on one unit. The popover UI
+  // converts to/from km for display when the user prefers metric.
   minDistanceMi?: number
 }
 
@@ -63,8 +65,6 @@ function readFilters(params: URLSearchParams): DrivesFilters {
   const minStr = params.get("minDist")
   const minDistanceMi = minStr ? Number(minStr) : undefined
   return {
-    origin: params.get("origin") || undefined,
-    destination: params.get("destination") || undefined,
     tag: params.get("tag") || undefined,
     minDistanceMi: Number.isFinite(minDistanceMi) ? minDistanceMi : undefined,
   }
@@ -120,8 +120,6 @@ function filterDrives(
     const t = new Date(d.startTime)
     if (from && t < from) return false
     if (to && t >= to) return false
-    if (filters.origin && d.startLocation !== filters.origin) return false
-    if (filters.destination && d.endLocation !== filters.destination) return false
     if (filters.tag && !(d.tags ?? []).includes(filters.tag)) return false
     if (filters.minDistanceMi !== undefined && d.distanceMi < filters.minDistanceMi) {
       return false
@@ -221,12 +219,12 @@ export function useDrivesList(): DrivesListState {
   const setFilters = (f: DrivesFilters) => {
     updateParams((p) => {
       p.delete("page")
-      p.delete("origin")
-      p.delete("destination")
       p.delete("tag")
       p.delete("minDist")
-      if (f.origin) p.set("origin", f.origin)
-      if (f.destination) p.set("destination", f.destination)
+      // Legacy params from pre-refactor builds — clear them so the URL
+      // doesn't carry orphan state after the user touches the filters.
+      p.delete("origin")
+      p.delete("destination")
       if (f.tag) p.set("tag", f.tag)
       if (f.minDistanceMi !== undefined) p.set("minDist", String(f.minDistanceMi))
     })

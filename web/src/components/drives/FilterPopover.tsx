@@ -4,13 +4,22 @@ import { cn } from "@/lib/utils"
 import type { DrivesFilters } from "@/hooks/useDrivesList"
 import type { DriveSummary } from "@/types/drives"
 
+const KM_PER_MI = 1.609344
+const miToKm = (mi: number): number => mi * KM_PER_MI
+const kmToMi = (km: number): number => km / KM_PER_MI
+
 interface FilterPopoverProps {
   drives: DriveSummary[]
   filters: DrivesFilters
   onChange: (f: DrivesFilters) => void
+  // True when the user's DRIVE_MAP_UNIT preference is "km". Controls
+  // whether the Minimum-distance input renders/accepts km or mi.
+  // DrivesFilters.minDistanceMi is always stored in MILES — the popover
+  // converts at the edge so the URL and the filter logic stay on one unit.
+  metric: boolean
 }
 
-export function FilterPopover({ drives, filters, onChange }: FilterPopoverProps) {
+export function FilterPopover({ drives, filters, onChange, metric }: FilterPopoverProps) {
   const [open, setOpen] = useState(false)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [draft, setDraft] = useState<DrivesFilters>(filters)
@@ -27,8 +36,6 @@ export function FilterPopover({ drives, filters, onChange }: FilterPopoverProps)
     return () => document.removeEventListener("mousedown", onDoc)
   }, [open])
 
-  const origins = useMemo(() => collectLocations(drives, "startLocation"), [drives])
-  const destinations = useMemo(() => collectLocations(drives, "endLocation"), [drives])
   const tags = useMemo(() => collectTags(drives), [drives])
 
   const apply = () => {
@@ -42,10 +49,28 @@ export function FilterPopover({ drives, filters, onChange }: FilterPopoverProps)
   }
 
   const activeCount =
-    (filters.origin ? 1 : 0) +
-    (filters.destination ? 1 : 0) +
-    (filters.tag ? 1 : 0) +
-    (filters.minDistanceMi !== undefined ? 1 : 0)
+    (filters.tag ? 1 : 0) + (filters.minDistanceMi !== undefined ? 1 : 0)
+
+  // Display value for the distance input: convert stored mi → km when
+  // the user prefers metric, and round to 1 decimal so the round-trip
+  // (10 km → 6.21371 mi → 10.0 km display) doesn't print floating-point
+  // ugliness in the input box.
+  const distanceDisplay =
+    draft.minDistanceMi === undefined
+      ? undefined
+      : metric
+        ? Number(miToKm(draft.minDistanceMi).toFixed(1))
+        : draft.minDistanceMi
+
+  const handleDistanceChange = (next: number | undefined) => {
+    if (next === undefined) {
+      setDraft({ ...draft, minDistanceMi: undefined })
+      return
+    }
+    setDraft({ ...draft, minDistanceMi: metric ? kmToMi(next) : next })
+  }
+
+  const unitLabel = metric ? "km" : "mi"
 
   return (
     <div ref={wrapRef} className="relative">
@@ -68,27 +93,15 @@ export function FilterPopover({ drives, filters, onChange }: FilterPopoverProps)
       {open && (
         <div className="absolute left-0 top-full z-50 mt-2 w-72 rounded-xl border border-white/10 bg-slate-900/95 p-3 shadow-2xl backdrop-blur">
           <Select
-            label="Origin"
-            value={draft.origin ?? ""}
-            options={origins}
-            onChange={(v) => setDraft({ ...draft, origin: v || undefined })}
-          />
-          <Select
-            label="Destination"
-            value={draft.destination ?? ""}
-            options={destinations}
-            onChange={(v) => setDraft({ ...draft, destination: v || undefined })}
-          />
-          <Select
             label="Tag"
             value={draft.tag ?? ""}
             options={tags}
             onChange={(v) => setDraft({ ...draft, tag: v || undefined })}
           />
           <NumberInput
-            label="Minimum distance (mi)"
-            value={draft.minDistanceMi}
-            onChange={(v) => setDraft({ ...draft, minDistanceMi: v })}
+            label={`Minimum distance (${unitLabel})`}
+            value={distanceDisplay}
+            onChange={handleDistanceChange}
           />
           <div className="mt-3 flex gap-2">
             <button
@@ -167,15 +180,6 @@ function NumberInput({ label, value, onChange }: NumberInputProps) {
       />
     </label>
   )
-}
-
-function collectLocations(drives: DriveSummary[], key: "startLocation" | "endLocation"): string[] {
-  const set = new Set<string>()
-  for (const d of drives) {
-    const v = d[key]
-    if (v) set.add(v)
-  }
-  return Array.from(set).sort()
 }
 
 function collectTags(drives: DriveSummary[]): string[] {
