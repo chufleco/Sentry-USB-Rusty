@@ -7,7 +7,7 @@ import {
   XAxis,
   YAxis,
 } from "recharts"
-import { useScrubberSync } from "@/hooks/useScrubberSync"
+import { useScrubberActions } from "@/hooks/useScrubberSync"
 
 interface DriveChartProps {
   series: { index: number; time: number; value: number }[]
@@ -22,7 +22,7 @@ export default function DriveChart({
   valueFormatter,
   startTime,
 }: DriveChartProps) {
-  const scrubber = useScrubberSync()
+  const { setIndex } = useScrubberActions()
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
 
   return (
@@ -34,7 +34,7 @@ export default function DriveChart({
           onMouseMove={(s) => {
             const idx = s?.activeTooltipIndex
             if (typeof idx === "number" && idx >= 0 && idx < series.length) {
-              scrubber.setIndex(series[idx].index)
+              setIndex(series[idx].index)
             }
           }}
         >

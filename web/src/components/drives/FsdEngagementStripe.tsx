@@ -1,12 +1,12 @@
 import { useMemo } from "react"
-import { useScrubberSync } from "@/hooks/useScrubberSync"
+import { useScrubberState } from "@/hooks/useScrubberSync"
 
 interface FsdEngagementStripeProps {
   fsdStates: number[]
 }
 
 export function FsdEngagementStripe({ fsdStates }: FsdEngagementStripeProps) {
-  const scrubber = useScrubberSync()
+  const { currentIndex } = useScrubberState()
   const n = fsdStates.length
 
   const segments = useMemo(() => {
@@ -28,7 +28,7 @@ export function FsdEngagementStripe({ fsdStates }: FsdEngagementStripeProps) {
 
   if (n === 0) return null
 
-  const cursorPct = (scrubber.currentIndex / Math.max(1, n - 1)) * 100
+  const cursorPct = (currentIndex / Math.max(1, n - 1)) * 100
 
   return (
     <div className="mt-2">
