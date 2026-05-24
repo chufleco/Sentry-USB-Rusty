@@ -330,40 +330,46 @@ pub async fn ble_latest_sample(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = s.drives.store.clone();
-    let row = tokio::task::spawn_blocking(move || {
+    let result = tokio::task::spawn_blocking(move || {
         store.with_locked_conn(|conn| {
+            // Pull two things:
+            //   1. The "envelope" — `ts` + `source` of the most recent
+            //      sample, used by the UI to render "polled Xs ago"
+            //      and to label what kind of sample was last taken
+            //      (state vs body_controller).
+            //   2. Per-field latest-non-null for every value field.
+            //      This way the UI shows the last-known reading for
+            //      each field even when the most-recent sample didn't
+            //      include it (e.g. body_controller samples carry no
+            //      battery/temps/HVAC — without this trick, those
+            //      fields would go blank the moment the sampler dropped
+            //      to Quiet mode, even though we have fresh values
+            //      from the last state poll).
+            //
+            // Trade-off acknowledged: the displayed values can be
+            // older than the "polled Xs ago" envelope timestamp.
+            // The footer hint in the UI explains the body_controller
+            // case; for state polls everything will match.
+            //
             // battery_temp_c intentionally not selected — Tesla doesn't
             // expose battery cell temp via the state API, so the column
-            // is always NULL. Including it in the response would just
-            // advertise a field that's never populated.
-            // Pull the most recent sample row plus the latest non-null
-            // TPMS reading per tire (which may live in an older sample
-            // than the most-recent one — tires update slowly).
-            let latest = conn
+            // is always NULL.
+            // "Envelope" timestamp = when we last successfully read
+            // *real* telemetry from the car. We filter to
+            // source='state' so body_controller pings don't make the
+            // UI say "polled 2s ago" when the actual battery/temps
+            // are from a state poll 10 min ago. The body_controller
+            // pings still count for the "Connected" indicator
+            // (handled by ble_connected) — different concern.
+            let envelope = conn
                 .query_row(
-                    "SELECT ts, battery_pct, interior_temp_c, \
-                            exterior_temp_c, hvac_on, source, odometer_mi, location_name \
-                     FROM telemetry_samples \
+                    "SELECT ts, source FROM telemetry_samples \
+                     WHERE source = 'state' \
                      ORDER BY ts DESC LIMIT 1",
                     [],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, Option<f64>>(1)?,
-                            r.get::<_, Option<f64>>(2)?,
-                            r.get::<_, Option<f64>>(3)?,
-                            r.get::<_, Option<i64>>(4)?,
-                            r.get::<_, String>(5)?,
-                            r.get::<_, Option<f64>>(6)?,
-                            r.get::<_, Option<String>>(7)?,
-                        ))
-                    },
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
                 .ok();
-            // Slow-changing fields (TPMS) sample less often than every
-            // cycle. Pull the most-recent non-null per field separately
-            // so the live panel can show what we know even when the
-            // latest sample didn't include them.
             let latest_col_f64 = |col: &str| -> Option<f64> {
                 conn.query_row(
                     &format!(
@@ -376,15 +382,44 @@ pub async fn ble_latest_sample(
                 )
                 .ok()
             };
-            latest.map(|row| {
-                (
-                    row,
-                    (
-                        latest_col_f64("tire_fl_psi"),
-                        latest_col_f64("tire_fr_psi"),
-                        latest_col_f64("tire_rl_psi"),
-                        latest_col_f64("tire_rr_psi"),
+            let latest_col_i64 = |col: &str| -> Option<i64> {
+                conn.query_row(
+                    &format!(
+                        "SELECT {col} FROM telemetry_samples \
+                         WHERE {col} IS NOT NULL \
+                         ORDER BY ts DESC LIMIT 1"
                     ),
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            let latest_col_string = |col: &str| -> Option<String> {
+                conn.query_row(
+                    &format!(
+                        "SELECT {col} FROM telemetry_samples \
+                         WHERE {col} IS NOT NULL \
+                         ORDER BY ts DESC LIMIT 1"
+                    ),
+                    [],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            envelope.map(|(ts, source)| {
+                (
+                    ts,
+                    source,
+                    latest_col_f64("battery_pct"),
+                    latest_col_f64("interior_temp_c"),
+                    latest_col_f64("exterior_temp_c"),
+                    latest_col_i64("hvac_on"),
+                    latest_col_f64("tire_fl_psi"),
+                    latest_col_f64("tire_fr_psi"),
+                    latest_col_f64("tire_rl_psi"),
+                    latest_col_f64("tire_rr_psi"),
+                    latest_col_f64("odometer_mi"),
+                    latest_col_string("location_name"),
                 )
             })
         })
@@ -398,30 +433,38 @@ pub async fn ble_latest_sample(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    match row {
+    match result {
         Some((
-            (ts, battery_pct, interior_temp_c, exterior_temp_c, hvac_on, source, odometer_mi, location_name),
-            (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
-        )) => {
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ts": ts,
-                    "seconds_ago": (now - ts).max(0),
-                    "battery_pct": battery_pct,
-                    "interior_temp_c": interior_temp_c,
-                    "exterior_temp_c": exterior_temp_c,
-                    "hvac_on": hvac_on.map(|v| v != 0),
-                    "tire_fl_psi": tire_fl_psi,
-                    "tire_fr_psi": tire_fr_psi,
-                    "tire_rl_psi": tire_rl_psi,
-                    "tire_rr_psi": tire_rr_psi,
-                    "odometer_mi": odometer_mi,
-                    "location_name": location_name,
-                    "source": source,
-                })),
-            )
-        }
+            ts,
+            source,
+            battery_pct,
+            interior_temp_c,
+            exterior_temp_c,
+            hvac_on,
+            tire_fl_psi,
+            tire_fr_psi,
+            tire_rl_psi,
+            tire_rr_psi,
+            odometer_mi,
+            location_name,
+        )) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ts": ts,
+                "seconds_ago": (now - ts).max(0),
+                "battery_pct": battery_pct,
+                "interior_temp_c": interior_temp_c,
+                "exterior_temp_c": exterior_temp_c,
+                "hvac_on": hvac_on.map(|v| v != 0),
+                "tire_fl_psi": tire_fl_psi,
+                "tire_fr_psi": tire_fr_psi,
+                "tire_rl_psi": tire_rl_psi,
+                "tire_rr_psi": tire_rr_psi,
+                "odometer_mi": odometer_mi,
+                "location_name": location_name,
+                "source": source,
+            })),
+        ),
         None => (
             StatusCode::OK,
             Json(serde_json::json!({ "ts": null })),

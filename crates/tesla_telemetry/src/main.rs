@@ -81,6 +81,18 @@ const FAST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 /// reconnection window without burning power on a truly dead link.
 const MAX_FAST_RETRIES: u32 = 3;
 
+/// How often to do a `state climate` + `state charge` refresh while
+/// in Quiet mode but the car is provably awake (recent clip writes
+/// → Sentry recording or charging). The default Quiet flow only
+/// runs body-controller-state, which doesn't carry battery/temps/
+/// HVAC — so without this refresh, parked-with-Sentry would show
+/// frozen values for as long as the session lasts. 3 min is the
+/// sweet spot: fresh enough that the dashboard cards feel alive,
+/// rare enough that we add minimal BLE load (~2 calls every 3 min,
+/// vs Active mode's 4 calls every 15 s). Safe because the car is
+/// already awake — we're not adding any wake-up drain.
+const PARKED_AWAKE_REFRESH_INTERVAL: Duration = Duration::from_secs(180);
+
 /// How many consecutive state polls must show shift_state = Park
 /// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
 /// 45 s of confirmed Park before we stop hammering the car. Keeps
@@ -228,6 +240,12 @@ async fn main() -> Result<()> {
     // fresh start-of-drive snapshot), with charge deferred 30s so
     // it doesn't stack with climate.
     let mut schedule = Schedule::new(Instant::now());
+    // Last time we did a parked-awake state refresh (climate +
+    // charge while in Quiet mode but the car is recording dashcam
+    // clips). Lets battery/temps stay reasonably fresh during
+    // Sentry sessions and charging without dropping the radio-lock
+    // dance the deep-sleep Quiet path relies on.
+    let mut last_parked_awake_refresh: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -256,6 +274,7 @@ async fn main() -> Result<()> {
                 &mut parked_polls,
                 &mut last_user_presence,
                 &mut schedule,
+                &mut last_parked_awake_refresh,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -291,6 +310,7 @@ async fn tick(
     parked_polls: &mut u32,
     last_user_presence: &mut Option<bool>,
     schedule: &mut Schedule,
+    last_parked_awake_refresh: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -435,6 +455,53 @@ async fn tick(
                     Err(e) => {
                         warn!("state drive probe in quiet+present failed: {e}");
                     }
+                }
+            }
+
+            // Parked-awake state refresh: when the car is parked
+            // (Quiet mode) but actively recording dashcam clips
+            // (observation == Awake), do a periodic climate +
+            // charge poll so battery/temps don't go indefinitely
+            // stale during Sentry sessions or AC charging. Safe
+            // because the car is already awake — we add no
+            // wake-up drain. Only fires every 3 min to keep BLE
+            // load minimal.
+            //
+            // Skipped when car_truly_asleep (let it sleep) or
+            // when the user is in the car (the drive probe above
+            // already covers that path and a state transition is
+            // imminent).
+            if observation == CarState::Awake && presence_now != Some(true) {
+                let due = last_parked_awake_refresh
+                    .map(|t| t.elapsed() >= PARKED_AWAKE_REFRESH_INTERVAL)
+                    .unwrap_or(true);
+                if due {
+                    let mut refresh = Sample {
+                        ts: sample::now_secs(),
+                        source: "state".into(),
+                        ..Sample::default()
+                    };
+                    let mut any_ok = false;
+                    match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+                        Ok(c) => {
+                            refresh.interior_temp_c = c.interior_temp_c;
+                            refresh.exterior_temp_c = c.exterior_temp_c;
+                            refresh.hvac_on = c.hvac_on;
+                            any_ok = true;
+                        }
+                        Err(e) => warn!("parked-awake climate refresh failed: {e}"),
+                    }
+                    match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+                        Ok(c) => {
+                            refresh.battery_pct = c.battery_pct;
+                            any_ok = true;
+                        }
+                        Err(e) => warn!("parked-awake charge refresh failed: {e}"),
+                    }
+                    if any_ok {
+                        persist(conn, refresh);
+                    }
+                    *last_parked_awake_refresh = Some(Instant::now());
                 }
             }
 

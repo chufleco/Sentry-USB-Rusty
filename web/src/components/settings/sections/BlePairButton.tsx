@@ -868,13 +868,13 @@ function AdapterPicker({
     <div className="rounded-lg border border-blue-500/20 bg-blue-500/[0.04] p-3 text-xs">
       <div className="mb-2 flex items-center gap-2">
         <Usb className="h-3.5 w-3.5 text-blue-400" />
-        <span className="font-semibold text-slate-200">External BLE adapter detected</span>
+        <span className="font-semibold text-slate-200">Bluetooth adapter</span>
       </div>
       <p className="mb-2 text-[11px] leading-relaxed text-slate-400">
-        A USB BLE dongle gives you a dedicated radio with a better antenna —
-        substantially more reliable for the Tesla connection than the Pi's
-        onboard chip (which shares an antenna with Wi-Fi). Switching applies
-        to both Tesla telemetry and the SentryUSB iOS app peripheral.
+        Using a USB Bluetooth dongle instead of the Pi's built-in radio is
+        more reliable — the dongle has its own antenna and isn't competing
+        with Wi-Fi. The change applies to both your Tesla connection and the
+        SentryUSB iOS app.
       </p>
       <div className="mb-2 flex flex-col gap-1.5">
         {adapters.available.map((a) => {
@@ -899,7 +899,7 @@ function AdapterPicker({
                   <Cpu className="h-3 w-3 text-slate-400" />
                 )}
                 <span className="font-medium text-slate-200">
-                  {a.source === "external" ? "External dongle" : "Onboard radio"} ({a.id})
+                  {a.source === "external" ? "USB Bluetooth dongle" : "Pi built-in Bluetooth"}
                 </span>
                 {a.address && (
                   <span className="text-[10px] text-slate-600">{a.address}</span>
@@ -916,17 +916,18 @@ function AdapterPicker({
       </div>
       {!usingExternal && external && (
         <p className="mb-1 text-[10px] text-emerald-400/80">
-          Recommended: switch to the external dongle for better reliability.
+          Tap the USB dongle above to start using it — recommended.
         </p>
       )}
       {usingExternal && onboard && (
         <p className="mb-1 text-[10px] text-slate-500">
-          You can fall back to the onboard radio if you unplug the dongle.
+          If you unplug the dongle, the Pi will switch back to its built-in
+          Bluetooth automatically.
         </p>
       )}
       {switching && (
         <p className="mt-1.5 inline-flex items-center gap-1 text-[10px] text-slate-400">
-          <Loader2 className="h-3 w-3 animate-spin" /> Restarting BLE services…
+          <Loader2 className="h-3 w-3 animate-spin" /> Switching Bluetooth adapter…
         </p>
       )}
       {error && (
@@ -1005,16 +1006,16 @@ function DiagnosticsPanel({
         </div>
       </div>
       <p className="mb-2 text-[10px] leading-relaxed text-slate-600">
-        Per-poll outcomes from the BLE sampler. Each <code className="text-slate-500">state-poll</code> line shows climate / charge / tires /
-        drive timing + success. Failure lines explain why a subcommand
-        timed out (e.g. <code className="text-slate-500">context deadline exceeded</code> usually means
-        too many phone keys connected to the car).
+        Behind-the-scenes log of every Bluetooth read from your car. Useful
+        when readings stop updating — most failures point to too many phone
+        keys connected to the car at once (Tesla limits this to 3-4) or
+        Bluetooth range/interference.
       </p>
       {lines.length === 0 ? (
         <p className="rounded bg-white/[0.02] p-3 text-center text-[11px] text-slate-500">
           {totalJournalLines === 0
-            ? "Journal is empty — has the sampler started yet?"
-            : "No diagnostic lines yet. Wait ~15s for the next poll."}
+            ? "Nothing logged yet — the Pi may still be starting up."
+            : "No issues to report. Check back after a drive."}
         </p>
       ) : (
         <pre className="max-h-72 overflow-auto whitespace-pre rounded bg-black/40 p-2 text-[10px] leading-relaxed text-slate-300">
@@ -1049,14 +1050,20 @@ function TelemetryOutputPanel({
   // de-emphasize so the user understands they're looking at past
   // values, not a real-time read like the Tesla app shows.
   const isStale = hasSample && (sample?.seconds_ago ?? 0) > 60
+  // Translate the (possibly-old) sample age into a friendlier
+  // label. The raw "polled 240s ago" is true but reads like a
+  // log line — these phrasings are how a non-engineer would say
+  // the same thing.
+  const ageLabel = sample?.seconds_ago != null ? friendlyAge(sample.seconds_ago) : null
+
   return (
     <div className="rounded-lg border border-white/5 bg-black/20 p-3 text-xs">
       <div className="mb-2 flex items-center justify-between">
-        <span className="font-semibold text-slate-300">Live telemetry from car</span>
+        <span className="font-semibold text-slate-300">Live data from car</span>
         <div className="flex items-center gap-2">
-          {fetchedSecondsAgo !== null && (
+          {ageLabel && (
             <span className="text-[10px] text-slate-600">
-              polled {fetchedSecondsAgo}s ago
+              updated {ageLabel}
             </span>
           )}
           <button
@@ -1072,8 +1079,8 @@ function TelemetryOutputPanel({
 
       {!hasSample && (
         <p className="text-slate-500">
-          No samples in the database yet. If the car is awake and the Pi is in
-          range, this should populate within ~15 s.
+          Waiting for the first reading from your car. This usually takes
+          15-30 seconds once the car is awake and within Bluetooth range.
         </p>
       )}
 
@@ -1112,22 +1119,22 @@ function TelemetryOutputPanel({
           {isStale && radioOwner === "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
               {archiving
-                ? "Sampler paused while the Pi is archiving — keep-awake is holding the BLE radio. New samples will resume once archive completes."
-                : "Sampler paused — the keep-awake nudge is holding the BLE radio. New samples will resume once it finishes."}
+                ? "Paused while we back up your dashcam clips. Live readings will resume once that finishes."
+                : "Paused while another part of the Pi is using Bluetooth. Live readings will resume in a moment."}
             </p>
           )}
           {isStale && radioOwner !== "keep_awake" && (
             <p className="pt-1 text-[10px] text-amber-400/70">
-              These values are {sample.seconds_ago}s old. The Tesla app reads
-              live data over LTE — small differences from what's shown here
-              are expected when the car has been driving or charging.
+              These values are from {ageLabel} — your car may have moved or
+              charged since. The Tesla app uses a different connection (LTE)
+              so small differences are normal.
             </p>
           )}
           {sample.source === "body_controller" && (
             <p className="pt-1 text-[10px] text-slate-600">
-              <code>body_controller</code> samples are taken while the car is
-              asleep — temperatures and HVAC stay blank because reading them
-              would wake the car.
+              Your car is asleep right now, so we're showing the last known
+              values. Live updates resume when you start driving, open the
+              door, or Sentry Mode triggers.
             </p>
           )}
         </div>
@@ -1151,6 +1158,20 @@ function Row({ label, value }: { label: string; value: string }) {
  *  value. */
 function fmtPct(v: number | null | undefined): string {
   return v == null ? "—" : `${Math.round(v)}%`
+}
+
+/** Turn a "seconds ago" integer into a phrase a human would say.
+ *  Used for the "updated X" line so the panel reads like natural
+ *  English instead of a log message. */
+function friendlyAge(seconds: number): string {
+  if (seconds < 5) return "just now"
+  if (seconds < 60) return `${seconds} seconds ago`
+  const minutes = Math.round(seconds / 60)
+  if (minutes < 60) return minutes === 1 ? "1 minute ago" : `${minutes} minutes ago`
+  const hours = Math.round(minutes / 60)
+  if (hours < 24) return hours === 1 ? "1 hour ago" : `${hours} hours ago`
+  const days = Math.round(hours / 24)
+  return days === 1 ? "1 day ago" : `${days} days ago`
 }
 
 /** Backend always stores Celsius (single source of truth). Convert
