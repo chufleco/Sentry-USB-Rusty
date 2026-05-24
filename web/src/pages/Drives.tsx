@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useMemo, useState } from "react"
 import { Loader2 } from "lucide-react"
 import { setDriveTags } from "@/api/drives"
 import { DriveRow } from "@/components/drives/DriveRow"
@@ -12,9 +12,12 @@ export default function Drives() {
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
 
-  useEffect(() => {
-    if (!selectMode) setSelected(new Set())
-  }, [selectMode])
+  const toggleSelectMode = () => {
+    setSelectMode((s) => {
+      if (s) setSelected(new Set())
+      return !s
+    })
+  }
 
   const onToggleSelected = useCallback((id: number) => {
     setSelected((prev) => {
@@ -66,7 +69,7 @@ export default function Drives() {
         onRangeChange={list.setRange}
         onFiltersChange={list.setFilters}
         selectMode={selectMode}
-        onToggleSelectMode={() => setSelectMode((s) => !s)}
+        onToggleSelectMode={toggleSelectMode}
         selectedCount={selected.size}
         totalCount={list.total}
         onSelectAll={onSelectAll}

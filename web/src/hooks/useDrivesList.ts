@@ -142,6 +142,7 @@ export function useDrivesList(): DrivesListState {
 
   useEffect(() => {
     let cancelled = false
+    /* eslint-disable-next-line react-hooks/set-state-in-effect */
     setLoading(true)
     setError(null)
     Promise.all([fetchDrives(), fetchRouteOverviews(20).catch(() => [])])

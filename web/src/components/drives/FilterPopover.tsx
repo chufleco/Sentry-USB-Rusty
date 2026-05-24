@@ -15,6 +15,7 @@ export function FilterPopover({ drives, filters, onChange }: FilterPopoverProps)
   const wrapRef = useRef<HTMLDivElement>(null)
   const [draft, setDraft] = useState<DrivesFilters>(filters)
 
+  /* eslint-disable-next-line react-hooks/set-state-in-effect */
   useEffect(() => setDraft(filters), [filters])
 
   useEffect(() => {

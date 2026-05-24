@@ -18,6 +18,7 @@ export function useDriveDetail(id: string | undefined): DriveDetailState {
 
   useEffect(() => {
     if (!id) {
+      /* eslint-disable-next-line react-hooks/set-state-in-effect */
       setDrive(null)
       setLoading(false)
       setError(null)

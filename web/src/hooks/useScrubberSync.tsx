@@ -1,4 +1,5 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react"
+/* eslint-disable react-refresh/only-export-components */
+import { createContext, useCallback, useContext, useEffect, useMemo, useState } from "react"
 
 interface ScrubberState {
   currentIndex: number
@@ -22,38 +23,34 @@ export function ScrubberProvider({ children }: ScrubberProviderProps) {
   const [totalPoints, setTotalPoints] = useState(0)
   const [playing, setPlaying] = useState(false)
   const [playbackSpeed, setPlaybackSpeed] = useState(1)
-  const playingRef = useRef(playing)
-  const speedRef = useRef(playbackSpeed)
-  const totalRef = useRef(totalPoints)
-
-  playingRef.current = playing
-  speedRef.current = playbackSpeed
-  totalRef.current = totalPoints
 
   useEffect(() => {
-    if (!playing) return
+    if (!playing || totalPoints === 0) return
+    const tickMs = Math.max(20, Math.floor(100 / playbackSpeed))
     const id = window.setInterval(() => {
       setCurrentIndex((prev) => {
         const next = prev + 1
-        if (next >= totalRef.current) {
+        if (next >= totalPoints) {
           setPlaying(false)
-          return totalRef.current > 0 ? totalRef.current - 1 : 0
+          return totalPoints - 1
         }
         return next
       })
-    }, Math.max(20, Math.floor(100 / speedRef.current)))
+    }, tickMs)
     return () => window.clearInterval(id)
-  }, [playing, playbackSpeed])
+  }, [playing, playbackSpeed, totalPoints])
 
-  const setIndex = useCallback((n: number) => {
-    setCurrentIndex(() => {
-      const total = totalRef.current
-      if (total <= 0) return 0
-      if (n < 0) return 0
-      if (n >= total) return total - 1
-      return n
-    })
-  }, [])
+  const setIndex = useCallback(
+    (n: number) => {
+      setCurrentIndex(() => {
+        if (totalPoints <= 0) return 0
+        if (n < 0) return 0
+        if (n >= totalPoints) return totalPoints - 1
+        return n
+      })
+    },
+    [totalPoints],
+  )
 
   const setTotal = useCallback((n: number) => {
     setTotalPoints(n)
