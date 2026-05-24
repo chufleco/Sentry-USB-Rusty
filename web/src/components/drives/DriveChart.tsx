@@ -26,11 +26,11 @@ export default function DriveChart({
   const baseMs = useMemo(() => new Date(startTime).getTime(), [startTime])
 
   return (
-    <div className="h-44 w-full" aria-label={`${valueLabel} chart`}>
+    <div className="h-56 w-full" aria-label={`${valueLabel} chart`}>
       <ResponsiveContainer>
         <AreaChart
           data={series}
-          margin={{ top: 8, right: 4, bottom: 0, left: 0 }}
+          margin={{ top: 10, right: 12, bottom: 10, left: 4 }}
           onMouseMove={(s) => {
             const idx = s?.activeTooltipIndex
             if (typeof idx === "number" && idx >= 0 && idx < series.length) {
@@ -53,15 +53,17 @@ export default function DriveChart({
             tick={{ fill: "#64748b", fontSize: 11 }}
             tickLine={false}
             axisLine={false}
-            minTickGap={48}
+            tickMargin={6}
+            minTickGap={56}
           />
           <YAxis
             stroke="#475569"
             tick={{ fill: "#64748b", fontSize: 11 }}
-            tickFormatter={valueFormatter}
+            tickFormatter={(n: number) => Math.round(n).toString()}
             tickLine={false}
             axisLine={false}
-            width={42}
+            tickMargin={4}
+            width={36}
           />
           <Tooltip
             content={({ active, payload }) => {
