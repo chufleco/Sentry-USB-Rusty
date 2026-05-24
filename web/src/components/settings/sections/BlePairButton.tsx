@@ -119,7 +119,6 @@ export function BlePairButton() {
   const [outputOpen, setOutputOpen] = useState(false)
   const [latestSample, setLatestSample] = useState<BleLatestSample | null>(null)
   const [sampleLoading, setSampleLoading] = useState(false)
-  const [sampleFetchedAt, setSampleFetchedAt] = useState<number>(0)
   const [adapters, setAdapters] = useState<BleAdaptersResp | null>(null)
   const [adapterSwitching, setAdapterSwitching] = useState(false)
   const [adapterError, setAdapterError] = useState<string | null>(null)
@@ -294,7 +293,6 @@ export function BlePairButton() {
       const res = await fetch("/api/system/ble-latest-sample")
       const d = (await res.json()) as BleLatestSample
       setLatestSample(d)
-      setSampleFetchedAt(Math.floor(Date.now() / 1000))
     } catch {
       /* leave previous value */
     } finally {
