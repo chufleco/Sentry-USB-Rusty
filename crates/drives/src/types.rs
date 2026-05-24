@@ -274,13 +274,15 @@ pub struct DriveSummary {
     /// `end - start`, rounded to one decimal — UI convenience scalar.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub odometer_mi_driven: Option<f64>,
+    /// v10 drive start/end labels. Either Tesla's reverse-geocoded
+    /// address string OR "Home" / "Work" when the drive's start/end
+    /// GPS matched the user's saved home/work coords (within ~150m).
+    /// The matcher prefers "Home"/"Work" over raw addresses for
+    /// drives that begin or end at known places.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub software_version: Option<String>,
-    /// Mapped FSD release ("v14.3.2" / "?"). None unless the drive
-    /// had FSD engaged at some point; populated by the rollup using
-    /// `fsd_versions::fsd_version_for`.
+    pub start_location: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub fsd_version: Option<String>,
+    pub end_location: Option<String>,
     // Provenance
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<String>,
@@ -464,11 +466,16 @@ pub struct RouteTelemetryAggregates {
     /// reading within the clip's window.
     pub odometer_mi_start: Option<f64>,
     pub odometer_mi_end: Option<f64>,
-    /// v9 Tesla OS version string ("2026.2.9.10"). Latest non-null
-    /// sample in the window — software_version is throttle-sampled
-    /// so most clip windows will have it NULL.
-    pub software_version: Option<String>,
+    /// v10 Tesla-supplied address strings — first / last non-null
+    /// `location_name` sample in the clip's window. The per-drive
+    /// rollup chains these across all the clips of a trip to
+    /// produce the start/end labels surfaced in the UI.
+    pub location_name_start: Option<String>,
+    pub location_name_end: Option<String>,
 }
+// `software_version` removed from the rollup — Tesla doesn't expose
+// `car_version` over BLE, so we never populated it. The DB column on
+// `routes` stays nullable as forward-compat.
 
 /// BLOB-free row shape used by the summary endpoints. Carries the
 /// metadata that `groupClips` needs plus all pre-computed scalars from

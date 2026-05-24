@@ -40,33 +40,28 @@ const OWNER: &str = "telemetry";
 /// per the user's design call.
 const AWAKE_INTERVAL: Duration = Duration::from_secs(15);
 
-/// Sample cadence while the car is asleep, after the warm-up ramp.
-/// Uses `body-controller-state` which doesn't wake the car.
-const ASLEEP_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// Sample cadence for sleep-safe `body-controller-state` calls.
+/// Set to 1 min so the sampler notices a drive starting within a
+/// minute of the car coming out of sleep — body-controller-state
+/// doesn't wake the car, so polling this often is cheap from a
+/// battery-drain perspective. Replaces the old 15-min interval +
+/// ramp-up backoff (which made drive starts invisible for up to
+/// 15 min after sleep).
+const QUIET_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Minimum gap between two `state software-update` fetches. The OS
-/// version only changes on OTAs, so every-cycle polling would waste
-/// BLE air time and force the car awake more often than needed. We
-/// re-check every 15 min so a drive that starts shortly after an OTA
-/// still gets the new version recorded.
-const SOFTWARE_VERSION_INTERVAL: Duration = Duration::from_secs(15 * 60);
+/// How many consecutive state polls must show shift_state = Park
+/// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
+/// 45 s of confirmed Park before we stop hammering the car. Keeps
+/// us in Drive mode through a brief stop at a light, but bails out
+/// quickly enough to let the car sleep within minutes of parking.
+const PARK_CONFIRMATIONS_BEFORE_QUIET: u32 = 3;
 
-/// Asleep-mode backoff for the first few attempts after the daemon
-/// starts (or after the state flips Awake → Asleep). Goal: give the
-/// user feedback within a minute of pairing without spamming the
-/// radio long-term.
-///
-/// Attempt n → interval:
-///   1 → 30 s,  2 → 60 s,  3 → 2 min,  4 → 5 min,  5+ → ASLEEP_INTERVAL
-fn asleep_backoff(attempt: usize) -> Duration {
-    match attempt {
-        0 | 1 => Duration::from_secs(30),
-        2 => Duration::from_secs(60),
-        3 => Duration::from_secs(120),
-        4 => Duration::from_secs(300),
-        _ => ASLEEP_INTERVAL,
-    }
-}
+// (Software version is intentionally not sampled. tesla-control's
+// `state software-update` only returns the *pending* OTA version
+// (often " "), never the currently-installed `car_version`. To
+// surface the running OS version on drives, the user can enter it
+// manually in settings — see fsd_versions.rs for the mapping table
+// the per-drive rollup uses.)
 
 /// How long to sleep when we can't take the BLE radio (some other
 /// owner holds the lock). Short so we resume quickly when the
@@ -91,15 +86,17 @@ async fn main() -> Result<()> {
 
     let conn = db::open()?;
     let mut held_radio = false;
-    // Counts consecutive Asleep ticks since the last Awake/Idle
-    // observation. Drives `asleep_backoff` so the first few attempts
-    // after pairing or after the car goes to sleep are fast (30s, 60s,
-    // 2m, 5m) before settling at the 15-min steady-state cadence.
-    let mut asleep_attempts: usize = 0;
-    // Unix seconds of the last successful (or attempted) software
-    // version fetch. Drives the SOFTWARE_VERSION_INTERVAL throttle.
-    // 0 = never fetched, so the first awake sample includes it.
-    let mut last_software_check: i64 = 0;
+    // Counts consecutive state polls showing shift_state = Park.
+    // When it crosses PARK_CONFIRMATIONS_BEFORE_QUIET, the next tick
+    // drops to body-controller-only polling (sleep-safe). Reset by
+    // any non-Park shift observation OR by a user_presence flip
+    // back to PRESENT during Quiet mode.
+    let mut parked_polls: u32 = 0;
+    // Last user_presence reading from body-controller-state. Used
+    // to detect "driver got back in" while in Quiet mode so the
+    // sampler can promote to Active on the next tick rather than
+    // waiting for an external trigger.
+    let mut last_user_presence: Option<bool> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -122,7 +119,12 @@ async fn main() -> Result<()> {
                 if held_radio { release_radio().await; }
                 return Ok(());
             }
-            sleep = tick(&conn, &mut held_radio, &mut asleep_attempts, &mut last_software_check) => {
+            sleep = tick(
+                &conn,
+                &mut held_radio,
+                &mut parked_polls,
+                &mut last_user_presence,
+            ) => {
                 tokio::time::sleep(sleep).await;
             }
         }
@@ -130,14 +132,32 @@ async fn main() -> Result<()> {
 }
 
 /// One iteration of the main loop. Returns the duration to sleep
-/// before the next iteration. `asleep_attempts` tracks consecutive
-/// Asleep ticks for the warm-up backoff and gets reset whenever the
-/// car is observed Awake or Idle.
+/// before the next iteration.
+///
+/// Two phases, decided each tick:
+///
+///   * **Active** — clip writes are happening AND shift_state isn't
+///     confirmed-Park. Full `state` polls every AWAKE_INTERVAL, radio
+///     held continuously. Each successful poll updates `parked_polls`
+///     based on the observed shift.
+///   * **Quiet** — either no clip writes (car asleep) OR shift_state
+///     has been Park for `PARK_CONFIRMATIONS_BEFORE_QUIET` polls
+///     (car parked-with-Sentry-recording). Body-controller-state
+///     polls every QUIET_INTERVAL — sleep-safe, doesn't pin the car
+///     awake. Radio is released between deep-asleep polls (so iOS
+///     GATT can run) but held while in parked-with-Sentry (poll
+///     cadence is too fast to cycle the GATT daemon cleanly).
+///
+/// Transitions:
+///   * Active → Quiet: parked_polls reaches the confirmation count.
+///   * Quiet → Active: body-controller user_presence flips
+///     NOT_PRESENT → PRESENT (driver got back in). The next tick
+///     immediately does a state poll.
 async fn tick(
     conn: &Connection,
     held_radio: &mut bool,
-    asleep_attempts: &mut usize,
-    last_software_check: &mut i64,
+    parked_polls: &mut u32,
+    last_user_presence: &mut Option<bool>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -153,7 +173,8 @@ async fn tick(
             release_radio().await;
             *held_radio = false;
         }
-        *asleep_attempts = 0;
+        *parked_polls = 0;
+        *last_user_presence = None;
         return DISABLED_POLL;
     }
     if cfg.vin.is_empty() {
@@ -162,101 +183,180 @@ async fn tick(
             release_radio().await;
             *held_radio = false;
         }
-        *asleep_attempts = 0;
+        *parked_polls = 0;
+        *last_user_presence = None;
         return DISABLED_POLL;
     }
 
-    let state = usb_watch::observe();
+    let observation = usb_watch::observe();
+    let car_truly_asleep = observation == CarState::Asleep;
+    let parked_confirmed = *parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET;
+    let in_quiet_mode = car_truly_asleep || parked_confirmed;
 
-    match state {
-        CarState::Awake | CarState::Idle => {
-            // Car is producing clip writes → reset the warm-up
-            // counter so the next Asleep transition starts fast
-            // again rather than jumping straight to 15-min.
-            *asleep_attempts = 0;
-            // Need the radio. Try to acquire.
-            if !*held_radio {
-                match lock::try_acquire(OWNER) {
-                    Ok(true) => {
-                        *held_radio = true;
-                        stop_ios_gatt().await;
-                    }
-                    Ok(false) => {
-                        debug!(
-                            "radio held by {:?}, backing off",
-                            lock::current_owner()
-                        );
-                        return RADIO_CONTENDED_BACKOFF;
-                    }
-                    Err(e) => {
-                        warn!("failed to acquire radio lock: {e}");
-                        return RADIO_CONTENDED_BACKOFF;
-                    }
+    if in_quiet_mode {
+        // Sleep-safe path. Acquire the radio for the brief BC call,
+        // then release if the car is truly asleep (so iOS GATT comes
+        // back). When in parked-confirmed (Sentry recording), keep
+        // the radio held — 1-min poll cadence means cycling GATT
+        // would burn ~10% of the time in stop/start churn.
+        let acquired = if *held_radio {
+            true
+        } else {
+            match lock::try_acquire(OWNER) {
+                Ok(true) => {
+                    *held_radio = true;
+                    stop_ios_gatt().await;
+                    true
                 }
-            }
-
-            // Throttle the software-update fetch: every cycle is
-            // wasteful (OS version only changes on OTAs), so only
-            // include it once per SOFTWARE_VERSION_INTERVAL.
-            let now_ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let include_software = now_ts - *last_software_check
-                >= SOFTWARE_VERSION_INTERVAL.as_secs() as i64;
-            match sample::sample_state(&cfg.vin, include_software).await {
-                Ok(s) => {
-                    if include_software {
-                        // Bump the gate even on a None result so we
-                        // don't retry the (possibly slow) call every
-                        // cycle when the car doesn't expose it.
-                        *last_software_check = now_ts;
-                    }
-                    persist(conn, s);
+                Ok(false) => {
+                    debug!("radio contended during quiet poll, skipping");
+                    false
                 }
                 Err(e) => {
-                    warn!("sample_state failed: {e}");
-                    // Keep the radio — transient failure (car
-                    // briefly out of range, BLE jitter). If
-                    // failures persist the next clip-write probe
-                    // will eventually flip us to Asleep.
+                    warn!("failed to acquire radio lock for quiet poll: {e}");
+                    false
                 }
             }
-            AWAKE_INTERVAL
-        }
-        CarState::Asleep => {
-            // Briefly take the radio for one sample, then release
-            // so iOS GATT can come back.
-            let acquired = if *held_radio {
-                true
-            } else {
-                match lock::try_acquire(OWNER) {
-                    Ok(true) => {
-                        stop_ios_gatt().await;
-                        true
-                    }
-                    Ok(false) => {
-                        debug!("radio contended during asleep sample, skipping");
-                        false
-                    }
-                    Err(e) => {
-                        warn!("failed to acquire radio lock for asleep sample: {e}");
-                        false
-                    }
+        };
+
+        if acquired {
+            // Always probe body-controller first — it's the
+            // canonical source of user_presence and is sleep-safe.
+            let presence_now = match sample::sample_body_controller(&cfg.vin).await {
+                Ok(bc) => {
+                    let p = bc.user_presence;
+                    persist(conn, bc.sample);
+                    p
+                }
+                Err(e) => {
+                    warn!("sample_body_controller failed: {e}");
+                    *last_user_presence
                 }
             };
 
-            if acquired {
-                match sample::sample_body_controller(&cfg.vin).await {
-                    Ok(s) => persist(conn, s),
-                    Err(e) => warn!("sample_body_controller failed: {e}"),
+            // Driver-got-back-in detection: user_presence flipped
+            // from NOT_PRESENT to PRESENT (was outside the car,
+            // now inside). Promote to Active immediately — the
+            // short returned Duration triggers a state poll on the
+            // next tick instead of waiting another full QUIET_INTERVAL.
+            if *last_user_presence == Some(false) && presence_now == Some(true) {
+                info!("user_presence flipped PRESENT — resuming full state polls");
+                *parked_polls = 0;
+                *last_user_presence = presence_now;
+                if car_truly_asleep {
+                    release_radio().await;
+                    *held_radio = false;
                 }
+                // 1s so the OS scheduler gets a moment; effectively
+                // immediate next tick → state poll.
+                return Duration::from_secs(1);
+            }
+
+            // When the user is in the car AND we're in Quiet
+            // (because shift_state was Park last we checked), also
+            // poll `state drive` to catch a shift change. This
+            // covers the "user sat in parked car for a while then
+            // drove away" case where user_presence never flips.
+            // The car was already awake (user is in it), so we're
+            // not making things worse from a sleep-timer
+            // perspective.
+            if presence_now == Some(true) {
+                match sample::sample_state(&cfg.vin).await {
+                    Ok(ss) => {
+                        let shift_changed_to_drive = ss
+                            .shift_state
+                            .map_or(false, |s| !s.is_park() && s != sample::ShiftState::Unknown);
+                        persist(conn, ss.sample);
+                        if shift_changed_to_drive {
+                            info!(
+                                "shift_state non-Park while user in car — resuming full state polls"
+                            );
+                            *parked_polls = 0;
+                            *last_user_presence = presence_now;
+                            return Duration::from_secs(1);
+                        }
+                    }
+                    Err(e) => {
+                        warn!("state drive probe in quiet+present failed: {e}");
+                    }
+                }
+            }
+
+            *last_user_presence = presence_now;
+            if car_truly_asleep {
+                // Deep sleep + no user → hand the radio back to
+                // iOS GATT between polls.
                 release_radio().await;
                 *held_radio = false;
             }
-            *asleep_attempts = asleep_attempts.saturating_add(1);
-            asleep_backoff(*asleep_attempts)
         }
+        QUIET_INTERVAL
+    } else {
+        // Active state polling — full telemetry, car stays awake.
+        if !*held_radio {
+            match lock::try_acquire(OWNER) {
+                Ok(true) => {
+                    *held_radio = true;
+                    stop_ios_gatt().await;
+                }
+                Ok(false) => {
+                    debug!(
+                        "radio held by {:?}, backing off",
+                        lock::current_owner()
+                    );
+                    return RADIO_CONTENDED_BACKOFF;
+                }
+                Err(e) => {
+                    warn!("failed to acquire radio lock: {e}");
+                    return RADIO_CONTENDED_BACKOFF;
+                }
+            }
+        }
+
+        match sample::sample_state(&cfg.vin).await {
+            Ok(ss) => {
+                // Update park-confirmation counter. Any non-Park
+                // reading resets it; an Unknown reading neither
+                // increments nor resets (better to stay in Active
+                // when the SDK returns a value we can't decode).
+                match ss.shift_state {
+                    Some(s) if s.is_park() => {
+                        *parked_polls = parked_polls.saturating_add(1);
+                        if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
+                            info!(
+                                "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
+                                PARK_CONFIRMATIONS_BEFORE_QUIET
+                            );
+                        }
+                    }
+                    Some(sample::ShiftState::Unknown) => {
+                        // leave counter alone
+                    }
+                    Some(_) => {
+                        // Drive / Reverse / Neutral — actively
+                        // moving, reset.
+                        *parked_polls = 0;
+                    }
+                    None => {
+                        // shift_state not present in response; treat
+                        // like Unknown.
+                    }
+                }
+                // Clear stale user_presence — next time we drop to
+                // Quiet, we want a fresh baseline before triggering
+                // the "got back in" transition.
+                *last_user_presence = None;
+                persist(conn, ss.sample);
+            }
+            Err(e) => {
+                warn!("sample_state failed: {e}");
+                // Keep the radio — transient failure (car
+                // briefly out of range, BLE jitter). If
+                // failures persist the next clip-write probe
+                // will eventually flip us to Asleep.
+            }
+        }
+        AWAKE_INTERVAL
     }
 }
 

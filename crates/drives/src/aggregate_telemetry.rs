@@ -157,13 +157,26 @@ pub fn compute_telemetry_for_window(
         )
         .optional()?;
 
-    // Software version: latest non-null in the window. Throttled
-    // sampling means most clips won't have it; the per-drive rollup
-    // takes the latest across the drive's clips.
-    let software_version: Option<String> = conn
+    // software_version intentionally not fetched — Tesla doesn't
+    // expose car_version over BLE, so this column is always NULL.
+
+    // v10 location_name: first / last non-null reverse-geocoded
+    // address in the clip window. Drive-level rollup chains these
+    // and (optionally) overrides with "Home"/"Work" based on the
+    // user's saved coords in `meta`.
+    let location_name_start: Option<String> = conn
         .query_row(
-            "SELECT software_version FROM telemetry_samples \
-             WHERE ts BETWEEN ?1 AND ?2 AND software_version IS NOT NULL \
+            "SELECT location_name FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 AND location_name IS NOT NULL \
+             ORDER BY ts ASC LIMIT 1",
+            params![start_ts, end_ts],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let location_name_end: Option<String> = conn
+        .query_row(
+            "SELECT location_name FROM telemetry_samples \
+             WHERE ts BETWEEN ?1 AND ?2 AND location_name IS NOT NULL \
              ORDER BY ts DESC LIMIT 1",
             params![start_ts, end_ts],
             |r| r.get(0),
@@ -200,7 +213,8 @@ pub fn compute_telemetry_for_window(
         tire_rr_psi,
         odometer_mi_start,
         odometer_mi_end,
-        software_version,
+        location_name_start,
+        location_name_end,
     })
 }
 
@@ -241,11 +255,12 @@ pub fn write_route_telemetry(
             tire_fl_psi       = ?7,
             tire_fr_psi       = ?8,
             tire_rl_psi       = ?9,
-            tire_rr_psi       = ?10,
-            odometer_mi_start = ?11,
-            odometer_mi_end   = ?12,
-            software_version  = ?13
-         WHERE file = ?14",
+            tire_rr_psi          = ?10,
+            odometer_mi_start    = ?11,
+            odometer_mi_end      = ?12,
+            location_name_start  = ?13,
+            location_name_end    = ?14
+         WHERE file = ?15",
         params![
             agg.battery_pct_start,
             agg.battery_pct_end,
@@ -259,7 +274,8 @@ pub fn write_route_telemetry(
             agg.tire_rr_psi,
             agg.odometer_mi_start,
             agg.odometer_mi_end,
-            agg.software_version,
+            agg.location_name_start,
+            agg.location_name_end,
             file,
         ],
     )?;

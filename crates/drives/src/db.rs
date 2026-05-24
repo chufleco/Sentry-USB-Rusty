@@ -1401,7 +1401,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 interior_temp_min, interior_temp_max, exterior_temp_avg,
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
-                odometer_mi_start, odometer_mi_end, software_version
+                odometer_mi_start, odometer_mi_end,
+                location_name_start, location_name_end
          FROM routes
          ORDER BY file",
     )?;
@@ -1448,11 +1449,16 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<f64>>(33)?,
                 row.get::<_, Option<f64>>(34)?,
             ),
-            // v9 odometer + software version
+            // v9 odometer. software_version intentionally not
+            // fetched — Tesla doesn't expose car_version over BLE.
             (
                 row.get::<_, Option<f64>>(35)?,
                 row.get::<_, Option<f64>>(36)?,
+            ),
+            // v10 location names (start / end)
+            (
                 row.get::<_, Option<String>>(37)?,
+                row.get::<_, Option<String>>(38)?,
             ),
         ))
     })?;
@@ -1492,7 +1498,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             exterior_temp_avg,
             hvac_runtime_s,
             (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
-            (odometer_mi_start, odometer_mi_end, software_version),
+            (odometer_mi_start, odometer_mi_end),
+            (location_name_start, location_name_end),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -1540,7 +1547,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 tire_rr_psi,
                 odometer_mi_start,
                 odometer_mi_end,
-                software_version,
+                location_name_start,
+                location_name_end,
             },
         });
     }

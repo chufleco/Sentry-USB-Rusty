@@ -307,7 +307,7 @@ pub async fn ble_latest_sample(
             let latest = conn
                 .query_row(
                     "SELECT ts, battery_pct, interior_temp_c, \
-                            exterior_temp_c, hvac_on, source, odometer_mi \
+                            exterior_temp_c, hvac_on, source, odometer_mi, location_name \
                      FROM telemetry_samples \
                      ORDER BY ts DESC LIMIT 1",
                     [],
@@ -320,15 +320,15 @@ pub async fn ble_latest_sample(
                             r.get::<_, Option<i64>>(4)?,
                             r.get::<_, String>(5)?,
                             r.get::<_, Option<f64>>(6)?,
+                            r.get::<_, Option<String>>(7)?,
                         ))
                     },
                 )
                 .ok();
-            // Slow-changing fields (TPMS, software_version) sample
-            // less often than every cycle. Pull the most-recent
-            // non-null per field separately so the live panel can
-            // show what we know even when the latest sample didn't
-            // include them.
+            // Slow-changing fields (TPMS) sample less often than every
+            // cycle. Pull the most-recent non-null per field separately
+            // so the live panel can show what we know even when the
+            // latest sample didn't include them.
             let latest_col_f64 = |col: &str| -> Option<f64> {
                 conn.query_row(
                     &format!(
@@ -341,15 +341,6 @@ pub async fn ble_latest_sample(
                 )
                 .ok()
             };
-            let latest_software: Option<String> = conn
-                .query_row(
-                    "SELECT software_version FROM telemetry_samples \
-                     WHERE software_version IS NOT NULL \
-                     ORDER BY ts DESC LIMIT 1",
-                    [],
-                    |r| r.get(0),
-                )
-                .ok();
             latest.map(|row| {
                 (
                     row,
@@ -359,7 +350,6 @@ pub async fn ble_latest_sample(
                         latest_col_f64("tire_rl_psi"),
                         latest_col_f64("tire_rr_psi"),
                     ),
-                    latest_software,
                 )
             })
         })
@@ -375,9 +365,8 @@ pub async fn ble_latest_sample(
 
     match row {
         Some((
-            (ts, battery_pct, interior_temp_c, exterior_temp_c, hvac_on, source, odometer_mi),
+            (ts, battery_pct, interior_temp_c, exterior_temp_c, hvac_on, source, odometer_mi, location_name),
             (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
-            software_version,
         )) => {
             (
                 StatusCode::OK,
@@ -393,7 +382,7 @@ pub async fn ble_latest_sample(
                     "tire_rl_psi": tire_rl_psi,
                     "tire_rr_psi": tire_rr_psi,
                     "odometer_mi": odometer_mi,
-                    "software_version": software_version,
+                    "location_name": location_name,
                     "source": source,
                 })),
             )

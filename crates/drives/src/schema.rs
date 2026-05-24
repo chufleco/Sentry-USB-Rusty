@@ -64,7 +64,21 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// (pre-v6 / v6 / v7 / v8 / v9 / fresh) ends up without the dead
 /// index in one pass. `IF EXISTS` makes the call a no-op on fresh
 /// DBs and on any subsequent open.
-pub const CURRENT_SCHEMA_VERSION: i32 = 9;
+///
+/// v9 -> v10: add `location_name` (TEXT) to `telemetry_samples` —
+/// Tesla's reverse-geocoded address string from `state drive`'s
+/// `locationState.locationName` field. Per-clip rollups
+/// `location_name_start` / `location_name_end` added to `routes`,
+/// populated by the aggregator from the first / last non-null
+/// sample in each clip's 60s window. The per-drive rollup chains
+/// these across clips so each drive in the list gets a friendly
+/// start → end label without needing to call an external
+/// reverse-geocoding API.
+///
+/// Also: `software_version` columns on both tables are kept for
+/// forward-compat but no longer written — Tesla doesn't expose
+/// `car_version` over BLE state queries.
+pub const CURRENT_SCHEMA_VERSION: i32 = 10;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -240,6 +254,21 @@ pub const V9_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
     ("software_version", "TEXT"),
 ];
 
+/// v10 `location_name` column on `telemetry_samples` — Tesla's
+/// reverse-geocoded address from `state drive`. Free human-readable
+/// drive start/end labels without needing to call a geocoder.
+pub const V10_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
+    ("location_name", "TEXT"),
+];
+
+/// v10 per-clip location-name rollups on `routes`. Populated by
+/// the aggregator from the first / last non-null sample in the
+/// clip's 60s window.
+pub const V10_ROUTE_COLUMNS: &[(&str, &str)] = &[
+    ("location_name_start", "TEXT"),
+    ("location_name_end", "TEXT"),
+];
+
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
 /// per-trip mileage delta that's more accurate than GPS distance
 /// (GPS over-estimates curves, drops in tunnels, can drift).
@@ -288,6 +317,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
         .chain(V7_ROUTE_TPMS_COLUMNS.iter())
         .chain(V9_ROUTE_COLUMNS.iter())
+        .chain(V10_ROUTE_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -304,6 +334,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS
         .iter()
         .chain(V9_TELEMETRY_COLUMNS.iter())
+        .chain(V10_TELEMETRY_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -478,7 +509,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9"),
+            Some("10"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -510,12 +541,13 @@ mod tests {
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
             .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing after migrate", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -541,12 +573,13 @@ mod tests {
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
             .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -574,12 +607,13 @@ mod tests {
             .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
             .chain(V7_ROUTE_TPMS_COLUMNS.iter())
             .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
         {
             assert!(existing.contains(*name), "column {} missing", name);
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -686,7 +720,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -737,7 +771,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -790,7 +824,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 
@@ -833,7 +867,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("9")
+            Some("10")
         );
     }
 

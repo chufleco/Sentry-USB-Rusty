@@ -928,8 +928,8 @@ fn build_summary(
         odometer_mi_start: None,
         odometer_mi_end: None,
         odometer_mi_driven: None,
-        software_version: None,
-        fsd_version: None,
+        start_location: None,
+        end_location: None,
         // Default null source to "sei" so the JSON contract matches Go
         // (`hide_tessie_overlapping_sei` and the FSD analytics filter
         // both compare to the literal "sei" string).
@@ -2583,11 +2583,7 @@ fn build_summary_from_aggregates(
         );
 
     // ── v6 BLE telemetry rollup across this drive's unique clips ──
-    // `had_fsd` controls whether the FSD-version badge is emitted —
-    // we only want to claim a version on drives where FSD was
-    // actually engaged at some point during the trip.
-    let had_fsd = fsd_engaged_ms > 0.0;
-    let telemetry = roll_up_telemetry_with_fsd(clips, had_fsd);
+    let telemetry = roll_up_telemetry(clips);
 
     let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
     let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
@@ -2640,8 +2636,12 @@ fn build_summary_from_aggregates(
         odometer_mi_start: telemetry.odometer_mi_start,
         odometer_mi_end: telemetry.odometer_mi_end,
         odometer_mi_driven: telemetry.odometer_mi_driven,
-        software_version: telemetry.software_version,
-        fsd_version: telemetry.fsd_version,
+        // start/end_location populated from the rolled-up Tesla
+        // address strings (first/last clip in the drive with a
+        // non-null `location_name` BLE sample). Whatever Tesla's
+        // own reverse-geocoder returned — no post-processing.
+        start_location: telemetry.location_name_start,
+        end_location: telemetry.location_name_end,
         // Match Go: null/empty source becomes "sei".
         source: Some(
             first_clip
@@ -2684,22 +2684,20 @@ struct DriveTelemetryRollup {
     tire_fr_psi: Option<f64>,
     tire_rl_psi: Option<f64>,
     tire_rr_psi: Option<f64>,
-    /// v9 odometer + software/FSD.
+    /// v9 odometer rollup.
     odometer_mi_start: Option<f64>,
     odometer_mi_end: Option<f64>,
     odometer_mi_driven: Option<f64>,
-    software_version: Option<String>,
-    fsd_version: Option<String>,
+    /// v10 raw Tesla location-name strings from the first/last
+    /// non-null clip in the drive. Stored verbatim — Tesla's
+    /// reverse-geocoder picks the label (street address, business
+    /// name, etc.). No post-processing or matching.
+    location_name_start: Option<String>,
+    location_name_end: Option<String>,
 }
 
-/// Rolls per-clip telemetry into per-drive scalars. `had_fsd` (drive
-/// actually engaged FSD at some point) gates the FSD-version badge —
-/// the product requirement is to only claim an FSD release on
-/// drives that actually used FSD.
-fn roll_up_telemetry_with_fsd(
-    clips: &[SubClipSummary],
-    had_fsd: bool,
-) -> DriveTelemetryRollup {
+/// Rolls per-clip telemetry into per-drive scalars.
+fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
     // Dedupe per parent file (same logic as the time-attributable
     // aggregates above) so a clip split into two sub-segments doesn't
     // get its telemetry counted twice.
@@ -2720,7 +2718,12 @@ fn roll_up_telemetry_with_fsd(
     // Odometer: first non-null start, last non-null end.
     let mut odo_start: Option<f64> = None;
     let mut odo_end: Option<f64> = None;
-    let mut software_version: Option<String> = None;
+    // Location names: first non-null start, last non-null end —
+    // mirror the odometer logic. The matcher overrides these to
+    // "Home"/"Work" downstream if the drive's GPS endpoints land
+    // near the user's saved coords.
+    let mut loc_start: Option<String> = None;
+    let mut loc_end: Option<String> = None;
 
     for clip in clips {
         if !seen.insert(clip.summary.file.as_str()) {
@@ -2757,8 +2760,13 @@ fn roll_up_telemetry_with_fsd(
         if let Some(v) = t.odometer_mi_end {
             odo_end = Some(v);
         }
-        if let Some(v) = &t.software_version {
-            software_version = Some(v.clone());
+        if loc_start.is_none() {
+            if let Some(v) = &t.location_name_start {
+                loc_start = Some(v.clone());
+            }
+        }
+        if let Some(v) = &t.location_name_end {
+            loc_end = Some(v.clone());
         }
     }
 
@@ -2789,22 +2797,8 @@ fn roll_up_telemetry_with_fsd(
             (Some(s), Some(e)) if e >= s => Some(round2(e - s)),
             _ => None,
         },
-        // FSD version only when (a) we know the OS version and
-        // (b) the drive actually had FSD engaged at some point.
-        // Unknown OS version with FSD engaged → "?" (so the badge
-        // still appears so the user knows it was an FSD drive).
-        fsd_version: if had_fsd {
-            Some(
-                software_version
-                    .as_deref()
-                    .and_then(crate::fsd_versions::fsd_version_for)
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "?".to_string()),
-            )
-        } else {
-            None
-        },
-        software_version,
+        location_name_start: loc_start,
+        location_name_end: loc_end,
     }
 }
 
@@ -3371,7 +3365,7 @@ mod tests {
 
     #[test]
     fn rollup_empty_drive_returns_all_none() {
-        let r = roll_up_telemetry_with_fsd(&[], false);
+        let r = roll_up_telemetry(&[]);
         assert!(r.battery_pct_start.is_none());
         assert!(r.battery_pct_end.is_none());
         assert!(r.battery_pct_used.is_none());
@@ -3400,7 +3394,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry_with_fsd(&clips, false);
+        let r = roll_up_telemetry(&clips);
         assert_eq!(r.battery_pct_start, Some(80.0));
         assert_eq!(r.battery_pct_end, Some(78.0));
         assert_eq!(r.battery_pct_used, Some(2.0));
@@ -3425,7 +3419,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry_with_fsd(&clips, false);
+        let r = roll_up_telemetry(&clips);
         assert_eq!(r.interior_temp_min_c, Some(17.0));
         assert_eq!(r.interior_temp_max_c, Some(28.0));
     }
@@ -3449,7 +3443,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry_with_fsd(&clips, false);
+        let r = roll_up_telemetry(&clips);
         assert_eq!(r.hvac_runtime_s, Some(135));
     }
 
@@ -3475,7 +3469,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts(1) }),
             SubClipSummary::whole(TimedSummary { summary: &s3, timestamp: ts(2) }),
         ];
-        let r = roll_up_telemetry_with_fsd(&clips, false);
+        let r = roll_up_telemetry(&clips);
         assert_eq!(r.battery_pct_start, Some(60.0));
         assert_eq!(r.battery_pct_end, Some(55.0));
         assert_eq!(r.battery_pct_used, Some(5.0));
@@ -3494,7 +3488,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
             SubClipSummary::whole(TimedSummary { summary: &s, timestamp: ts(0) }),
         ];
-        let r = roll_up_telemetry_with_fsd(&clips, false);
+        let r = roll_up_telemetry(&clips);
         assert_eq!(r.hvac_runtime_s, Some(30), "dedupe: hvac counted once, not twice");
         assert_eq!(r.battery_pct_start, Some(70.0));
         assert_eq!(r.battery_pct_end, Some(69.0));

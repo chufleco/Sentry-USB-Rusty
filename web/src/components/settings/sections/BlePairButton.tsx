@@ -55,7 +55,7 @@ interface BleLatestSample {
   tire_rl_psi?: number | null
   tire_rr_psi?: number | null
   odometer_mi?: number | null
-  software_version?: string | null
+  location_name?: string | null
   source?: string
 }
 
@@ -735,12 +735,12 @@ function TelemetryOutputPanel({
           {sample.odometer_mi != null && (
             <Row label="Odometer" value={fmtOdo(sample.odometer_mi, metric)} />
           )}
+          {sample.location_name && (
+            <Row label="Location" value={sample.location_name} />
+          )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
           <Row label="Exterior temp" value={fmtTemp(sample.exterior_temp_c, metric)} />
           <Row label="HVAC" value={fmtBool(sample.hvac_on)} />
-          {sample.software_version && (
-            <Row label="Tesla OS" value={sample.software_version} />
-          )}
           {/* Battery cell temperature intentionally omitted: Tesla
               doesn't expose it via state-query APIs (BLE or REST).
               Only battery_heater_on (a boolean) is available. */}

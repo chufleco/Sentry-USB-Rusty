@@ -30,11 +30,14 @@ pub fn open() -> Result<Connection> {
 /// duplicates only possible if the daemon races itself on a clock
 /// adjustment, in which case keeping the older row is fine.
 pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
+    // `software_version` column is intentionally not written —
+    // Tesla doesn't expose `car_version` over BLE. The column stays
+    // nullable in the schema for forward-compat.
     conn.execute(
         "INSERT OR IGNORE INTO telemetry_samples \
          (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
           tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, \
-          odometer_mi, software_version, source) \
+          odometer_mi, location_name, source) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             s.ts,
@@ -48,12 +51,13 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.tire_rl_psi,
             s.tire_rr_psi,
             s.odometer_mi,
-            s.software_version,
+            s.location_name,
             s.source,
         ],
     )?;
     Ok(())
 }
+
 
 #[cfg(test)]
 mod tests {
@@ -81,7 +85,7 @@ mod tests {
             tire_rl_psi: Some(38.5),
             tire_rr_psi: Some(39.0),
             odometer_mi: Some(12453.5),
-            software_version: Some("2026.2.9.10".into()),
+            location_name: Some("123 Main St".into()),
             source: "state".into(),
         };
         insert(&conn, &s).unwrap();

@@ -60,15 +60,14 @@ interface DriveSummary {
   tireFrPsi?: number
   tireRlPsi?: number
   tireRrPsi?: number
-  // v9 odometer + FSD version. odometerMiDriven is precomputed
-  // server-side (end - start, rounded). softwareVersion is the
-  // raw Tesla OS string; fsdVersion is the mapped FSD release and
-  // only appears on drives that actually had FSD engaged.
+  // v9 odometer. odometerMiDriven is precomputed server-side
+  // (end - start, rounded).
   odometerMiStart?: number
   odometerMiEnd?: number
   odometerMiDriven?: number
-  softwareVersion?: string
-  fsdVersion?: string
+  // v10 Tesla-supplied start/end address strings.
+  startLocation?: string
+  endLocation?: string
   source?: string
   externalSignature?: string
   tessieAutopilotPercent?: number
@@ -169,7 +168,6 @@ function TelemetryStrip({ d, metric }: {
     odometerMiStart?: number
     odometerMiEnd?: number
     odometerMiDriven?: number
-    fsdVersion?: string
   }
   metric: boolean
 }) {
@@ -186,7 +184,6 @@ function TelemetryStrip({ d, metric }: {
     d.exteriorTempAvgC != null ||
     d.hvacRuntimeS != null ||
     d.odometerMiDriven != null ||
-    d.fsdVersion != null ||
     hasTpms
   if (!hasAny) return null
 
@@ -207,15 +204,6 @@ function TelemetryStrip({ d, metric }: {
           {metric
             ? `${(d.odometerMiDriven * 1.609344).toFixed(1)} km odo`
             : `${d.odometerMiDriven.toFixed(1)} mi odo`}
-        </span>
-      )}
-      {d.fsdVersion != null && (
-        <span
-          className="inline-flex items-center gap-1"
-          title={`FSD version active during this drive (${d.fsdVersion === "?" ? "Tesla OS version not in lookup table" : "from software_version mapping"})`}
-        >
-          <Zap className="h-3 w-3 text-emerald-400/80" />
-          FSD {d.fsdVersion}
         </span>
       )}
       {d.batteryPctUsed != null && d.batteryPctUsed > 0 && (
@@ -304,12 +292,10 @@ function DriveTelemetryDetail({
     d.tireFrPsi != null ||
     d.tireRlPsi != null ||
     d.tireRrPsi != null
-  const hasSoftware = d.softwareVersion != null
-  const hasFsd = d.fsdVersion != null
 
   const hasAny =
     hasBattery || hasOdo || hasInteriorTemp || hasExteriorTemp ||
-    hasHvac || hasTpms || hasSoftware || hasFsd
+    hasHvac || hasTpms
   if (!hasAny) return null
 
   const tempStr = (c: number) =>
@@ -379,17 +365,6 @@ function DriveTelemetryDetail({
             label="HVAC"
             value={formatHvacRuntime(d.hvacRuntimeS)}
           />
-        )}
-        {hasFsd && (
-          <Stat
-            icon={<Zap className="h-3 w-3" />}
-            label="FSD version"
-            value={d.fsdVersion!}
-            highlight
-          />
-        )}
-        {hasSoftware && (
-          <Stat label="Tesla OS" value={d.softwareVersion!} />
         )}
       </div>
       {hasTpms && (
@@ -1305,6 +1280,11 @@ export default function Drives() {
                             </span>
                           ) : null })()}
                         </div>
+                        {(d.startLocation || d.endLocation) && (
+                          <div className="mt-0.5 truncate text-[11px] text-slate-400">
+                            {d.startLocation || "—"} → {d.endLocation || "—"}
+                          </div>
+                        )}
                         <div className="mt-1 flex gap-x-3 text-[11px] text-slate-500">
                           <span>{dist(d)}</span>
                           <span>{formatDuration(d.durationMs)}</span>
@@ -1455,6 +1435,11 @@ export default function Drives() {
                           </span>
                         ) : null })()}
                       </div>
+                      {(d.startLocation || d.endLocation) && (
+                        <div className="mt-0.5 truncate text-[11px] text-slate-400">
+                          {d.startLocation || "—"} → {d.endLocation || "—"}
+                        </div>
+                      )}
                       <div className="mt-1 flex gap-x-3 text-[11px] text-slate-500">
                         <span>{dist(d)}</span>
                         <span>{formatDuration(d.durationMs)}</span>
@@ -1643,6 +1628,22 @@ export default function Drives() {
                 <Stat icon={<Gauge className="h-3 w-3" />} label="Avg" value={avgSpd(selectedDrive)} />
                 <Stat label="Max" value={maxSpd(selectedDrive)} highlight />
               </div>
+
+              {/* Tesla-reported start/end address (BLE, v10+).
+                  Renders only when at least one end has a name —
+                  drives that predate the sampler, or whose clip
+                  windows had no location_name samples, get nothing. */}
+              {(selectedDrive.startLocation || selectedDrive.endLocation) && (
+                <div className="mb-2 flex items-center gap-1.5 rounded-lg border border-white/5 bg-white/[0.02] px-3 py-1.5 text-xs text-slate-300">
+                  <MapPin className="h-3 w-3 shrink-0 text-blue-400/80" />
+                  <span className="truncate">
+                    <span className="text-slate-500">From </span>
+                    {selectedDrive.startLocation || <span className="text-slate-600">—</span>}
+                    <span className="text-slate-500"> to </span>
+                    {selectedDrive.endLocation || <span className="text-slate-600">—</span>}
+                  </span>
+                </div>
+              )}
 
               {/* Assisted driving stats row */}
               {(selectedDrive.assistedPercent ?? 0) > 0 && (

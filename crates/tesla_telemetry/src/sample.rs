@@ -24,6 +24,51 @@ const TESLA_CONTROL: &str = "/root/bin/tesla-control";
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Tesla shift state. Decoded from `state drive`'s `shiftState`
+/// field which is either a string ("P"/"R"/"N"/"D") or a protobuf
+/// int (P=1, R=2, N=3, D=4). The sampler's phase machine uses this
+/// to decide whether the car is parked-and-recording (drop to
+/// sleep-safe body-controller polling) vs actually being driven
+/// (full state polls every 15s).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShiftState {
+    Park,
+    Reverse,
+    Neutral,
+    Drive,
+    /// Returned but value didn't match any known mapping. Treated
+    /// as not-Park to avoid spuriously back-off-ing during real
+    /// driving on a newer SDK.
+    Unknown,
+}
+
+impl ShiftState {
+    pub fn is_park(self) -> bool {
+        matches!(self, ShiftState::Park)
+    }
+}
+
+/// Result of a successful `sample_state` call. The Sample goes to
+/// the DB; the shift_state is in-memory state for the phase machine
+/// and intentionally NOT persisted (no DB column for it).
+pub struct StateSample {
+    pub sample: Sample,
+    pub shift_state: Option<ShiftState>,
+}
+
+/// Result of a body-controller-state probe. Both fields are
+/// in-memory signals for the phase machine — they ride the sample
+/// row so it gets persisted with a body_controller source marker,
+/// but the user_presence flag itself isn't stored.
+pub struct BodyControllerSample {
+    pub sample: Sample,
+    /// Driver-seat occupancy. Used to detect "user got back in"
+    /// while in body-controller-only mode so the sampler can
+    /// promote to full state polling without waiting for the
+    /// 15-min asleep cycle.
+    pub user_presence: Option<bool>,
+}
+
 /// A single point-in-time observation, in the shape the DB writer
 /// wants. All fields except `ts` and `source` are nullable because
 /// different sample paths populate different subsets.
@@ -45,35 +90,33 @@ pub struct Sample {
     /// Odometer in miles (Tesla native unit). Sampled every awake
     /// cycle — ticks continuously while driving.
     pub odometer_mi: Option<f64>,
-    /// Tesla OS version ("2026.2.9.10"). Only populated on cycles
-    /// that include the throttled software-update fetch (see
-    /// `sample_state`'s `include_software` flag).
-    pub software_version: Option<String>,
+    /// Tesla's reverse-geocoded address string for the car's
+    /// current location. Pulled from `state drive`. Used as
+    /// drive start/end labels in the UI.
+    pub location_name: Option<String>,
     pub source: String,
 }
 
-/// Full sample via `state climate` + `state charge`. Wakes the car
-/// briefly if it's asleep — only call when we already know the car
-/// is awake (recent clip writes).
+/// Full sample via `state climate` + `state charge` + `state drive`
+/// + `state tire-pressure`. Wakes the car briefly if it's asleep —
+/// only call when we already know the car is awake (recent clip
+/// writes).
 ///
-/// `include_software` controls whether the (relatively expensive)
-/// software-update fetch runs this cycle. The OS version only
-/// changes on OTAs, so the main loop throttles this to ~15 min via
-/// `SOFTWARE_VERSION_INTERVAL`.
-pub async fn sample_state(vin: &str, include_software: bool) -> Result<Sample> {
+/// Note: `state software-update` is intentionally not called. Its
+/// response only contains the *pending* OTA version (often " "
+/// when no update is queued), never the currently-installed
+/// `car_version`. That field lives in `VehicleState` which tesla-
+/// control doesn't expose as a state category, so there's no point
+/// burning BLE air time on it.
+pub async fn sample_state(vin: &str) -> Result<StateSample> {
     let climate = run_state(vin, "climate").await?;
     let charge = run_state(vin, "charge").await?;
-    // tire-pressure / drive / software-update are best-effort:
-    // cars or SDK versions that don't expose them return an error
-    // instead of populating fields. Don't let any of them fail the
-    // whole sample — just leave their fields as None.
+    // tire-pressure / drive are best-effort: cars or SDK versions
+    // that don't expose them return an error instead of populating
+    // fields. Don't let either fail the whole sample — just leave
+    // their fields as None.
     let tires = run_state(vin, "tire-pressure").await.ok();
     let drive = run_state(vin, "drive").await.ok();
-    let software = if include_software {
-        run_state(vin, "software-update").await.ok()
-    } else {
-        None
-    };
     let now = now_secs();
     // NOTE on battery_temp_c: Tesla's BLE state API does NOT expose
     // battery cell temperature. Both charge_state and climate_state
@@ -83,7 +126,7 @@ pub async fn sample_state(vin: &str, include_software: bool) -> Result<Sample> {
     // the public state query surface. We leave the column nullable
     // in the schema for forward compatibility (in case Tesla adds it
     // later) but we don't waste a probe trying to find it.
-    Ok(Sample {
+    let sample = Sample {
         ts: now,
         battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
         battery_temp_c: None,
@@ -122,32 +165,81 @@ pub async fn sample_state(vin: &str, include_software: bool) -> Result<Sample> {
             .as_ref()
             .and_then(|t| pick_f64(t, &["tpmsPressureRr", "tpms_pressure_rr"]))
             .map(bar_to_psi),
-        // Odometer lives in drive_state.
-        odometer_mi: drive
-            .as_ref()
-            .and_then(|d| pick_f64(d, &["odometer", "odometerMi"])),
-        // Tesla OS version. Tesla exposes the *currently installed*
-        // version on different fields depending on SDK build —
-        // `carVersion` / `car_version` (top-level vehicle state) or
-        // `version` inside the software-update payload. Try the most
-        // likely names; degrade to None on unknown shapes.
-        software_version: software.as_ref().and_then(|s| {
-            pick_string(s, &["carVersion", "car_version", "version"])
+        // Odometer — Tesla emits this as `odometerInHundredthsOfAMile`
+        // (an int) inside the `driveState` object. Convert to miles by
+        // dividing by 100. Keep fallback candidates in case the field
+        // name changes on a future SDK release.
+        odometer_mi: drive.as_ref().and_then(|d| {
+            pick_f64(
+                d,
+                &[
+                    "odometerInHundredthsOfAMile",
+                    "odometer_in_hundredths_of_a_mile",
+                ],
+            )
+            .map(|hundredths| hundredths / 100.0)
+            .or_else(|| {
+                // Older / alternate shape — assume already in miles.
+                pick_f64(
+                    d,
+                    &["odometer", "odometerMi", "odometer_mi", "odometerMiles"],
+                )
+            })
+        }),
+        // Reverse-geocoded address. Tesla emits it inside the
+        // `locationState` object that's also returned by `state drive`
+        // (separate from `driveState`); fall back to checking the
+        // top-level in case the shape varies. Becomes the drive
+        // start/end label after the per-drive rollup matches it (or
+        // doesn't) against the known home/work coords.
+        location_name: drive.as_ref().and_then(|d| {
+            pick_string(d, &["locationName", "location_name"])
         }),
         source: "state".into(),
+    };
+    // Decode shift state for the phase machine. Accepts string
+    // (P/R/N/D) or protobuf int (1/2/3/4). Returned alongside the
+    // Sample but NOT stored in the DB — it's purely a transient
+    // signal for "should the sampler back off to sleep-safe polling?"
+    let shift_state = drive
+        .as_ref()
+        .and_then(|d| pick_shift_state(d));
+
+    Ok(StateSample {
+        sample,
+        shift_state,
     })
 }
 
 /// Cheap sample via `body-controller-state` — works on a sleeping
-/// car, doesn't wake it. Populates only the timestamp and source; the
-/// reachability of the car is what's interesting, the absence of
-/// other fields is fine and the schema lets them stay NULL.
-pub async fn sample_body_controller(vin: &str) -> Result<Sample> {
-    let _ = run_tesla_control(vin, &["body-controller-state"]).await?;
-    Ok(Sample {
-        ts: now_secs(),
-        source: "body_controller".into(),
-        ..Sample::default()
+/// car, doesn't wake it. The Sample row is mostly NULL (the call
+/// doesn't return battery/temp/HVAC). The `user_presence` flag is
+/// the real reason to call this: it lets the sampler's phase
+/// machine notice when the driver gets back in to a parked car so
+/// it can resume state polling without waiting for the next slow
+/// asleep-mode tick.
+pub async fn sample_body_controller(vin: &str) -> Result<BodyControllerSample> {
+    let out = run_tesla_control(vin, &["body-controller-state"]).await?;
+    let parsed: serde_json::Value = serde_json::from_str(&out).unwrap_or(Value::Null);
+    // user_presence enum names vary across SDK versions: try the
+    // protobuf-mangled name first, then the snake-cased one. Values
+    // we treat as "present": the literal protobuf enum
+    // VEHICLE_USER_PRESENCE_PRESENT or a friendly "PRESENT" / "true".
+    let user_presence = pick_string(
+        &parsed,
+        &["userPresence", "user_presence", "vehicleUserPresence"],
+    )
+    .map(|s| {
+        let upper = s.to_ascii_uppercase();
+        upper.contains("PRESENT") && !upper.contains("NOT_PRESENT")
+    });
+    Ok(BodyControllerSample {
+        sample: Sample {
+            ts: now_secs(),
+            source: "body_controller".into(),
+            ..Sample::default()
+        },
+        user_presence,
     })
 }
 
@@ -231,7 +323,18 @@ fn pick_string(v: &Value, names: &[&str]) -> Option<String> {
 
 fn direct_string(v: &Value, name: &str) -> Option<String> {
     match v.get(name)? {
-        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        // Trim whitespace — Tesla's protojson output sometimes
+        // includes leading/trailing newlines on string fields, and
+        // an all-whitespace value should be treated as missing so
+        // the UI doesn't render a labelled-but-empty row.
+        Value::String(s) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        }
         _ => None,
     }
 }
@@ -254,6 +357,57 @@ fn direct_bool(v: &Value, name: &str) -> Option<bool> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Decode shift_state from `state drive` JSON. Tesla's protobuf
+/// emits this as a **oneof** — the JSON form is
+/// `"shiftState": {"P": {}}` (variant name as a key, empty object as
+/// value). Older SDK builds may also have emitted it as a string or
+/// protobuf int; we handle all three shapes for robustness.
+fn pick_shift_state(v: &Value) -> Option<ShiftState> {
+    // Locate the `shiftState` field — top level or one level
+    // nested (under `driveState`).
+    let shift = v
+        .get("shiftState")
+        .or_else(|| v.get("shift_state"))
+        .or_else(|| {
+            v.as_object()?
+                .values()
+                .find_map(|c| c.get("shiftState").or_else(|| c.get("shift_state")))
+        })?;
+
+    // Protobuf oneof shape: `{"P": {}}` — single key, empty value.
+    if let Value::Object(map) = shift {
+        if let Some(key) = map.keys().next() {
+            return Some(decode_shift_token(key));
+        }
+        return None;
+    }
+    // String shape: `"P"`.
+    if let Value::String(s) = shift {
+        return Some(decode_shift_token(s));
+    }
+    // Int shape: Protobuf SHIFT_STATE_P=1, R=2, N=3, D=4.
+    if let Some(n) = shift.as_i64() {
+        return Some(match n {
+            1 => ShiftState::Park,
+            2 => ShiftState::Reverse,
+            3 => ShiftState::Neutral,
+            4 => ShiftState::Drive,
+            _ => ShiftState::Unknown,
+        });
+    }
+    None
+}
+
+fn decode_shift_token(s: &str) -> ShiftState {
+    match s.to_ascii_uppercase().as_str() {
+        "P" | "PARK" | "SHIFT_STATE_P" => ShiftState::Park,
+        "R" | "REVERSE" | "SHIFT_STATE_R" => ShiftState::Reverse,
+        "N" | "NEUTRAL" | "SHIFT_STATE_N" => ShiftState::Neutral,
+        "D" | "DRIVE" | "SHIFT_STATE_D" => ShiftState::Drive,
+        _ => ShiftState::Unknown,
     }
 }
 
@@ -306,6 +460,49 @@ mod tests {
     fn parses_string_number() {
         let v = json!({"climateState": {"outsideTemp": "13.2"}});
         assert_eq!(pick_f64(&v, &["outsideTemp"]), Some(13.2));
+    }
+
+    #[test]
+    fn shift_state_string_decodes_park_drive() {
+        let v = json!({"driveState": {"shiftState": "P"}});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Park));
+        assert!(pick_shift_state(&v).unwrap().is_park());
+
+        let v = json!({"driveState": {"shiftState": "D"}});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Drive));
+        assert!(!pick_shift_state(&v).unwrap().is_park());
+    }
+
+    #[test]
+    fn shift_state_int_decodes_proto_form() {
+        // Protobuf SHIFT_STATE_P = 1
+        let v = json!({"shiftState": 1});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Park));
+        // SHIFT_STATE_D = 4
+        let v = json!({"shiftState": 4});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Drive));
+    }
+
+    #[test]
+    fn shift_state_decodes_protobuf_oneof_shape() {
+        // Real tesla-control output shape:
+        // {"driveState": {"shiftState": {"P": {}}}}
+        let v = json!({"driveState": {"shiftState": {"P": {}}}});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Park));
+        let v = json!({"driveState": {"shiftState": {"D": {}}}});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Drive));
+    }
+
+    #[test]
+    fn shift_state_unknown_for_garbage() {
+        let v = json!({"shiftState": "what"});
+        assert_eq!(pick_shift_state(&v), Some(ShiftState::Unknown));
+    }
+
+    #[test]
+    fn shift_state_none_when_missing() {
+        let v = json!({"unrelated": 1});
+        assert_eq!(pick_shift_state(&v), None);
     }
 
     #[test]
