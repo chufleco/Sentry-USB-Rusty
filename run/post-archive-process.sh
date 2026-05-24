@@ -267,6 +267,31 @@ if [ -x /root/bin/archive-is-reachable.sh ]; then
   fi
 fi
 
+# No-op short-circuit: skip the JSON regen + remote sync when the live
+# drives_count matches what the archive already has (the LAST_REACHABLE
+# baseline written at the end of the previous successful sync). The export
+# can take 3+ minutes on a well-used Pi (~848 MB on a year of dashcam data)
+# and rsync would then ship zero bytes — pure waste when nothing changed.
+#
+# Only short-circuits when a baseline exists (LAST_REACHABLE_EXISTS=true);
+# the first-ever post-archive run still regenerates + ships normally.
+# Compares drives_count, which is the user-visible "drives" number; if a
+# clip was processed but had no GPS, the processed_files list grows in the
+# DB but the archive's view of processed_files stays stale by one cycle —
+# harmless, since the route data itself is unchanged.
+SKIP_REGEN_SYNC=false
+if [ "$ARCHIVE_REACHABLE" = "true" ] && { [ -n "${RSYNC_SERVER:-}" ] || [ -n "${RCLONE_DRIVE:-}" ]; }; then
+  POST_STATS=$(curl -sf "${API_URL}/api/drives/stats" 2>/dev/null)
+  if [ $? -eq 0 ]; then
+    DRIVES_NOW=$(echo "$POST_STATS" | grep -o '"drives_count":[0-9]*' | cut -d: -f2)
+    DRIVES_NOW=${DRIVES_NOW:-0}
+    if [ "$LAST_REACHABLE_EXISTS" = "true" ] && [ "$DRIVES_NOW" -eq "$LAST_DRIVES_COUNT" ]; then
+      SKIP_REGEN_SYNC=true
+      log "No new drives since last successful sync (drives_count=${DRIVES_NOW}); skipping drive-data.json regen + archive sync."
+    fi
+  fi
+fi
+
 # Regenerate the drive-data.json mirror from the SQLite store before any
 # remote sync. The canonical live store is /backingfiles/drive-data.db; the
 # JSON file at $DRIVE_DATA_JSON (/backingfiles/drive-data.json) is rebuilt
@@ -276,7 +301,7 @@ fi
 # On older binaries that don't yet expose /api/drives/data/export-for-sync
 # this is a no-op (curl returns non-zero) and the rsync/rclone blocks
 # below ship whatever JSON is on disk, same as before.
-if [ "$ARCHIVE_REACHABLE" = "true" ] && { [ -n "${RSYNC_SERVER:-}" ] || [ -n "${RCLONE_DRIVE:-}" ]; }; then
+if [ "$SKIP_REGEN_SYNC" != "true" ] && [ "$ARCHIVE_REACHABLE" = "true" ] && { [ -n "${RSYNC_SERVER:-}" ] || [ -n "${RCLONE_DRIVE:-}" ]; }; then
   log "Regenerating drive-data.json mirror for archive sync..."
   EXPORT_RESULT=$(curl -sf -X POST "${API_URL}/api/drives/data/export-for-sync" 2>/dev/null)
   if [ $? -eq 0 ]; then
@@ -294,7 +319,7 @@ fi
 #
 # Size-guard: refuse if local file is dramatically smaller than the last
 # successful sync (see drive_data_size_guard_ok above).
-if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
+if [ "$SKIP_REGEN_SYNC" != "true" ] && [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RSYNC_USER:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
   if drive_data_size_guard_ok "$DRIVE_DATA_JSON" "rsync archive"; then
     log "Syncing drive-data.json to rsync archive..."
     if rsync -avh --no-perms --omit-dir-times --timeout=60 \
@@ -309,7 +334,7 @@ if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RSYNC_SERVER:-}" ] && [ -n "${RS
 fi
 
 # For rclone archive (no local mount; rclone pushes directly to cloud storage).
-if [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
+if [ "$SKIP_REGEN_SYNC" != "true" ] && [ "$ARCHIVE_REACHABLE" = "true" ] && [ -n "${RCLONE_DRIVE:-}" ] && [ -f "$DRIVE_DATA_JSON" ]; then
   if drive_data_size_guard_ok "$DRIVE_DATA_JSON" "rclone archive"; then
     log "Syncing drive-data.json to rclone archive..."
     if rclone --config /root/.config/rclone/rclone.conf copy \
