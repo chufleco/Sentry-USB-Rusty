@@ -412,12 +412,16 @@ pub async fn ble_diagnostics(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let output = tokio::task::spawn_blocking(|| {
+        // 1500 raw lines covers a long drive (~4 lines/min during
+        // awake mode × 4 = roughly 6 hours of history) and is
+        // still cheap for journalctl to spit out — most of these
+        // will get filtered out before they reach the UI.
         std::process::Command::new("journalctl")
             .args([
                 "-u",
                 "sentryusb-tesla-telemetry",
                 "-n",
-                "200",
+                "1500",
                 "--no-pager",
                 "--output=short-iso",
             ])
