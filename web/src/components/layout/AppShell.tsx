@@ -1,4 +1,4 @@
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { Outlet } from "react-router-dom"
 import { Menu } from "lucide-react"
 import { Sidebar } from "./Sidebar"
@@ -9,9 +9,46 @@ import { KeepAwakeProvider } from "@/hooks/useKeepAwake"
 import { AwayModeProvider } from "@/hooks/useAwayMode"
 import { ConnectionProvider } from "@/hooks/useConnectionStatus"
 
+// Routes likely to be visited after the Dashboard. Prefetched on idle
+// so navigation is instant. Heavy/rare routes (Terminal, Viewer with
+// leaflet, Community wraps) are intentionally NOT in this list — we
+// don't want to burn data on screens the user may never open.
+const PREFETCH_ROUTES: Array<() => Promise<unknown>> = [
+  () => import("@/pages/Drives"),
+  () => import("@/pages/Files"),
+  () => import("@/pages/Settings"),
+  () => import("@/pages/Logs"),
+]
+
 export function AppShell() {
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
+
+  // Warm the module cache for likely-next routes on idle. Respects
+  // Save-Data and effectively-slow connections so we don't punish
+  // metered users.
+  useEffect(() => {
+    const conn = (navigator as Navigator & {
+      connection?: { saveData?: boolean; effectiveType?: string }
+    }).connection
+    if (conn?.saveData) return
+    if (conn?.effectiveType === "slow-2g" || conn?.effectiveType === "2g") return
+
+    const idle = (window as Window & {
+      requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number
+    }).requestIdleCallback ?? ((cb: () => void) => setTimeout(cb, 1500))
+
+    const handle = idle(() => {
+      PREFETCH_ROUTES.forEach((load) => { load().catch(() => {}) })
+    }, { timeout: 3000 })
+
+    return () => {
+      const cancel = (window as Window & {
+        cancelIdleCallback?: (handle: number) => void
+      }).cancelIdleCallback
+      if (cancel && typeof handle === "number") cancel(handle)
+    }
+  }, [])
 
   return (
     <ConnectionProvider>
