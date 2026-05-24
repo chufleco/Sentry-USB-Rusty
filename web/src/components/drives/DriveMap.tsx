@@ -18,6 +18,13 @@ interface DriveMapProps {
   // True when the user's DRIVE_MAP_UNIT === "km". Controls the speed
   // unit displayed in the playback card.
   metric?: boolean
+  // Battery percentage at the drive's start / end (drive-level fields
+  // from telemetry aggregation — we don't have per-point battery).
+  // When both are present, the playback card shows a linearly
+  // interpolated battery % at the current scrubber index. When either
+  // is missing, the battery row is omitted from the card.
+  batteryStart?: number
+  batteryEnd?: number
 }
 
 const TILES = {
@@ -92,6 +99,24 @@ const WHEEL_SVG =
 const MPS_TO_MPH = 2.23694
 const MPS_TO_KPH = 3.6
 
+// Inline-SVG battery icon. Outer rectangle with a small terminal nub
+// on the right; the inner fill rect's width is set inline at call
+// time from the current battery percentage so the visual gauge tracks
+// the playback. `fill="currentColor"` so the CSS pill colour controls
+// the whole glyph.
+function batterySVG(pct: number): string {
+  // Inner fill spans x=3..x=18 (15 units wide max) and is proportional
+  // to pct. clamp so out-of-range readings can't blow past the bounds.
+  const fillW = Math.max(0, Math.min(15, (pct / 100) * 15))
+  return (
+    '<svg viewBox="0 0 22 12" width="18" height="10" fill="none" stroke="currentColor" stroke-width="1.2">' +
+    '<rect x="1" y="1" width="18" height="10" rx="2"/>' +
+    `<rect x="3" y="3" width="${fillW.toFixed(2)}" height="6" rx="1" fill="currentColor" stroke="none"/>` +
+    '<rect x="20" y="4" width="2" height="4" rx="0.5" fill="currentColor" stroke="none"/>' +
+    "</svg>"
+  )
+}
+
 // Build the HTML body of the playback tooltip for the given scrubber
 // index. Returns a string so Leaflet's `tooltip.setContent` can swap
 // it on every tick without paying React-reconciliation cost.
@@ -100,6 +125,7 @@ function renderPlaybackHTML(
   fsd: number | undefined,
   baseMs: number,
   metric: boolean,
+  battery: number | undefined,
 ): string {
   if (!pt) return ""
   const speedMps = pt[3] ?? 0
@@ -117,13 +143,35 @@ function renderPlaybackHTML(
     ? "playback-info__wheel playback-info__wheel--fsd"
     : "playback-info__wheel"
   const wheelTitle = isFsd ? "FSD engaged" : "Manual driving"
+  const batteryHtml =
+    battery !== undefined && Number.isFinite(battery)
+      ? `<span class="playback-info__battery" aria-label="Battery ${Math.round(battery)}%">` +
+        `${batterySVG(battery)}${Math.round(battery)}%</span>`
+      : ""
   return (
     `<div class="playback-info__time">${time}</div>` +
     `<div class="playback-info__row">` +
     `<span class="playback-info__speed">${speed} ${unit}</span>` +
     `<span class="${wheelClass}" title="${wheelTitle}" aria-label="${wheelTitle}">${WHEEL_SVG}</span>` +
+    batteryHtml +
     `</div>`
   )
+}
+
+// Linear interpolation between drive-start and drive-end battery
+// percent based on the scrubber's progress through the route. Returns
+// undefined when either end is missing so the caller can omit the
+// battery row from the tooltip rather than show "—%".
+function interpolateBattery(
+  start: number | undefined,
+  end: number | undefined,
+  idx: number,
+  total: number,
+): number | undefined {
+  if (start === undefined || end === undefined) return undefined
+  if (total <= 1) return start
+  const t = Math.max(0, Math.min(1, idx / (total - 1)))
+  return start + (end - start) * t
 }
 
 export function DriveMap({
@@ -134,6 +182,8 @@ export function DriveMap({
   source,
   startTime,
   metric = false,
+  batteryStart,
+  batteryEnd,
 }: DriveMapProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
@@ -220,11 +270,18 @@ export function DriveMap({
     // card sits beside the pulse rather than covering it; Leaflet
     // auto-flips when it would go off the map edge.
     const baseMs = startTime ? new Date(startTime).getTime() : NaN
+    const initialBattery = interpolateBattery(
+      batteryStart,
+      batteryEnd,
+      0,
+      points.length,
+    )
     const initialHtml = renderPlaybackHTML(
       points[0],
       fsdStates?.[0],
       baseMs,
       metric,
+      initialBattery,
     )
     pulseRef.current
       .bindTooltip(initialHtml, {
@@ -283,11 +340,23 @@ export function DriveMap({
     const tooltip = pulse.getTooltip()
     if (tooltip) {
       const baseMs = startTime ? new Date(startTime).getTime() : NaN
+      const battery = interpolateBattery(
+        batteryStart,
+        batteryEnd,
+        i,
+        points.length,
+      )
       tooltip.setContent(
-        renderPlaybackHTML(points[i], fsdStates?.[i], baseMs, metric),
+        renderPlaybackHTML(
+          points[i],
+          fsdStates?.[i],
+          baseMs,
+          metric,
+          battery,
+        ),
       )
     }
-  }, [currentIndex, points, fsdStates, startTime, metric])
+  }, [currentIndex, points, fsdStates, startTime, metric, batteryStart, batteryEnd])
 
   const cycleStyle = () => {
     setStyle((s) => (s === "dark" ? "streets" : s === "streets" ? "satellite" : "dark"))

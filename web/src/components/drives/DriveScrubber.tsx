@@ -149,9 +149,13 @@ export function DriveScrubber({ points, startTime, fsdStates }: DriveScrubberPro
             aria-hidden
           />
 
-          {/* Floating current-time label tracks the thumb position. */}
+          {/* Floating current-time label tracks the thumb position.
+              `whitespace-nowrap` keeps it on one line even near the
+              right edge of the bar where the translateX(-50%) puts the
+              label's right half outside the parent's content box —
+              without it, "7:16 PM" would wrap as "7:1" / "PM". */}
           <div
-            className="pointer-events-none absolute -bottom-5 text-[10px] font-semibold tabular-nums text-emerald-300"
+            className="pointer-events-none absolute -bottom-5 whitespace-nowrap text-[10px] font-semibold tabular-nums text-emerald-300"
             style={{ left: `${cursorPct}%`, transform: "translateX(-50%)" }}
             aria-hidden
           >

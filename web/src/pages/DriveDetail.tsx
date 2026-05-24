@@ -170,6 +170,8 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
             source={drive.source}
             startTime={drive.startTime}
             metric={metric}
+            batteryStart={drive.batteryPctStart}
+            batteryEnd={drive.batteryPctEnd}
           />
           {/* Drive tag chip floats over the bottom-left of the map.
               Click to open the popover; when no tags, shows just a
