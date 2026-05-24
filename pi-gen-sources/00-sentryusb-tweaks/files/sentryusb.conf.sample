@@ -82,6 +82,17 @@ export SHARE_PASSWORD='password'
 #export ARCHIVE_SENTRYCLIPS=false
 #export ARCHIVE_TRACKMODECLIPS=false
 
+# Enable post-archive drive auto-processing. When set to true, after each
+# archive_clips run completes, /root/bin/post-archive-process.sh fires
+# `POST /api/drives/process?post_archive=1` so newly archived clips get
+# parsed into the Drives tab (GPS, FSD %, speed/distance) automatically.
+#
+# Default is true (recommended). The script silently exits if this is unset
+# or false — which previously left users wondering why the Drives tab kept
+# showing stale data and only updated when "Process New Drives" was clicked
+# manually in the web UI. Set to false to opt out.
+export DRIVE_MAP_ENABLED=true
+
 # Notes on sd card and image sizes:
 #   * A 128 GB or larger sd card (or USB drive, when using Pi4) is recommended.
 #     The minimum supported size is 64 GB.

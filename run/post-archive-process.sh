@@ -13,7 +13,10 @@ set -uo pipefail
 
 source /root/bin/envsetup.sh 2>/dev/null || true
 
-if [ "${DRIVE_MAP_ENABLED:-false}" != "true" ]; then
+# Default to enabled. Users who want manual control (testing, or to
+# avoid coupling archive completion to drive-DB writes) can set
+# DRIVE_MAP_ENABLED=false in /root/sentryusb.conf to opt out.
+if [ "${DRIVE_MAP_ENABLED:-true}" != "true" ]; then
   exit 0
 fi
 
