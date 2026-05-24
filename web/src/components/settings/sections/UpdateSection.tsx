@@ -41,6 +41,7 @@ export function UpdateSection({ onInstallStart }: Props) {
   const [updateStatus, setUpdateStatus] = useState<UpdateStatus>("idle")
   const [updateError, setUpdateError] = useState<string | null>(null)
   const [updateMessage, setUpdateMessage] = useState<string | null>(null)
+  const [installedVersion, setInstalledVersion] = useState<string | null>(null)
   const [isCheckingUpdate, setIsCheckingUpdate] = useState(false)
   const [stableUpdate, setStableUpdate] = useState<ReleaseInfo | null>(null)
   const [prereleaseUpdate, setPrereleaseUpdate] = useState<ReleaseInfo | null>(null)
@@ -178,9 +179,15 @@ export function UpdateSection({ onInstallStart }: Props) {
     setUpdateStatus("checking_internet")
     setUpdateError(null)
     setUpdateMessage("Checking internet connection...")
+    // Track the version we're installing so the success modal and message
+    // can show it without trusting /api/system/version — the OLD daemon
+    // answers that endpoint until reboot fires and can return a stale tag.
+    const preUpdateVersion = version
+    let newVersion: string | null = targetVersion ?? null
+    setInstalledVersion(newVersion)
 
     const unsubscribe = wsClient.subscribe("update_status", (data: unknown) => {
-      const msg = data as { status?: string; message?: string; error?: string }
+      const msg = data as { status?: string; message?: string; error?: string; output?: string }
       if (msg.error) {
         setUpdateStatus("error")
         setUpdateError(msg.error)
@@ -198,6 +205,13 @@ export function UpdateSection({ onInstallStart }: Props) {
           restarting: "restarting",
         }
         setUpdateStatus(statusMap[msg.status] || "installing")
+      }
+      if (msg.status === "complete" && msg.output) {
+        const m = msg.output.match(/Updated to (\S+?)\.?\s*$/)
+        if (m) {
+          newVersion = m[1]
+          setInstalledVersion(newVersion)
+        }
       }
       if (msg.message) {
         setUpdateMessage(msg.message)
@@ -233,16 +247,30 @@ export function UpdateSection({ onInstallStart }: Props) {
             const r = await fetch("/api/system/version")
             if (r.ok) {
               const data = await r.json()
+              // Reject stale responses from the OLD daemon — it stays
+              // responsive until `reboot` fires and may answer before
+              // /opt/sentryusb/version has been rewritten with the new
+              // tag. Wait for either the expected new version or any
+              // version distinct from the pre-update one.
+              const polled = (data.version || "").trim()
+              const matchesNew = newVersion && polled === newVersion
+              const differsFromOld = preUpdateVersion && polled && polled !== preUpdateVersion
+              if (!matchesNew && !differsFromOld) return
               reconnected = true
               clearInterval(pollInterval)
               setStableUpdate(null)
               setPrereleaseUpdate(null)
               setRevertStable(null)
               setUpdateStatus("done")
-              setUpdateMessage(`Update complete — now running ${data.version || "latest"}`)
+              setUpdateMessage(`Update complete — now running ${newVersion || polled || "latest"}`)
               setTimeout(() => {
                 setUpdateStatus("idle")
                 setUpdateMessage(null)
+                setInstalledVersion(null)
+                // Hard reload so every cached chunk and hook (useVersion,
+                // feature-gated UI) picks up against the freshly installed
+                // backend instead of holding the pre-update snapshot.
+                window.location.reload()
               }, 6000)
             }
           } catch {
@@ -254,6 +282,7 @@ export function UpdateSection({ onInstallStart }: Props) {
             clearInterval(pollInterval)
             setUpdateStatus("idle")
             setUpdateMessage(null)
+            setInstalledVersion(null)
             setUpdateError("Update may still be in progress. Refresh the page in a moment.")
           }
         }, 180000)
@@ -263,6 +292,7 @@ export function UpdateSection({ onInstallStart }: Props) {
       setUpdateStatus("error")
       setUpdateError(err instanceof Error ? err.message : "Update failed")
       setUpdateMessage(null)
+      setInstalledVersion(null)
       setRevertStable(null)
     }
   }
@@ -491,7 +521,7 @@ export function UpdateSection({ onInstallStart }: Props) {
               {updateStatus === "reconnecting" && "Don't close this tab."}
               {updateStatus === "done" && (
                 <>
-                  Now running <span className="font-mono text-slate-200">{version}</span>.
+                  Now running <span className="font-mono text-slate-200">{installedVersion ?? version}</span>.
                 </>
               )}
             </p>
