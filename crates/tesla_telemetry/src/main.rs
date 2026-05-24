@@ -66,6 +66,21 @@ const TIRES_INTERVAL: Duration = Duration::from_secs(300);
 /// often is cheap from a battery-drain perspective.
 const QUIET_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Retry interval after a sub-sampler fails. Implements the
+/// "constantly pummel the endpoint with recons" pattern the Pi's
+/// bluez stack doesn't do natively — when the car's BLE side drops
+/// a connection (which it does aggressively to save battery), we
+/// want to hit it again within seconds, not wait the full normal
+/// interval. Catches the brief acceptance window before the car's
+/// connection table refills with other clients.
+const FAST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
+
+/// How many consecutive fast retries before backing off to the
+/// normal cadence. 3 × FAST_RETRY_INTERVAL = ~9s of aggressive
+/// retry per sub-sampler before giving up — enough to catch a real
+/// reconnection window without burning power on a truly dead link.
+const MAX_FAST_RETRIES: u32 = 3;
+
 /// How many consecutive state polls must show shift_state = Park
 /// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
 /// 45 s of confirmed Park before we stop hammering the car. Keeps
@@ -108,6 +123,15 @@ struct Schedule {
     next_climate: Instant,
     next_charge: Instant,
     next_tires: Instant,
+    /// Consecutive failure counters — used by the fast-retry
+    /// pattern. On a successful sub-sample they reset to 0; on
+    /// failure they increment and drive a 3s retry until
+    /// MAX_FAST_RETRIES is hit, at which point we back off to the
+    /// normal cadence to avoid hammering a permanently-dead link.
+    drive_failures: u32,
+    climate_failures: u32,
+    charge_failures: u32,
+    tires_failures: u32,
 }
 
 impl Schedule {
@@ -119,6 +143,10 @@ impl Schedule {
             next_climate: now,
             next_charge: now + CHARGE_INITIAL_OFFSET,
             next_tires: now,
+            drive_failures: 0,
+            climate_failures: 0,
+            charge_failures: 0,
+            tires_failures: 0,
         }
     }
     fn drive_due(&self, now: Instant) -> bool { now >= self.next_drive }
@@ -126,17 +154,37 @@ impl Schedule {
     fn charge_due(&self, now: Instant) -> bool { now >= self.next_charge }
     fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
 
-    fn mark_drive(&mut self, now: Instant) {
-        self.next_drive = now + DRIVE_INTERVAL;
+    /// Compute the next-due instant for a sub-sampler that just ran.
+    /// On success: normal interval. On failure within MAX_FAST_RETRIES:
+    /// short retry interval (~3s) to catch the car's brief
+    /// post-disconnect acceptance window. After too many fast retries
+    /// in a row: fall back to the normal interval so we don't burn
+    /// battery on a permanently-failing link.
+    fn next_after(now: Instant, success: bool, failures: u32, normal: Duration) -> Instant {
+        if success {
+            now + normal
+        } else if failures <= MAX_FAST_RETRIES {
+            now + FAST_RETRY_INTERVAL
+        } else {
+            now + normal
+        }
     }
-    fn mark_climate(&mut self, now: Instant) {
-        self.next_climate = now + CLIMATE_INTERVAL;
+
+    fn mark_drive(&mut self, now: Instant, success: bool) {
+        self.drive_failures = if success { 0 } else { self.drive_failures.saturating_add(1) };
+        self.next_drive = Self::next_after(now, success, self.drive_failures, DRIVE_INTERVAL);
     }
-    fn mark_charge(&mut self, now: Instant) {
-        self.next_charge = now + CHARGE_INTERVAL;
+    fn mark_climate(&mut self, now: Instant, success: bool) {
+        self.climate_failures = if success { 0 } else { self.climate_failures.saturating_add(1) };
+        self.next_climate = Self::next_after(now, success, self.climate_failures, CLIMATE_INTERVAL);
     }
-    fn mark_tires(&mut self, now: Instant) {
-        self.next_tires = now + TIRES_INTERVAL;
+    fn mark_charge(&mut self, now: Instant, success: bool) {
+        self.charge_failures = if success { 0 } else { self.charge_failures.saturating_add(1) };
+        self.next_charge = Self::next_after(now, success, self.charge_failures, CHARGE_INTERVAL);
+    }
+    fn mark_tires(&mut self, now: Instant, success: bool) {
+        self.tires_failures = if success { 0 } else { self.tires_failures.saturating_add(1) };
+        self.next_tires = Self::next_after(now, success, self.tires_failures, TIRES_INTERVAL);
     }
 
     /// When should the next tick fire? Min of all four next-due
@@ -455,66 +503,74 @@ async fn tick(
         // Carries: shiftState (drive detection), locationName,
         // odometer. The "must stay fresh" signals.
         if schedule.drive_due(tick_now) {
-            match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
+            let success = match sample::sample_drive(&cfg.vin, &cfg.adapter).await {
                 Ok(d) => {
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
                     shift_state_observed = d.shift_state;
+                    true
                 }
                 Err(e) => {
                     warn!("sample_drive failed: {e}");
+                    false
                 }
-            }
-            // Mark as polled regardless of result so we don't
-            // hot-retry-loop on persistent failures.
-            schedule.mark_drive(tick_now);
+            };
+            // Fast-retry on failure (~3s), normal interval on
+            // success. See Schedule::next_after for the pattern.
+            schedule.mark_drive(tick_now, success);
             any_call_ran = true;
         }
 
         // ── 2. CLIMATE (every 60s) ──
         if schedule.climate_due(tick_now) {
-            match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
+            let success = match sample::sample_climate(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;
                     sample.hvac_on = c.hvac_on;
+                    true
                 }
                 Err(e) => {
                     warn!("sample_climate failed: {e}");
+                    false
                 }
-            }
-            schedule.mark_climate(tick_now);
+            };
+            schedule.mark_climate(tick_now, success);
             any_call_ran = true;
         }
 
         // ── 3. CHARGE (every 60s, offset 30s from climate) ──
         if schedule.charge_due(tick_now) {
-            match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
+            let success = match sample::sample_charge(&cfg.vin, &cfg.adapter).await {
                 Ok(c) => {
                     sample.battery_pct = c.battery_pct;
+                    true
                 }
                 Err(e) => {
                     warn!("sample_charge failed: {e}");
+                    false
                 }
-            }
-            schedule.mark_charge(tick_now);
+            };
+            schedule.mark_charge(tick_now, success);
             any_call_ran = true;
         }
 
         // ── 4. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
-            match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
+            let success = match sample::sample_tires(&cfg.vin, &cfg.adapter).await {
                 Ok(t) => {
                     sample.tire_fl_psi = t.tire_fl_psi;
                     sample.tire_fr_psi = t.tire_fr_psi;
                     sample.tire_rl_psi = t.tire_rl_psi;
                     sample.tire_rr_psi = t.tire_rr_psi;
+                    true
                 }
                 Err(e) => {
                     warn!("sample_tires failed: {e}");
+                    false
                 }
-            }
-            schedule.mark_tires(tick_now);
+            };
+            schedule.mark_tires(tick_now, success);
             any_call_ran = true;
         }
 
