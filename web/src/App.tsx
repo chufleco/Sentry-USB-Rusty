@@ -8,6 +8,7 @@ import Files from "@/pages/Files"
 import Logs from "@/pages/Logs"
 import Settings from "@/pages/Settings"
 import Drives from "@/pages/Drives"
+import DriveDetail from "@/pages/DriveDetail"
 import Support from "@/pages/Support"
 import Terminal from "@/pages/Terminal"
 import FSDAnalytics from "@/pages/FSDAnalytics"
@@ -185,6 +186,7 @@ function AppContent() {
           <Route path="/files" element={<Files />} />
           <Route path="/logs" element={<Logs />} />
           <Route path="/drives" element={<Drives />} />
+          <Route path="/drives/:id" element={<DriveDetail />} />
           <Route path="/fsd" element={<FSDAnalytics />} />
           <Route path="/support" element={<Support />} />
           <Route path="/terminal" element={<Terminal />} />

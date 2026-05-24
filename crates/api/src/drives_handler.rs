@@ -232,16 +232,30 @@ pub async fn single_drive(
     }
 }
 
-/// GET /api/drives/routes — overview routes for map
+/// GET /api/drives/routes — overview routes for map.
+///
+/// Optional `max_points` query parameter (clamped to 2..=2000, defaults
+/// to 500) controls how aggressively each drive's polyline is
+/// downsampled. The Drives-list mini-map thumbnails request a small
+/// value (e.g. 20) to keep the wire payload manageable when fetching
+/// routes for hundreds of drives at once.
 pub async fn all_routes(
     State(state): State<AppState>,
+    Query(q): Query<AllRoutesQuery>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    let max_points = q.max_points.unwrap_or(500).clamp(2, 2000);
     match state.drives.store.with_routes(|routes| {
-        grouper::route_overviews(routes, 500)
+        grouper::route_overviews(routes, max_points)
     }) {
         Ok(overviews) => (StatusCode::OK, Json(serde_json::to_value(overviews).unwrap_or_default())),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
+}
+
+#[derive(Deserialize, Default)]
+pub struct AllRoutesQuery {
+    #[serde(default)]
+    pub max_points: Option<usize>,
 }
 
 /// GET /api/drives/tags — list all tags
