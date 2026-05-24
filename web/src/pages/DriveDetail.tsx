@@ -14,11 +14,12 @@ import {
   Wind,
 } from "lucide-react"
 import { useDriveDetail } from "@/hooks/useDriveDetail"
-import { ScrubberProvider, useScrubberSync } from "@/hooks/useScrubberSync"
+import { ScrubberProvider, useScrubberActions } from "@/hooks/useScrubberSync"
 import {
   formatDistance,
   formatDuration,
   formatHvacRuntime,
+  formatMiles,
   formatPercent,
   formatPsi,
   formatSpeed,
@@ -73,12 +74,12 @@ interface DriveDetailContentProps {
 }
 
 function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
-  const scrubber = useScrubberSync()
+  const { setTotal } = useScrubberActions()
   const metric = false
 
   useEffect(() => {
-    scrubber.setTotal(drive.points.length)
-  }, [drive.points.length, scrubber])
+    setTotal(drive.points.length)
+  }, [drive.points.length, setTotal])
 
   const title = drive.endLocation ?? "Drive"
   const sourceBadge = drive.source === "tessie" ? "Tessie" : "USB"
@@ -318,17 +319,17 @@ function OdometerSection({ drive }: { drive: DriveDetailType }) {
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
         <StatTile
           label="Start"
-          value={drive.odometerMiStart !== undefined ? `${drive.odometerMiStart.toFixed(1)} mi` : "—"}
+          value={drive.odometerMiStart !== undefined ? formatMiles(drive.odometerMiStart) : "—"}
           icon={<MapPin className="h-4 w-4" />}
         />
         <StatTile
           label="End"
-          value={drive.odometerMiEnd !== undefined ? `${drive.odometerMiEnd.toFixed(1)} mi` : "—"}
+          value={drive.odometerMiEnd !== undefined ? formatMiles(drive.odometerMiEnd) : "—"}
           icon={<MapPin className="h-4 w-4" />}
         />
         <StatTile
           label="Driven"
-          value={drive.odometerMiDriven !== undefined ? `${drive.odometerMiDriven.toFixed(1)} mi` : "—"}
+          value={drive.odometerMiDriven !== undefined ? formatMiles(drive.odometerMiDriven) : "—"}
           icon={<Gauge className="h-4 w-4" />}
         />
       </div>

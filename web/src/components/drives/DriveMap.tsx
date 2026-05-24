@@ -3,7 +3,7 @@ import L from "leaflet"
 import "leaflet/dist/leaflet.css"
 import { Layers } from "lucide-react"
 import { cn } from "@/lib/utils"
-import { useScrubberSync } from "@/hooks/useScrubberSync"
+import { useScrubberState } from "@/hooks/useScrubberSync"
 import type { FsdEvent } from "@/types/drives"
 
 interface DriveMapProps {
@@ -78,7 +78,7 @@ export function DriveMap({ points, fsdStates, fsdEvents, source }: DriveMapProps
   const eventsLayerRef = useRef<L.LayerGroup | null>(null)
   const [style, setStyle] = useState<Style>("dark")
   const [showEvents, setShowEvents] = useState(true)
-  const scrubber = useScrubberSync()
+  const { currentIndex } = useScrubberState()
 
   useEffect(() => {
     const el = containerRef.current
@@ -186,9 +186,9 @@ export function DriveMap({ points, fsdStates, fsdEvents, source }: DriveMapProps
   useEffect(() => {
     const pulse = pulseRef.current
     if (!pulse || points.length === 0) return
-    const i = Math.min(points.length - 1, Math.max(0, scrubber.currentIndex))
+    const i = Math.min(points.length - 1, Math.max(0, currentIndex))
     pulse.setLatLng(L.latLng(points[i][0], points[i][1]))
-  }, [scrubber.currentIndex, points])
+  }, [currentIndex, points])
 
   const cycleStyle = () => {
     setStyle((s) => (s === "dark" ? "streets" : s === "streets" ? "satellite" : "dark"))

@@ -17,7 +17,19 @@ export function formatHvacRuntime(seconds: number): string {
 export function formatDistance(mi: number, km: number, metric: boolean): string {
   const value = metric ? km : mi
   const unit = metric ? "km" : "mi"
-  return `${value.toFixed(2)} ${unit}`
+  return `${value.toLocaleString(undefined, {
+    minimumFractionDigits: 2,
+    maximumFractionDigits: 2,
+  })} ${unit}`
+}
+
+/** Format an odometer / distance value (in miles) with thousands separators
+ *  and the requested decimal precision. 31676.9 -> "31,676.9 mi". */
+export function formatMiles(mi: number, decimals = 1): string {
+  return `${mi.toLocaleString(undefined, {
+    minimumFractionDigits: decimals,
+    maximumFractionDigits: decimals,
+  })} mi`
 }
 
 export function formatSpeed(mph: number, kmh: number, metric: boolean): string {
