@@ -30,9 +30,17 @@ ExecStartPre=-/bin/bash -c 'f=/tmp/ble_radio_owner; if [ -e "$f" ] && [ "$(head 
 # inside the daemon's env. The Rust code re-reads on each iteration,
 # but seeding the initial env here makes the systemd status output
 # show the active VIN.
-EnvironmentFile=-/root/sentryusb.conf
-EnvironmentFile=-/boot/firmware/sentryusb.conf
-ExecStart=/root/bin/sentryusb-tesla-telemetry
+#
+# We can't use systemd's `EnvironmentFile=` directive: its parser only
+# accepts bare `KEY=value` and silently rejects every line starting
+# with `export KEY=value`. The user-facing /root/sentryusb.conf is
+# bash-style (archiveloop and other legacy shell scripts source it
+# directly), so EnvironmentFile= leaves the daemon with an empty env.
+#
+# Source via bash instead: `set -a` auto-exports every var sourced,
+# `source` understands `export` as a no-op when sourcing, and `exec`
+# swaps to the binary so systemd's PID tracking still works.
+ExecStart=/bin/bash -c 'set -a; source /root/sentryusb.conf 2>/dev/null; source /boot/firmware/sentryusb.conf 2>/dev/null; set +a; exec /root/bin/sentryusb-tesla-telemetry'
 Restart=always
 RestartSec=10
 StandardOutput=journal
