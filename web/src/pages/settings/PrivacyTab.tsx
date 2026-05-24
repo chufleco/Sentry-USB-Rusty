@@ -149,7 +149,7 @@ export function PrivacyTab() {
             Full privacy policy ↗
           </a>
           <a
-            href="https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main/wiki/Privacy.md"
+            href="https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/Privacy"
             target="_blank"
             rel="noopener noreferrer"
             className="t-sm text-blue-400 hover:text-blue-300"
