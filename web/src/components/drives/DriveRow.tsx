@@ -1,7 +1,7 @@
 import { Clock, Gauge, Sparkles } from "lucide-react"
 import { useNavigate } from "react-router-dom"
 import { cn } from "@/lib/utils"
-import { formatDistance, formatDuration } from "@/lib/drive-format"
+import { formatDistance, formatDuration, formatPercent } from "@/lib/drive-format"
 import type { DriveSummary } from "@/types/drives"
 import { DualPinBlock } from "./DualPinBlock"
 import { MiniRouteMap } from "./MiniRouteMap"
@@ -37,8 +37,8 @@ export function DriveRow({
 
   const originLabel = drive.startLocation ?? formatGps(drive.startPoint) ?? "Unknown origin"
   const destinationLabel = drive.endLocation ?? formatGps(drive.endPoint) ?? "Unknown destination"
-  const fsdRounded = Math.round(drive.fsdPercent)
-  const fsdFull = fsdRounded >= 100
+  const fsdDisplay = formatPercent(drive.fsdPercent)
+  const fsdFull = drive.fsdPercent >= 100
 
   return (
     <div
@@ -110,7 +110,7 @@ export function DriveRow({
           </Chip>
           <Chip emphasis>
             <Sparkles className="h-3.5 w-3.5" />
-            FSD {fsdRounded}%
+            FSD {fsdDisplay}%
             {fsdFull && (
               <span className="ml-0.5 text-amber-300" aria-hidden>
                 ★

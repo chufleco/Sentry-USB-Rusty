@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react"
 import L from "leaflet"
 import "leaflet/dist/leaflet.css"
-import { Layers, Pause, Play } from "lucide-react"
+import { Layers } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useScrubberSync } from "@/hooks/useScrubberSync"
 import type { FsdEvent } from "@/types/drives"
@@ -141,23 +141,6 @@ export function DriveMap({ points, fsdEvents, source }: DriveMapProps) {
             FSD
           </button>
         )}
-      </div>
-      <div className="absolute left-2 top-2 z-[400]">
-        <button
-          type="button"
-          onClick={() => scrubber.setPlaying(!scrubber.playing)}
-          className="inline-flex items-center gap-1.5 rounded-md border border-white/10 bg-slate-900/85 px-2.5 py-1 text-xs font-medium text-slate-200 backdrop-blur hover:bg-slate-800"
-        >
-          {scrubber.playing ? (
-            <>
-              <Pause className="h-3.5 w-3.5" /> Pause
-            </>
-          ) : (
-            <>
-              <Play className="h-3.5 w-3.5" /> Play
-            </>
-          )}
-        </button>
       </div>
     </div>
   )

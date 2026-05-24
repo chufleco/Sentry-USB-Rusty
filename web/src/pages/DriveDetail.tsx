@@ -19,6 +19,7 @@ import {
   formatDistance,
   formatDuration,
   formatHvacRuntime,
+  formatPercent,
   formatPsi,
   formatSpeed,
   formatTempC,
@@ -95,7 +96,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   }, [drive.points, metric])
 
   const speedUnit = metric ? "km/h" : "mph"
-  const fsdFull = Math.round(drive.fsdPercent) >= 100
+  const fsdFull = drive.fsdPercent >= 100
 
   return (
     <>
@@ -147,7 +148,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         />
         <StatTile
           label="Self-driving"
-          value={`${Math.round(drive.fsdPercent)}%`}
+          value={`${formatPercent(drive.fsdPercent)}%`}
           icon={<Sparkles className="h-4 w-4" />}
           star={fsdFull}
           info="Percentage of the drive's distance with FSD engaged."
@@ -260,7 +261,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
       <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
         <StatTile
           label="FSD"
-          value={`${Math.round(drive.fsdPercent)}%`}
+          value={`${formatPercent(drive.fsdPercent)}%`}
           icon={<Sparkles className="h-4 w-4" />}
           info="Time + distance share with Full Self-Driving (Supervised) engaged."
         />
@@ -283,7 +284,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
         />
         <StatTile
           label="Autopilot"
-          value={`${Math.round(drive.autosteerPercent)}%`}
+          value={`${formatPercent(drive.autosteerPercent)}%`}
           icon={<Sparkles className="h-4 w-4" />}
           info="Autosteer share (lane-keeping without FSD)."
         />
@@ -294,7 +295,7 @@ function AssistedSection({ drive, metric }: AssistedSectionProps) {
         />
         <StatTile
           label="TACC"
-          value={`${Math.round(drive.taccPercent)}%`}
+          value={`${formatPercent(drive.taccPercent)}%`}
           icon={<Sparkles className="h-4 w-4" />}
           info="Traffic-Aware Cruise Control share (speed regulation only)."
         />

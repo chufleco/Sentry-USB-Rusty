@@ -57,3 +57,13 @@ export function formatPsi(psi: number | undefined): string {
   if (psi === undefined) return "—"
   return `${psi.toFixed(1)} psi`
 }
+
+/**
+ * Format a percentage with up to 2 decimal places, trailing zeros trimmed.
+ * Examples: 99.4567 → "99.46", 99.5 → "99.5", 100 → "100", 0 → "0".
+ * Preserves the raw value's precision without showing more than 2 decimals.
+ */
+export function formatPercent(n: number): string {
+  if (!Number.isFinite(n)) return "0"
+  return parseFloat(n.toFixed(2)).toString()
+}

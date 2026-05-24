@@ -16,11 +16,18 @@ export function DriveScrubber({ points, startTime }: DriveScrubberProps) {
   const current = points[Math.min(scrubber.currentIndex, max)]
   const label = current ? formatPointTime(current[2], startTime) : "—"
 
+  const togglePlay = () => {
+    if (!scrubber.playing && scrubber.currentIndex >= max) {
+      scrubber.setIndex(0)
+    }
+    scrubber.setPlaying(!scrubber.playing)
+  }
+
   return (
     <div className="mt-3 flex items-center gap-3">
       <button
         type="button"
-        onClick={() => scrubber.setPlaying(!scrubber.playing)}
+        onClick={togglePlay}
         className="inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-emerald-500/90 text-slate-950 transition-colors hover:bg-emerald-400"
         aria-label={scrubber.playing ? "Pause" : "Play"}
       >
