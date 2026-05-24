@@ -114,6 +114,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
       <div className="mt-4">
         <DriveMap
           points={drive.points}
+          fsdStates={drive.fsdStates}
           fsdEvents={drive.fsdEvents}
           source={drive.source}
         />
