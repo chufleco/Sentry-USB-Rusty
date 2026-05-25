@@ -127,9 +127,41 @@ export function KeepAwakeStep({ data, onChange, onBatchChange }: StepProps) {
 
       {/* Method-specific fields */}
       {method === "ble" && (
-        <Field label="Vehicle VIN" field="TESLA_BLE_VIN" placeholder="5YJ3E1EA4JF000001" data={data} onChange={onChange}
-          hint="After setup, use the Pair BLE button in Settings to complete pairing."
-          error={!data.TESLA_BLE_VIN?.trim()} />
+        <div className="space-y-3">
+          <Field label="Vehicle VIN" field="TESLA_BLE_VIN" placeholder="5YJ3E1EA4JF000001" data={data} onChange={onChange}
+            hint="After setup, use the Pair BLE button in Settings to complete pairing."
+            error={!data.TESLA_BLE_VIN?.trim()} />
+
+          {/* Opt-in upsell for BLE telemetry. Since the user already
+              chose BLE for keep-awake, enabling telemetry is just a
+              flag flip — no extra pairing, no extra hardware. Off
+              by default so picking BLE for keep-awake doesn't silently
+              start sampling the car. Can be toggled any time later
+              from the BLE card in Settings. */}
+          <label className={cn(
+            "flex cursor-pointer items-start gap-3 rounded-lg border p-3 transition-colors",
+            data.BLE_ENABLED === "yes"
+              ? "border-blue-500/40 bg-blue-500/10"
+              : "border-white/5 bg-white/[0.02] hover:border-white/10"
+          )}>
+            <input
+              type="checkbox"
+              checked={data.BLE_ENABLED === "yes"}
+              onChange={(e) => onChange("BLE_ENABLED", e.target.checked ? "yes" : "no")}
+              className="mt-0.5 accent-blue-500"
+            />
+            <div>
+              <p className="text-sm font-medium text-slate-300">
+                Also enable BLE telemetry for drive tracking
+              </p>
+              <p className="mt-0.5 text-xs text-slate-600">
+                Reads battery, temps, TPMS, odometer, and location from your car.
+                Adds richer data to the Drives tab. You can flip this any time
+                later from the Settings tab.
+              </p>
+            </div>
+          </label>
+        </div>
       )}
       {method === "teslafi" && (
         <Field label="TeslaFi API Token" field="TESLAFI_API_TOKEN" type="password" placeholder="Your TeslaFi API token" data={data} onChange={onChange}
