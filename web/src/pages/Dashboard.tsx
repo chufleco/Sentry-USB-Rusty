@@ -220,7 +220,12 @@ export default function Dashboard() {
       })
       .catch(() => {})
 
-    const statusInterval = setInterval(fetchStatus, 1000)
+    // Status drives the live-tile values (CPU, mem, temp). 2s is fast
+    // enough that a glance still feels real-time and halves the
+    // server hits vs the previous 1s cadence. The uptime tile uses a
+    // separate local 1s interval below so the seconds counter still
+    // advances smoothly between server polls.
+    const statusInterval = setInterval(fetchStatus, 2000)
     const statsInterval = setInterval(fetchDriveStats, 5000)
     const storageInterval = setInterval(fetchStorageBreakdown, 10000)
     const uptimeInterval = setInterval(() => setUptime((p) => p + 1), 1000)
