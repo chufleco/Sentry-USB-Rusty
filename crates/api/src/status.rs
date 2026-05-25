@@ -33,14 +33,54 @@ use crate::router::AppState;
 #[derive(Clone, Default)]
 struct CachedNetwork {
     wifi_ssid: String,
-    wifi_strength: String,
-    wifi_signal_dbm: Option<i32>,
     wifi_ip: String,
     ether_ip: String,
     ether_speed: String,
     /// Cached device names so we don't re-scan /sys/class/net every poll.
+    /// Signal strength + throughput are read live in `get_status` —
+    /// `wifi_strength` / `wifi_signal_dbm` come from /proc/net/wireless
+    /// (a single file read, no shell-out), and the bps values are
+    /// derived from the net_sampler. Everything else here changes only
+    /// when the user reconnects or swaps cable, so it's safe to cache.
     wifi_dev: String,
     eth_dev: String,
+}
+
+/// Live signal read from /proc/net/wireless — no fork+exec.
+///
+/// Returns `(strength_as_X/70, signal_dbm)`. The `/70` denominator
+/// matches what mainline mac80211 drivers (Broadcom Cypress on Pi 4/5
+/// and Pi Zero 2 W, Realtek on most third-party chipsets) report as
+/// the max link quality; other drivers may scale slightly differently,
+/// in which case the WifiBars indicator is approximate but the dBm
+/// value the UI also shows is always exact.
+///
+/// /proc/net/wireless format:
+/// ```
+/// Inter-| sta-|   Quality        |   Discarded packets               | Missed | WE
+///  face | tus | link level noise |  nwid  crypt   frag  retry   misc | beacon | 22
+///  wlan0: 0000   58.  -52.  -256        0      0      0      0    137        0
+/// ```
+fn read_wireless_quality(dev: &str) -> Option<(String, Option<i32>)> {
+    let data = std::fs::read_to_string("/proc/net/wireless").ok()?;
+    for line in data.lines().skip(2) {
+        let line = line.trim_start();
+        // Match either "wlan0:" or "wlan0 :" — kernel emits the former.
+        let prefix = format!("{}:", dev);
+        if !line.starts_with(&prefix) {
+            continue;
+        }
+        let cols: Vec<&str> = line[prefix.len()..].split_whitespace().collect();
+        // [status, link, level, noise, ...]
+        if cols.len() < 3 {
+            return None;
+        }
+        // Values end with a `.` (e.g. "58." for fixed-point) — strip it.
+        let link = cols[1].trim_end_matches('.').parse::<u32>().ok()?;
+        let level = cols[2].trim_end_matches('.').parse::<i32>().ok();
+        return Some((format!("{}/70", link), level));
+    }
+    None
 }
 
 #[derive(Clone, Copy, Default)]
@@ -224,18 +264,26 @@ pub async fn get_status(
         s.free_space = storage.free_space.to_string();
     }
 
-    // Network info — cached. The IP/SSID/signal/speed values are
-    // refreshed at NETWORK_TTL; throughput (rx_bps/tx_bps) is always
-    // fresh because it's derived from the net_sampler that the
-    // background poller updates independently.
+    // Network info — IPs, SSID, and ether_speed are cached at
+    // NETWORK_TTL (they change only on reconnect/cable swap).
+    //
+    // WiFi signal strength + dBm are read LIVE from /proc/net/wireless
+    // every poll so the bars and dBm value update in near-real-time as
+    // the user moves around — the cached version would lag by 10 s,
+    // which feels broken for a "signal strength" indicator.
+    //
+    // Throughput (rx_bps/tx_bps) is also live, derived from the
+    // net_sampler background loop.
     let net = cached_network().await;
     s.wifi_ssid = net.wifi_ssid;
-    s.wifi_strength = net.wifi_strength;
-    s.wifi_signal_dbm = net.wifi_signal_dbm;
     s.wifi_ip = net.wifi_ip;
     s.ether_ip = net.ether_ip;
     s.ether_speed = net.ether_speed;
     if !net.wifi_dev.is_empty() {
+        if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
+            s.wifi_strength = strength;
+            s.wifi_signal_dbm = dbm;
+        }
         let (rx, tx) = compute_throughput(&state.net_sampler, &net.wifi_dev);
         s.wifi_rx_bps = rx;
         s.wifi_tx_bps = tx;
@@ -274,40 +322,20 @@ async fn compute_network_info() -> CachedNetwork {
 
     // WiFi info — skip shell queries when interface is down (saves 5-10s
     // on ethernet-only systems where wlan0 exists but is unconfigured).
-    // The three shell-outs run concurrently — they're independent reads,
-    // so serializing them is wasted wallclock on a slow Pi.
+    // `iwconfig` is no longer needed here — signal strength + dBm are
+    // read live from /proc/net/wireless on every status poll, so this
+    // cache only needs the SSID and IP (both rare-change values).
     let wifi_dev = find_net_device("wl*");
     if !wifi_dev.is_empty() && iface_is_up(&wifi_dev) {
         info.wifi_dev = wifi_dev.clone();
         let ssid_args = ["-r", wifi_dev.as_str()];
-        let iwc_args = [wifi_dev.as_str()];
         let ip_args = ["-4", "addr", "show", wifi_dev.as_str()];
-        let (ssid_r, iwc_r, ip_r) = tokio::join!(
+        let (ssid_r, ip_r) = tokio::join!(
             sentryusb_shell::run("iwgetid", &ssid_args),
-            sentryusb_shell::run("iwconfig", &iwc_args),
             sentryusb_shell::run("ip", &ip_args),
         );
         if let Ok(out) = ssid_r {
             info.wifi_ssid = out.trim().to_string();
-        }
-        if let Ok(out) = iwc_r {
-            for line in out.lines() {
-                if let Some(after) = line.split("Link Quality=").nth(1) {
-                    if let Some(qual) = after.split_whitespace().next() {
-                        info.wifi_strength = qual.to_string();
-                    }
-                }
-                // Same line typically contains "Signal level=-48 dBm". Parse
-                // only the integer portion so we don't smuggle units through
-                // the JSON and the frontend can format consistently.
-                if let Some(after) = line.split("Signal level=").nth(1) {
-                    if let Some(tok) = after.split_whitespace().next() {
-                        if let Ok(dbm) = tok.parse::<i32>() {
-                            info.wifi_signal_dbm = Some(dbm);
-                        }
-                    }
-                }
-            }
         }
         if let Ok(out) = ip_r {
             for line in out.lines() {
