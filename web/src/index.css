@@ -369,14 +369,16 @@ code, pre, .font-mono {
   border: none;
 }
 .drive-pulse {
-  width: 24px;
-  height: 24px;
+  width: 18px;
+  height: 18px;
   display: flex;
   align-items: center;
   justify-content: center;
   transform-origin: 50% 50%;
-  /* Soft drop-shadow makes the arrow legible on every tile style. */
-  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
+  /* Tight drop-shadow keeps the arrow legible on light tile styles
+     (satellite, streets) without adding visual bulk that makes the
+     marker read bigger than its actual footprint. */
+  filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6));
   pointer-events: none;
 }
 .drive-pulse img {
