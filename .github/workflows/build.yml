@@ -77,27 +77,35 @@ jobs:
           #
           # Enabling foreign architectures alone isn't enough: Ubuntu
           # serves arm64/armhf binary packages from ports.ubuntu.com,
-          # NOT from the default security/archive mirrors. So:
-          #   1. Restrict the default sources to [arch=amd64] (otherwise
-          #      apt tries to fetch arm64 from security.ubuntu.com 404)
-          #   2. Add ports.ubuntu.com as [arch=arm64,armhf] separately
-          #   3. Then dpkg --add-architecture + apt-get install
+          # NOT from the default security/archive mirrors. Patching
+          # the existing sources turned out to be fragile across
+          # runner images (legacy sources.list vs DEB822
+          # sources.list.d/ubuntu.sources, with or without backports
+          # pocket, etc.), so we wholesale-replace both files with
+          # arch-scoped entries we control completely.
           #
           # armv6 piggybacks on the armhf package set (same EABI; the
           # libdbus C headers are bit-identical between armhf and armel).
           UBUNTU_CODENAME=$(lsb_release -cs)
-          sudo sed -i 's|^deb http|deb [arch=amd64,i386] http|' /etc/apt/sources.list
-          # Some runners use sources.list.d/ubuntu.sources (DEB822
-          # format) instead of the legacy sources.list. Match either.
-          if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then
-            sudo sed -i 's|^Architectures:.*|Architectures: amd64 i386|; t; /^Types:/a Architectures: amd64 i386' \
-              /etc/apt/sources.list.d/ubuntu.sources || true
-          fi
+          echo "Ubuntu codename: $UBUNTU_CODENAME"
+          # Wipe any existing sources so a stale [arch=] line on the
+          # runner image doesn't smuggle in a 404-bound fetch.
+          sudo rm -f /etc/apt/sources.list.d/ubuntu.sources
+          sudo tee /etc/apt/sources.list >/dev/null <<EOF
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME} main restricted universe multiverse
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-updates main restricted universe multiverse
+          deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-backports main restricted universe multiverse
+          deb [arch=amd64,i386] http://security.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-security main restricted universe multiverse
+          EOF
           sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<EOF
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME} main restricted universe multiverse
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-updates main restricted universe multiverse
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-security main restricted universe multiverse
           EOF
+          echo "=== Resulting sources.list ==="
+          cat /etc/apt/sources.list
+          echo "=== Resulting ports.list ==="
+          cat /etc/apt/sources.list.d/ports.list
           sudo dpkg --add-architecture arm64
           sudo dpkg --add-architecture armhf
           sudo apt-get update -qq
