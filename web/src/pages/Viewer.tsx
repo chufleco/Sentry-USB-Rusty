@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef, useCallback, useMemo } from "react"
+import { useState, useEffect, useRef, useCallback, useMemo, lazy, Suspense } from "react"
 import {
   Video, Play, Pause, SkipBack, SkipForward, Loader2,
   Maximize, Minimize, Trash2,
@@ -9,7 +9,11 @@ import { cn } from "@/lib/utils"
 import type { ClipEntry, ClipGroup, EventMeta } from "@/lib/api"
 import { useTelemetry } from "@/hooks/useTelemetry"
 import TelemetryOverlay from "@/components/viewer/TelemetryOverlay"
-import MiniMap from "@/components/viewer/MiniMap"
+
+// Lazy so leaflet (~149 KB / 43 KB gz) only fetches when the user
+// opens a clip that has GPS telemetry. Dashcam-only or non-Tesla
+// clips never trigger the map chunk.
+const MiniMap = lazy(() => import("@/components/viewer/MiniMap"))
 
 interface ClipSet {
   timestamp: string
@@ -833,7 +837,9 @@ export default function Viewer() {
                 })}
                 {/* Mini map */}
                 {telemetry && telemetry.has_gps && !focusedCamera && (
-                  <MiniMap telemetry={telemetry} currentFrame={currentFrame} />
+                  <Suspense fallback={null}>
+                    <MiniMap telemetry={telemetry} currentFrame={currentFrame} />
+                  </Suspense>
                 )}
               </div>
 
