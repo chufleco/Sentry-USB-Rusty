@@ -74,6 +74,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-status", get(crate::system::ble_status))
         .route("/api/system/ble-enabled", get(crate::ble::ble_enabled_get))
         .route("/api/system/ble-enabled", post(crate::ble::ble_enabled_set))
+        .route(
+            "/api/system/ble-keep-awake-enabled",
+            get(crate::ble::ble_keep_awake_enabled_get),
+        )
+        .route(
+            "/api/system/ble-keep-awake-enabled",
+            post(crate::ble::ble_keep_awake_enabled_set),
+        )
         .route("/api/system/ble-vin", post(crate::ble::ble_vin_set))
         .route("/api/system/ble-connected", get(crate::ble::ble_connected))
         .route("/api/system/ble-install", post(crate::ble::ble_install))

@@ -5,41 +5,59 @@ import { Toggle } from "@/components/ui/Toggle"
 import { Pill } from "@/components/ui/Pill"
 
 /**
- * Master Tesla-BLE enable/disable toggle.
+ * Two independent BLE feature toggles for Pi → car:
+ *   - Telemetry (battery, temps, TPMS, location, odometer)
+ *   - Keep-awake nudge (prevents USB power-off during archive cycles)
  *
- * Sits beside `BlePairButton` in the Device settings tab. Flipping
- * this off is the user's "kill switch" for the Pi-as-phone-key
- * proximity-unlock concern: with BLE disabled the keep-awake nudge,
- * telemetry sampler, and pairing handshake all refuse to run. The
- * iOS-app GATT daemon stays unaffected — this only governs Pi → car
- * commands.
+ * Both share the same paired BLE key and VIN; they just decide whether
+ * each feature does anything. Turning everything off is the kill
+ * switch — the iOS-app GATT peripheral is unaffected by either toggle.
  */
 export function BleEnableToggle() {
-  const [enabled, setEnabled] = useState<boolean | null>(null)
+  const [telemetry, setTelemetry] = useState<boolean | null>(null)
+  const [keepAwake, setKeepAwake] = useState<boolean | null>(null)
   const [busy, setBusy] = useState(false)
   const [err, setErr] = useState<string | null>(null)
 
   useEffect(() => {
-    fetch("/api/system/ble-enabled")
-      .then((r) => r.json())
-      .then((d) => setEnabled(Boolean(d?.enabled)))
-      .catch(() => setEnabled(false))
+    let cancelled = false
+    Promise.all([
+      fetch("/api/system/ble-enabled").then((r) => r.json()),
+      fetch("/api/system/ble-keep-awake-enabled").then((r) => r.json()),
+    ])
+      .then(([t, k]) => {
+        if (cancelled) return
+        setTelemetry(Boolean(t?.enabled))
+        setKeepAwake(Boolean(k?.enabled))
+      })
+      .catch(() => {
+        if (cancelled) return
+        setTelemetry(false)
+        setKeepAwake(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
-  async function handleToggle(next: boolean) {
+  async function update(
+    endpoint: string,
+    next: boolean,
+    setter: (v: boolean) => void,
+  ) {
     setBusy(true)
     setErr(null)
     try {
-      const res = await fetch("/api/system/ble-enabled", {
+      const res = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ enabled: next }),
       })
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || "Failed to update BLE toggle")
+        throw new Error(data.error || "Failed to update")
       }
-      setEnabled(next)
+      setter(next)
     } catch (e) {
       setErr(e instanceof Error ? e.message : "Failed to update")
     } finally {
@@ -47,8 +65,9 @@ export function BleEnableToggle() {
     }
   }
 
-  const isOn = enabled === true
-  const icon = isOn ? (
+  const anyOn = telemetry === true || keepAwake === true
+  const loaded = telemetry !== null && keepAwake !== null
+  const icon = anyOn ? (
     <ShieldCheck className="h-3.5 w-3.5" />
   ) : (
     <ShieldAlert className="h-3.5 w-3.5" />
@@ -57,26 +76,37 @@ export function BleEnableToggle() {
   return (
     <PrefCard
       icon={icon}
-      halo={isOn ? "accent" : "amber"}
+      halo={anyOn ? "accent" : "amber"}
       title="Tesla BLE"
       badge={
-        enabled === null ? null : (
-          <Pill kind={isOn ? "accent" : "amber"}>{isOn ? "Enabled" : "Disabled"}</Pill>
-        )
+        loaded ? (
+          <Pill kind={anyOn ? "accent" : "amber"}>
+            {anyOn ? "In use" : "Off"}
+          </Pill>
+        ) : null
       }
     >
-      <Toggle
-        checked={isOn}
-        disabled={busy || enabled === null}
-        onChange={handleToggle}
-        label="Allow Pi → car BLE commands"
-        sub={
-          isOn
-            ? "Pairing, telemetry, and keep-awake nudges can talk to the car."
-            : "Pi cannot send any BLE commands to the car. iOS-app pairing is unaffected."
-        }
-      />
-      {err && <p className="text-xs text-red-400">{err}</p>}
+      <div className="flex flex-col gap-3">
+        <Toggle
+          checked={telemetry === true}
+          disabled={busy || !loaded}
+          onChange={(v) =>
+            update("/api/system/ble-enabled", v, setTelemetry)
+          }
+          label="Use BLE for telemetry"
+          sub="Reads battery, temps, HVAC, TPMS, odometer, and location from your car."
+        />
+        <Toggle
+          checked={keepAwake === true}
+          disabled={busy || !loaded}
+          onChange={(v) =>
+            update("/api/system/ble-keep-awake-enabled", v, setKeepAwake)
+          }
+          label="Use BLE for keep-awake"
+          sub="Nudges the car over BLE during archive cycles so USB power stays on."
+        />
+        {err && <p className="text-xs text-red-400">{err}</p>}
+      </div>
     </PrefCard>
   )
 }

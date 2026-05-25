@@ -33,18 +33,16 @@ else
   # Maximum age (seconds) before a lock file is considered stale.
   BLE_LOCK_MAX_AGE=86400  # 24 hours
 
-  # Treat BLE as disabled when the user has flipped the toggle off, OR
-  # when neither the config flag nor the legacy /root/.ble/paired
-  # implicit-yes signal is present.  Matches the api crate's
-  # is_ble_enabled() resolution order.
+  # BLE keep-awake is now controlled by its own dedicated flag,
+  # independent of the telemetry-side `BLE_ENABLED`. Users who only
+  # want telemetry can leave keep-awake off, and vice versa. Existing
+  # installs get migrated to the new flag at API startup via
+  # `migrate_legacy_ble_flag` in crates/api/src/ble.rs.
   ble_is_enabled() {
-    case "${BLE_ENABLED:-}" in
+    case "${BLE_KEEP_AWAKE_ENABLED:-}" in
       yes|true|1) return 0 ;;
-      no|false|0) return 1 ;;
+      *) return 1 ;;
     esac
-    # Unset: implicit yes when VIN configured or pairing artifact present.
-    if [[ -n "${TESLA_BLE_VIN:+x}" ]]; then return 0; fi
-    [ -e /root/.ble/paired ]
   }
 
   ble_disable_gatt_daemon() {

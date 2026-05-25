@@ -253,6 +253,11 @@ async fn main() {
 
     // Resume Away Mode if the flag file still has time remaining.
     sentryusb_api::away_mode::restore_from_file();
+    // One-shot: migrate legacy "VIN implies BLE on" users to explicit
+    // BLE_ENABLED + BLE_KEEP_AWAKE_ENABLED flags so they don't lose
+    // either feature across the decoupling change. Idempotent —
+    // skips if `BLE_KEEP_AWAKE_ENABLED` is already present.
+    sentryusb_api::ble::migrate_legacy_ble_flag();
     phase!("startup_tasks_spawned");
 
     // Build the API router

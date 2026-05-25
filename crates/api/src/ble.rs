@@ -8,7 +8,6 @@
 //! trigger an on-demand install of `tesla-control` / `tesla-keygen` if
 //! they didn't enable BLE during initial setup.
 
-use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use axum::Json;
@@ -36,16 +35,13 @@ pub fn mark_ble_success() {
     LAST_BLE_SUCCESS_TS.store(now, Ordering::Relaxed);
 }
 
-/// Whether Tesla BLE is currently enabled by the user.
-///
-/// Resolution order:
-///   1. Explicit `BLE_ENABLED=yes|no|true|false|1|0` in the config —
-///      always wins. Set by the settings toggle.
-///   2. Implicit "yes" if the user previously configured BLE
-///      (`TESLA_BLE_VIN` present in config), so existing installs
-///      don't silently lose BLE on upgrade.
-///   3. Implicit "yes" if the paired marker exists.
-///   4. Default "no" for fresh installs — user opts in via settings.
+/// Whether the Tesla BLE telemetry sampler should be running.
+/// **Telemetry-specific** — does NOT control the BLE keep-awake nudge
+/// (that's `is_ble_keep_awake_enabled`). Strictly explicit: only true
+/// when `BLE_ENABLED=yes|true|1` is in the config. Existing installs
+/// are handled by `migrate_legacy_ble_flag` at API startup, which
+/// writes an explicit `BLE_ENABLED=yes` for users who'd been relying
+/// on the old "VIN present = implicit yes" behavior.
 pub fn is_ble_enabled() -> bool {
     let config_path = sentryusb_config::find_config_path();
     if let Ok((active, commented)) = sentryusb_config::parse_file(config_path) {
@@ -54,11 +50,79 @@ pub fn is_ble_enabled() -> bool {
         {
             return matches!(v.as_str(), "yes" | "true" | "1");
         }
-        if active.contains_key("TESLA_BLE_VIN") {
-            return true;
+    }
+    false
+}
+
+/// Whether the BLE keep-awake nudge (in `run/awake_start`) should
+/// take the BLE path. Separate from telemetry so a user can pick:
+/// telemetry only, keep-awake only, both, or neither — all four are
+/// valid choices for a paired Pi.
+pub fn is_ble_keep_awake_enabled() -> bool {
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, commented)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = sentryusb_config::get_config_value(
+            &active,
+            &commented,
+            "BLE_KEEP_AWAKE_ENABLED",
+        ) {
+            return matches!(v.as_str(), "yes" | "true" | "1");
         }
     }
-    Path::new("/root/.ble/paired").exists()
+    false
+}
+
+/// One-shot migration: existing prebuilt-image users may have only
+/// `TESLA_BLE_VIN` set (their pairing was done before the explicit
+/// `BLE_ENABLED` / `BLE_KEEP_AWAKE_ENABLED` toggles existed). For
+/// them, the old code treated VIN-present as implicit "yes" for both
+/// telemetry and keep-awake. To preserve that behavior across the
+/// decoupling change without surprising anyone, we write explicit
+/// values once based on what was implied before.
+///
+/// Rules:
+///   * If `BLE_KEEP_AWAKE_ENABLED` already present → skip (migration done)
+///   * If `BLE_ENABLED=no` explicitly → set keep-awake=no (user had BLE off)
+///   * If `BLE_ENABLED=yes` explicitly → set keep-awake=yes (preserve old coupling)
+///   * If `BLE_ENABLED` unset BUT `TESLA_BLE_VIN` set → set both =yes
+///     (preserve the old "implicit yes from VIN" behavior)
+///   * Else → no migration needed (fresh install, user picks both toggles)
+pub fn migrate_legacy_ble_flag() {
+    let config_path = sentryusb_config::find_config_path();
+    let Ok((mut active, commented)) = sentryusb_config::parse_file(config_path) else {
+        return;
+    };
+    if active.contains_key("BLE_KEEP_AWAKE_ENABLED") {
+        return; // already migrated
+    }
+    let explicit_ble =
+        sentryusb_config::get_config_value(&active, &commented, "BLE_ENABLED");
+    let has_vin = active.contains_key("TESLA_BLE_VIN");
+
+    let (telemetry, keep_awake) = match explicit_ble.as_deref() {
+        Some(v) if matches!(v, "yes" | "true" | "1") => ("yes", "yes"),
+        Some(_) => ("no", "no"),
+        None if has_vin => ("yes", "yes"),
+        None => return, // nothing to migrate
+    };
+
+    active.insert("BLE_ENABLED".to_string(), telemetry.to_string());
+    active.insert(
+        "BLE_KEEP_AWAKE_ENABLED".to_string(),
+        keep_awake.to_string(),
+    );
+    let _ = std::process::Command::new("bash")
+        .args(["-c", "/root/bin/remountfs_rw"])
+        .status();
+    if let Err(e) = sentryusb_config::write_file(config_path, &active) {
+        tracing::warn!("BLE config migration write failed: {e}");
+    } else {
+        tracing::info!(
+            "BLE config migrated: BLE_ENABLED={}, BLE_KEEP_AWAKE_ENABLED={}",
+            telemetry,
+            keep_awake
+        );
+    }
 }
 
 /// GET /api/system/ble-enabled
@@ -160,6 +224,66 @@ fn first_external_adapter() -> Option<String> {
         .collect();
     ids.sort();
     ids.into_iter().next()
+}
+
+/// GET /api/system/ble-keep-awake-enabled
+pub async fn ble_keep_awake_enabled_get(
+    State(_s): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "enabled": is_ble_keep_awake_enabled() })),
+    )
+}
+
+/// POST /api/system/ble-keep-awake-enabled
+///
+/// Body: `{"enabled": true|false}`. Writes `BLE_KEEP_AWAKE_ENABLED`.
+/// Independent of `BLE_ENABLED` (telemetry), so users can flip either
+/// without affecting the other. The `awake_start` script reads this
+/// value on every nudge cycle, so the change is eventually consistent
+/// without needing a service restart.
+pub async fn ble_keep_awake_enabled_set(
+    State(_s): State<AppState>,
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let enabled = match body.get("enabled").and_then(|v| v.as_bool()) {
+        Some(b) => b,
+        None => {
+            return crate::json_error(
+                StatusCode::BAD_REQUEST,
+                "missing or non-bool `enabled` field",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        let config_path = sentryusb_config::find_config_path();
+        let (mut active, _) = sentryusb_config::parse_file(config_path)?;
+        active.insert(
+            "BLE_KEEP_AWAKE_ENABLED".to_string(),
+            if enabled { "yes" } else { "no" }.to_string(),
+        );
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "/root/bin/remountfs_rw"])
+            .status();
+        sentryusb_config::write_file(config_path, &active)?;
+        Ok(())
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "enabled": enabled })),
+        ),
+        Ok(Err(e)) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to write config: {}", e),
+        ),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("config write task panicked: {}", e),
+        ),
+    }
 }
 
 /// POST /api/system/ble-vin

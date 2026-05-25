@@ -42,17 +42,15 @@ impl BleConfig {
         let config_path = sentryusb_config::find_config_path();
         let (active, commented) = sentryusb_config::parse_file(config_path)?;
 
-        // BLE_ENABLED resolution mirrors api/src/ble.rs::is_ble_enabled.
+        // BLE_ENABLED is now telemetry-specific and strictly explicit
+        // — no more implicit yes-if-VIN-set. The api crate runs
+        // `migrate_legacy_ble_flag` at startup which writes an
+        // explicit BLE_ENABLED for existing users so they don't lose
+        // their telemetry on upgrade. See api/src/ble.rs.
         let enabled =
             match sentryusb_config::get_config_value(&active, &commented, "BLE_ENABLED") {
                 Some(v) => matches!(v.as_str(), "yes" | "true" | "1"),
-                None => {
-                    // Unset → legacy default: implicit "yes" if user
-                    // previously configured BLE (VIN present or paired
-                    // marker), else "no".
-                    active.contains_key("TESLA_BLE_VIN")
-                        || std::path::Path::new("/root/.ble/paired").exists()
-                }
+                None => false,
             };
 
         let vin = active
