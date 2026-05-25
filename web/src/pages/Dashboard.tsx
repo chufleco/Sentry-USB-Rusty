@@ -141,6 +141,12 @@ export default function Dashboard() {
   // "Parked Xh Ym" duration. One-shot fetch on mount + a refresh
   // when a drive-process WebSocket completion comes in.
   const [latestDriveEnd, setLatestDriveEnd] = useState<string | null>(null)
+  // Active lock-chime sound name (e.g. "Star Wars Theme") when the
+  // feature is configured. null means "no active chime", which hides
+  // the indicator entirely. Fetched once on mount + refreshed every
+  // 5 minutes (the active chime rarely changes — manual user action
+  // on the LockChime page is the only source).
+  const [activeChimeName, setActiveChimeName] = useState<string | null>(null)
 
   const archiveHistoryRef = useRef<ProgressSample[]>([])
   const processHistoryRef = useRef<ProgressSample[]>([])
@@ -276,9 +282,30 @@ export default function Dashboard() {
       }
     }
 
+    // Active lock-chime probe. Endpoint is /api/lockchime/list — it
+    // returns the full sound directory, but we only need
+    // active_name/active_set. The list is small (filename + size per
+    // sound) so the extra payload is negligible.
+    async function fetchActiveChime() {
+      try {
+        const res = await fetch("/api/lockchime/list")
+        if (!res.ok) return
+        const d = (await res.json()) as {
+          active_set?: boolean
+          active_name?: string
+        }
+        if (!mounted) return
+        setActiveChimeName(d.active_set && d.active_name ? d.active_name : null)
+      } catch {
+        /* non-critical */
+      }
+    }
+
     fetchCarStatusSample()
     fetchLatestDrive()
+    fetchActiveChime()
     const carStatusInterval = setInterval(fetchCarStatusSample, 30_000)
+    const chimeInterval = setInterval(fetchActiveChime, 300_000)
 
     // Status drives the live-tile values (CPU, mem, temp). 2s is fast
     // enough that a glance still feels real-time and halves the
@@ -317,6 +344,7 @@ export default function Dashboard() {
       clearInterval(storageInterval)
       clearInterval(uptimeInterval)
       clearInterval(carStatusInterval)
+      clearInterval(chimeInterval)
       unsubscribe()
     }
   }, [])
@@ -436,19 +464,24 @@ export default function Dashboard() {
         {isAwayActive && <AwayModeTile />}
       </div>
 
-      {/* Car status overview — top of dashboard. Shows last-known
-          battery / cabin temps / tire health as compact chips, with
-          the tire-pressure history chart hidden behind an expand
-          toggle on the Tires chip. The chart bundle (recharts ~380KB)
-          stays unloaded until the user expands it. The whole card is
-          only mounted once we have at least one telemetry sample. */}
+      {/* Car status overview — shows last-known battery / cabin temps
+          / tire health as compact chips, with the tire-pressure
+          history chart hidden behind an expand toggle on the Tires
+          chip. The chart bundle (recharts ~380KB) stays unloaded
+          until the user expands it.
+          Constrained to ~2 tile widths so on wide monitors the card
+          doesn't stretch into an awkwardly long strip. On narrow
+          viewports it shrinks naturally with the wrapper. */}
       {carStatusSample && carStatusSample.ts != null && (
-        <CarStatusCard
-          sample={carStatusSample}
-          latestDriveEnd={latestDriveEnd}
-          tireHistory={tireHistory ?? undefined}
-          useFahrenheit={useFahrenheit}
-        />
+        <div className="max-w-[640px]">
+          <CarStatusCard
+            sample={carStatusSample}
+            latestDriveEnd={latestDriveEnd}
+            tireHistory={tireHistory ?? undefined}
+            useFahrenheit={useFahrenheit}
+            lockChimeName={activeChimeName}
+          />
+        </div>
       )}
     </div>
   )

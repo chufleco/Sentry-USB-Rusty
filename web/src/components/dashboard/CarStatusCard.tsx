@@ -1,10 +1,13 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react"
+import { Link } from "react-router-dom"
 import {
   BatteryMedium,
   Car,
   ChevronDown,
+  ChevronRight,
   ChevronUp,
   Disc,
+  Music2,
   Thermometer,
 } from "lucide-react"
 import type { TireHistoryResponse } from "./TirePressureCard"
@@ -37,6 +40,10 @@ interface CarStatusCardProps {
   // the Tires chip's expand affordance entirely (e.g. no telemetry).
   tireHistory?: TireHistoryResponse
   useFahrenheit: boolean
+  // Name of the currently-active lock-chime sound, if the feature
+  // is configured. null/undefined hides the indicator entirely so
+  // users who don't use lock chimes don't see a confusing chip.
+  lockChimeName?: string | null
 }
 
 type TireStatus =
@@ -101,6 +108,7 @@ export function CarStatusCard({
   latestDriveEnd,
   tireHistory,
   useFahrenheit,
+  lockChimeName,
 }: CarStatusCardProps) {
   const [tiresOpen, setTiresOpen] = useState(false)
   // Now tick — drives the parked-duration counter forward without
@@ -132,17 +140,32 @@ export function CarStatusCard({
 
   return (
     <div className="glass-card p-4">
-      {/* Top row — car state + duration */}
+      {/* Top row — car state + duration + (optional) lock-chime indicator
+          on the right. The chime chip is a clickable shortcut to the
+          /lockchime page; only rendered when the user has actually
+          configured a chime so users who don't use the feature don't
+          see a confusing extra UI element. */}
       <div className="flex items-center gap-3">
         <span className="tile-icon halo-accent">
           <Car className="h-4 w-4" />
         </span>
-        <div className="min-w-0">
+        <div className="min-w-0 flex-1">
           <div className="text-sm font-semibold text-slate-100">Parked</div>
           {parkedDuration && (
             <div className="text-[11px] text-slate-500">{parkedDuration}</div>
           )}
         </div>
+        {lockChimeName && (
+          <Link
+            to="/lockchime"
+            title={`Active lock chime: ${lockChimeName}`}
+            className="inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15"
+          >
+            <Music2 className="h-3 w-3 shrink-0" />
+            <span className="truncate">{lockChimeName}</span>
+            <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400/60" />
+          </Link>
+        )}
       </div>
 
       {/* Chip row — battery / interior / exterior / tires */}
