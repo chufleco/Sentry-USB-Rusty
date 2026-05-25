@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Loader2 } from "lucide-react"
-import { setDriveTags } from "@/api/drives"
+import { Loader2, Trash2 } from "lucide-react"
+import { bulkDeleteDrives, setDriveTags } from "@/api/drives"
+import { cn } from "@/lib/utils"
 import { DriveRow } from "@/components/drives/DriveRow"
 import { DrivesActionsBar } from "@/components/drives/DrivesActionsBar"
 import { DrivesToolbar } from "@/components/drives/DrivesToolbar"
@@ -36,6 +37,15 @@ export default function Drives() {
   }, [])
   const [selectMode, setSelectMode] = useState(false)
   const [selected, setSelected] = useState<Set<number>>(new Set())
+  // Confirmation dialog state for bulk-delete. Snapshot the selected
+  // ids and how many drives the click captured so the modal text and
+  // the eventual API call are immune to the user changing selection
+  // mid-confirmation.
+  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState<{
+    ids: number[]
+  } | null>(null)
+  const [deletingBulk, setDeletingBulk] = useState(false)
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null)
 
   const toggleSelectMode = () => {
     setSelectMode((s) => {
@@ -43,6 +53,29 @@ export default function Drives() {
       return !s
     })
   }
+
+  const onDeleteSelected = useCallback(() => {
+    if (selected.size === 0) return
+    setBulkDeleteError(null)
+    setConfirmingBulkDelete({ ids: Array.from(selected) })
+  }, [selected])
+
+  const confirmBulkDelete = useCallback(async () => {
+    if (!confirmingBulkDelete) return
+    setDeletingBulk(true)
+    setBulkDeleteError(null)
+    try {
+      await bulkDeleteDrives(confirmingBulkDelete.ids)
+      setConfirmingBulkDelete(null)
+      setSelected(new Set())
+      setSelectMode(false)
+      list.refresh()
+    } catch (e) {
+      setBulkDeleteError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeletingBulk(false)
+    }
+  }, [confirmingBulkDelete, list])
 
   const onToggleSelected = useCallback((id: number) => {
     setSelected((prev) => {
@@ -114,7 +147,7 @@ export default function Drives() {
         onSelectAll={onSelectAll}
         onTagSelected={() => alert("Bulk tag is not implemented yet.")}
         onExportSelected={() => alert("Bulk export is not implemented yet.")}
-        onDeleteSelected={() => alert("Bulk delete is not implemented yet.")}
+        onDeleteSelected={onDeleteSelected}
         metric={metric}
       />
 
@@ -173,6 +206,55 @@ export default function Drives() {
 
       {!list.loading && list.visible.length > 0 && (
         <div className="mt-4 flex justify-end">{pagination}</div>
+      )}
+
+      {confirmingBulkDelete && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-slate-950 p-6 shadow-2xl">
+            <h3 className="text-base font-semibold text-slate-100">
+              {confirmingBulkDelete.ids.length === 1
+                ? "Delete 1 drive?"
+                : `Delete ${confirmingBulkDelete.ids.length} drives?`}
+            </h3>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              This removes the selected drive
+              {confirmingBulkDelete.ids.length === 1 ? "" : "s"} (routes, tags, and processed-file records) from the database. The action cannot be undone. The underlying video clips on the USB are not touched.
+            </p>
+            {bulkDeleteError && (
+              <p className="mt-3 text-xs text-rose-300">{bulkDeleteError}</p>
+            )}
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingBulk}
+                onClick={() => setConfirmingBulkDelete(null)}
+                className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/[0.06] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingBulk}
+                onClick={confirmBulkDelete}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-lg px-4 py-1.5 text-xs font-medium text-white transition-colors disabled:opacity-50",
+                  "bg-rose-600 hover:bg-rose-500",
+                )}
+              >
+                {deletingBulk ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {deletingBulk
+                  ? "Deleting…"
+                  : confirmingBulkDelete.ids.length === 1
+                  ? "Delete drive"
+                  : `Delete ${confirmingBulkDelete.ids.length} drives`}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
     </div>
   )
