@@ -75,13 +75,13 @@ pub fn parse_rfc3339_secs(s: &str) -> Option<i64> {
 }
 
 /// If the local clock is meaningfully wrong (>5 min from vehicle), set
-/// it to vehicle time. Apply half the round-trip-time as a latency
-/// correction. Optionally persist to RTC.
+/// it to vehicle time. Optionally persist to RTC.
 ///
 /// Args:
 ///   * `vehicle_ts_secs` — the timestamp Tesla sent us
 ///   * `request_started_at` — monotonic Instant from before we sent
-///     the BLE request, used to estimate RTT for latency comp
+///     the BLE request. Kept around for diagnostic logging (RTT) even
+///     though we don't apply it as a correction — see comment below.
 ///
 /// Returns true if we adjusted the clock; false if delta was below
 /// threshold (normal case once everything's synced).
@@ -94,13 +94,17 @@ pub fn maybe_set_clock_from_vehicle(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Latency comp: assume the vehicle wrote `vehicle_ts` at roughly
-    // the midpoint of the BLE call (the response was serialized at
-    // the car, traveled over BLE, was decrypted, then parsed by us).
-    // Half-RTT is the standard NTP-style correction; gets us within
-    // tens of ms of the true time even if the call took seconds.
+    // Empirically (validated against NTP-set reference time), Tesla
+    // stamps the response timestamp just before transmitting it —
+    // NOT at the midpoint of processing. So the actual one-way
+    // latency from car-stamp to our-receive is small (~50 ms in
+    // measurements), already small enough that our second-resolution
+    // clock_settime ignores it. The earlier half-RTT correction
+    // overshoot by 700-2000 ms; using the raw timestamp lands
+    // within ~50-100 ms of NTP-set time. We still measure RTT for
+    // diagnostic logging.
     let rtt_ms = request_started_at.elapsed().as_millis() as i64;
-    let corrected_target = vehicle_ts_secs + (rtt_ms / 2 / 1000);
+    let corrected_target = vehicle_ts_secs;
 
     let delta = corrected_target - local_secs;
     if delta.abs() < ADJUSTMENT_THRESHOLD_SECS {
