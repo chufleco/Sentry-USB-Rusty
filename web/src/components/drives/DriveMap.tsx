@@ -86,10 +86,10 @@ function pulseMarkerIcon(bearingDeg: number) {
     className: "drive-pulse-marker",
     html:
       `<div class="drive-pulse" style="transform:rotate(${bearingDeg}deg)">` +
-      `<img src="/arrow.png" alt="" width="18" height="18" draggable="false"/>` +
+      `<img src="/arrow.png" alt="" width="9" height="9" draggable="false"/>` +
       `</div>`,
-    iconSize: [18, 18],
-    iconAnchor: [9, 9],
+    iconSize: [9, 9],
+    iconAnchor: [5, 5],
   })
 }
 
