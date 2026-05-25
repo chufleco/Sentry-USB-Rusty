@@ -595,6 +595,11 @@ function archive_progress_monitor () {
     done < "$listfile"
     write_archive_status "{\"phase\":\"archiving\",\"current\":$done,\"total\":$total}"
 
+    # Mirror progress to /mutable so a mid-batch reboot leaves a record the next
+    # archiveloop run can surface in its start notification. Atomic write.
+    echo "{\"phase\":\"archiving\",\"current\":$done,\"total\":$total}" > /mutable/archive_in_progress.json.tmp \
+      && mv /mutable/archive_in_progress.json.tmp /mutable/archive_in_progress.json
+
     # Send APNs Live Activity update every ~30s (6 × 5s)
     push_counter=$((push_counter + 1))
     if [ $((push_counter % 6)) -eq 0 ]; then
@@ -822,6 +827,18 @@ function archive_teslacam_clips () {
     else
       message+="$trackmode_count track mode file(s)"
     fi
+
+    # If a prior archive run was interrupted (e.g. reboot), surface how many
+    # files it completed before dying. The monitor persists this every 5s.
+    local prior_done=0
+    if [ -r /mutable/archive_in_progress.json ]; then
+      prior_done=$(sed -n 's/.*"current":\([0-9]\+\).*/\1/p' /mutable/archive_in_progress.json)
+      prior_done=${prior_done:-0}
+    fi
+    if [[ $prior_done -gt 0 ]]; then
+      message+=" ($prior_done already completed from prior run)"
+    fi
+
     message+=" starting at $(date)"
     ARCHIVE_TOTAL_COUNT=$total_count /root/bin/send-push-message "$NOTIFICATION_TITLE:" "$message" start archive_start || log "failed to send mobile app notification"
     /root/bin/send-live-activity start "$total_count" || true
@@ -913,6 +930,10 @@ function archive_teslacam_clips () {
         cp "${sentrylist_archived}" "${sentrylist_previously_archived}.new"
         mv "${sentrylist_previously_archived}.new" "${sentrylist_previously_archived}"
     fi
+
+    # Batch reached its end (success or failure) — clear the in-progress marker
+    # so the next run's start notification doesn't claim a stale "prior run" count.
+    rm -f /mutable/archive_in_progress.json
 
     message+="Archived "
     if [[ $sentry_count -gt 0 && $trackmode_count -gt 0 ]]
