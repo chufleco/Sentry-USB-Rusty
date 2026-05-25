@@ -23,9 +23,10 @@ else
   #   - sentryusb-ble.service clears stale lock files on startup (boot/crash).
   #   - Lock files older than 24h are treated as stale and cleaned up.
   #
-  # Master BLE kill-switch: the user-facing settings toggle writes
-  # BLE_ENABLED=no to the config when they disable Tesla BLE for
-  # security.  Honor it here even when a VIN is configured.
+  # Keep-awake BLE switch: the user-facing settings toggle writes
+  # BLE_KEEP_AWAKE_ENABLED=no to the config when they disable the
+  # BLE keep-awake nudge specifically (independent of telemetry).
+  # Honor it here even when a VIN is configured.
   # ---------------------------------------------------------------------------
   BLE_LOCK="/tmp/ble_radio_owner"
   BLE_LOCK_OWNER="keep_awake"
@@ -38,8 +39,22 @@ else
   # want telemetry can leave keep-awake off, and vice versa. Existing
   # installs get migrated to the new flag at API startup via
   # `migrate_legacy_ble_flag` in crates/api/src/ble.rs.
+  #
+  # We re-read the value from /root/sentryusb.conf rather than using
+  # the inherited env var. archiveloop sources the conf once at
+  # process start, so a toggle flip in the web UI doesn't reach the
+  # running process — its env still has the boot-time value. Reading
+  # the file fresh on every call picks up live changes without
+  # requiring an archiveloop restart.
   ble_is_enabled() {
-    case "${BLE_KEEP_AWAKE_ENABLED:-}" in
+    local current=""
+    if [ -f /root/sentryusb.conf ]; then
+      current=$(grep -E '^[[:space:]]*export[[:space:]]+BLE_KEEP_AWAKE_ENABLED=' \
+        /root/sentryusb.conf 2>/dev/null \
+        | tail -n1 \
+        | sed -E "s/^[[:space:]]*export[[:space:]]+BLE_KEEP_AWAKE_ENABLED=//; s/^['\"]//; s/['\"]$//")
+    fi
+    case "$current" in
       yes|true|1) return 0 ;;
       *) return 1 ;;
     esac
@@ -112,7 +127,7 @@ else
   if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled; then
     ble_disable_gatt_daemon
   elif [[ -n "${TESLA_BLE_VIN:+x}" ]]; then
-    log "Tesla BLE: VIN configured but BLE_ENABLED=no — skipping BLE keep-awake path."
+    log "Tesla BLE: VIN configured but BLE_KEEP_AWAKE_ENABLED=no — skipping BLE keep-awake path."
   fi
 
   # Returns a label like "Archive", "Drive Processing", "Manual (8m left)"
