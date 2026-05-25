@@ -294,14 +294,16 @@ where
         let _ = std::fs::remove_dir_all("/tmp/blebin");
     }
 
-    // Generate BLE keys if they don't exist
-    let _ = std::fs::create_dir_all("/root/.ble");
+    // Generate BLE keys if they don't exist. Uses our Rust-side
+    // P-256 generator (sentryusb_tesla_ble::keys::generate_keypair)
+    // — no longer shells out to tesla-keygen. Writes PKCS#8 PEM for
+    // the private key (vs tesla-keygen's SEC1 format); our loader
+    // accepts both, so existing installs that already have a SEC1
+    // key file from tesla-keygen keep working untouched.
     if !std::path::Path::new("/root/.ble/key_private.pem").exists() {
-        sentryusb_shell::run(
-            "tesla-keygen", &["-key-file", "/root/.ble/key_private.pem", "-output", "/root/.ble/key_public.pem", "create"],
-        ).await?;
-        sentryusb_shell::run("chmod", &["600", "/root/.ble/key_private.pem"]).await?;
-        sentryusb_shell::run("chmod", &["644", "/root/.ble/key_public.pem"]).await?;
+        let dir = std::path::Path::new("/root/.ble");
+        sentryusb_tesla_ble::keys::generate_keypair(dir)
+            .context("generating Tesla BLE keypair")?;
         std::fs::write("/root/.ble/key_pending_pairing", "")?;
         progress("Generated Tesla BLE keys. Pairing required via web UI.");
     }

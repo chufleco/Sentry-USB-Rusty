@@ -2512,6 +2512,7 @@ dependencies = [
  "sentryusb-config",
  "sentryusb-gadget",
  "sentryusb-shell",
+ "sentryusb-tesla-ble",
  "serde_json",
  "tokio",
  "tracing",
