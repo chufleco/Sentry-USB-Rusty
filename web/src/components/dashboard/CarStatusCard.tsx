@@ -139,13 +139,28 @@ export function CarStatusCard({
     !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
 
   return (
-    <div className="glass-card p-4">
-      {/* Top row — car state + duration + (optional) lock-chime indicator
-          on the right. The chime chip is a clickable shortcut to the
-          /lockchime page; only rendered when the user has actually
-          configured a chime so users who don't use the feature don't
-          see a confusing extra UI element. */}
-      <div className="flex items-center gap-3">
+    <div className="glass-card relative p-4">
+      {/* Lock-chime chip pinned to the card's actual top-right
+          corner via absolute positioning, so it sits in the corner
+          regardless of the Parked row's height. Only renders when
+          a chime is active so users without the feature don't see
+          an empty placeholder. Click → /lockchime. */}
+      {lockChimeName && (
+        <Link
+          to="/lockchime"
+          title={`Active lock chime: ${lockChimeName}`}
+          className="absolute right-3 top-3 inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15"
+        >
+          <Music2 className="h-3 w-3 shrink-0" />
+          <span className="truncate">{lockChimeName}</span>
+          <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400/60" />
+        </Link>
+      )}
+
+      {/* Top row — car state + duration. Right padding reserves room
+          for the absolutely-positioned chime chip when present so
+          long durations / labels can't slide under it. */}
+      <div className={"flex items-center gap-3 " + (lockChimeName ? "pr-32 sm:pr-40" : "")}>
         <span className="tile-icon halo-accent">
           <Car className="h-4 w-4" />
         </span>
@@ -155,17 +170,6 @@ export function CarStatusCard({
             <div className="text-[11px] text-slate-500">{parkedDuration}</div>
           )}
         </div>
-        {lockChimeName && (
-          <Link
-            to="/lockchime"
-            title={`Active lock chime: ${lockChimeName}`}
-            className="inline-flex max-w-[180px] items-center gap-1.5 rounded-full border border-emerald-400/25 bg-emerald-500/10 px-2.5 py-1 text-[11px] font-medium text-emerald-300 transition-colors hover:bg-emerald-500/15"
-          >
-            <Music2 className="h-3 w-3 shrink-0" />
-            <span className="truncate">{lockChimeName}</span>
-            <ChevronRight className="h-3 w-3 shrink-0 text-emerald-400/60" />
-          </Link>
-        )}
       </div>
 
       {/* Chip row — battery / interior / exterior / tires */}
