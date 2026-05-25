@@ -85,6 +85,65 @@ impl ShiftState {
     }
 }
 
+/// Tesla `ChargeState.charging_state` (`CarServer.ChargeState.ChargingState`
+/// oneof). Mapped to a flat enum so the phase machine in `main.rs` can
+/// pattern-match without dragging in proto types.
+///
+/// Used by the quiet-mode gate: `Starting` / `Charging` / `Calibrating`
+/// mean the car is keeping itself awake for charging, so we stay in
+/// Active polling regardless of shift state. Everything else (including
+/// `Unknown` per design) is a candidate for the quiet path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargingState {
+    Unknown,
+    Disconnected,
+    NoPower,
+    Starting,
+    Charging,
+    Complete,
+    Stopped,
+    Calibrating,
+}
+
+impl ChargingState {
+    /// "Actively pulling power (or about to)" — the three states that
+    /// keep the car awake on its own. Sampler stays in Active mode
+    /// while this is true, even when shift_state has been Park for a
+    /// while; quiet mode would just leave battery % stale during a
+    /// charge session.
+    pub fn is_active_charging(self) -> bool {
+        matches!(
+            self,
+            ChargingState::Starting | ChargingState::Charging | ChargingState::Calibrating
+        )
+    }
+}
+
+/// Tesla `ClosuresState.SentryModeState` oneof, flattened. Mirrors the
+/// proto's six states; `Off` is the only one where the car will sleep
+/// on its own (the other five all hold the car awake monitoring).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SentryMode {
+    Off,
+    Idle,
+    Armed,
+    Aware,
+    Panic,
+    /// "Quiet Sentry" — alarm is suppressed but the system is still
+    /// armed and recording. Not to be confused with the sampler's
+    /// own quiet-poll mode (unfortunate naming collision in the
+    /// Tesla proto).
+    Quiet,
+}
+
+impl SentryMode {
+    /// Anything that isn't `Off` keeps the car awake. Used by the
+    /// quiet-mode gate alongside `ChargingState::is_active_charging`.
+    pub fn is_on(self) -> bool {
+        !matches!(self, SentryMode::Off)
+    }
+}
+
 /// Common fields every state response carries that downstream code
 /// might want regardless of which specific sub-sampler it was. The
 /// `vehicle_ts_secs` field is what the clock-sync feature uses to
@@ -127,8 +186,26 @@ pub struct ClimateResult {
 }
 
 /// Result of a successful `sample_charge` call. Slow-changing.
+///
+/// `charging_state` is in-memory only (not persisted to the DB) — the
+/// phase machine in `main.rs` reads it on each tick to decide whether
+/// it's safe to drop into quiet polling. `None` means we couldn't
+/// extract it from the response; the gate treats unknown as
+/// "stay Active" to avoid wrongly quieting down during a real charge
+/// session.
 pub struct ChargeResult {
     pub battery_pct: Option<f64>,
+    pub charging_state: Option<ChargingState>,
+    pub meta: ResponseMeta,
+}
+
+/// Result of a successful `sample_closures` call. In-memory only —
+/// the only field we read from closures right now is sentry mode (for
+/// the quiet-mode gate), no DB persistence. If we later want to
+/// surface door / window / charge-port state in the UI, this is the
+/// right place to add fields.
+pub struct ClosuresResult {
+    pub sentry_mode: Option<SentryMode>,
     pub meta: ResponseMeta,
 }
 
@@ -293,6 +370,9 @@ pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
     let meta = build_meta(&charge, started);
     Ok(ChargeResult {
         battery_pct: pick_f64(&charge, &["batteryLevel", "battery_level", "batteryPct"]),
+        // Legacy shell-out path no longer wired up (see header), so
+        // we don't bother parsing charging_state out of the JSON.
+        charging_state: None,
         meta,
     })
 }

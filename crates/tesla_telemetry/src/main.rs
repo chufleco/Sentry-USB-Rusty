@@ -61,6 +61,15 @@ const CHARGE_INITIAL_OFFSET: Duration = Duration::from_secs(30);
 /// nothing.
 const TIRES_INTERVAL: Duration = Duration::from_secs(300);
 
+/// How often to refresh `state closures` in Active mode. 60s — same
+/// cadence as climate/charge. This is the sole source of
+/// `sentry_mode_state` for the quiet-mode gate, so it has to be at
+/// least as fresh as the cadence at which the phase machine reacts
+/// (every drive-poll, i.e. 15s). 60s is a fine compromise: the gate
+/// only cares about transitions, not millisecond accuracy, and a
+/// remote sentry toggle from the Tesla app reaches us within ~1 tick.
+const CLOSURES_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Sample cadence for sleep-safe `body-controller-state` calls in
 /// Quiet mode. 30s (down from 60s) halves the worst-case wakeup
 /// latency — important because the user_presence flip is what
@@ -148,6 +157,11 @@ struct Schedule {
     next_climate: Instant,
     next_charge: Instant,
     next_tires: Instant,
+    /// `state closures` — only field we read from it is
+    /// sentry_mode_state, which the quiet-mode gate needs every
+    /// poll cycle. Same cadence as climate/charge so the gate's
+    /// inputs are roughly co-fresh.
+    next_closures: Instant,
     /// Consecutive failure counters — used by the fast-retry
     /// pattern. On a successful sub-sample they reset to 0; on
     /// failure they increment and drive a 3s retry until
@@ -157,27 +171,33 @@ struct Schedule {
     climate_failures: u32,
     charge_failures: u32,
     tires_failures: u32,
+    closures_failures: u32,
 }
 
 impl Schedule {
     fn new(now: Instant) -> Self {
         Self {
-            // Drive + climate + tires fire immediately on first
-            // tick — get a baseline snapshot.
+            // Drive + climate + tires + closures fire immediately on
+            // first tick — get a baseline snapshot, including the
+            // sentry_mode + (after the 30s charge offset) charging_state
+            // signals the quiet-mode gate depends on.
             next_drive: now,
             next_climate: now,
             next_charge: now + CHARGE_INITIAL_OFFSET,
             next_tires: now,
+            next_closures: now,
             drive_failures: 0,
             climate_failures: 0,
             charge_failures: 0,
             tires_failures: 0,
+            closures_failures: 0,
         }
     }
     fn drive_due(&self, now: Instant) -> bool { now >= self.next_drive }
     fn climate_due(&self, now: Instant) -> bool { now >= self.next_climate }
     fn charge_due(&self, now: Instant) -> bool { now >= self.next_charge }
     fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
+    fn closures_due(&self, now: Instant) -> bool { now >= self.next_closures }
 
     /// Compute the next-due instant for a sub-sampler that just ran.
     /// On success: normal interval. On failure within MAX_FAST_RETRIES:
@@ -211,14 +231,20 @@ impl Schedule {
         self.tires_failures = if success { 0 } else { self.tires_failures.saturating_add(1) };
         self.next_tires = Self::next_after(now, success, self.tires_failures, TIRES_INTERVAL);
     }
+    fn mark_closures(&mut self, now: Instant, success: bool) {
+        self.closures_failures = if success { 0 } else { self.closures_failures.saturating_add(1) };
+        self.next_closures = Self::next_after(now, success, self.closures_failures, CLOSURES_INTERVAL);
+    }
 
-    /// When should the next tick fire? Min of all four next-due
-    /// timestamps. The main loop sleeps until this instant.
+    /// When should the next tick fire? Min of all next-due timestamps
+    /// across every sub-sampler. The main loop sleeps until this
+    /// instant.
     fn next_due(&self) -> Instant {
         self.next_drive
             .min(self.next_climate)
             .min(self.next_charge)
             .min(self.next_tires)
+            .min(self.next_closures)
     }
 }
 
@@ -289,6 +315,20 @@ async fn main() -> Result<()> {
     // avoid re-scanning + re-handshaking on every cycle. Dropped
     // and recreated if VIN changes mid-run.
     let mut ble_session: Option<sample_ble::SessionHandle> = None;
+    // Last-known charging_state from a successful `state charge` poll.
+    // Drives the quiet-mode gate: while the car is actively charging
+    // (Starting / Charging / Calibrating), the car is keeping itself
+    // awake, so quiet-mode body-controller polling would just leave
+    // battery_pct stale. `None` = we've never had a successful charge
+    // poll → conservative default: treat as actively-charging so we
+    // stay Active until we have proof otherwise.
+    let mut last_charging_state: Option<sample::ChargingState> = None;
+    // Same idea for sentry mode — read from `state closures`. Any
+    // non-Off value means the car is awake for sentry purposes;
+    // dropping to quiet would freeze the live-data panel during an
+    // active session. `None` → treat as on for the conservative
+    // default.
+    let mut last_sentry_mode: Option<sample::SentryMode> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -344,6 +384,8 @@ async fn main() -> Result<()> {
                 &mut last_parked_awake_refresh,
                 &mut last_parked_awake_tpms_refresh,
                 &mut ble_session,
+                &mut last_charging_state,
+                &mut last_sentry_mode,
             ) => {
                 tokio::time::sleep(sleep).await;
             }
@@ -382,6 +424,8 @@ async fn tick(
     last_parked_awake_refresh: &mut Option<Instant>,
     last_parked_awake_tpms_refresh: &mut Option<Instant>,
     ble_session: &mut Option<sample_ble::SessionHandle>,
+    last_charging_state: &mut Option<sample::ChargingState>,
+    last_sentry_mode: &mut Option<sample::SentryMode>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -429,7 +473,31 @@ async fn tick(
     let observation = usb_watch::observe();
     let car_truly_asleep = observation == CarState::Asleep;
     let parked_confirmed = *parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET;
-    let in_quiet_mode = car_truly_asleep || parked_confirmed;
+
+    // Conservative defaults: if we've never had a successful charge or
+    // closures poll, treat the car as actively-charging / sentry-on so
+    // the gate keeps us in Active mode. Pro: never wrongly quiets down
+    // during a charge session we haven't observed yet. Con: cold-start
+    // does a brief Active burst (~30-60s) before the first charge +
+    // closures polls land and confirm the car can actually sleep,
+    // which may wake the car once per daemon restart.
+    let actively_charging = last_charging_state
+        .map(|s| s.is_active_charging())
+        .unwrap_or(true);
+    let sentry_on = last_sentry_mode.map(|s| s.is_on()).unwrap_or(true);
+
+    // Two paths to quiet-mode polling:
+    //   * car_truly_asleep — no clip writes for the AWAKE_WITHIN window.
+    //     Body-controller is the only sleep-safe option here.
+    //   * parked_confirmed — shift_state=Park for 3+ consecutive polls.
+    //     The car COULD sleep, but only if nothing else is keeping
+    //     it awake.
+    // Either path requires that the car isn't actively pulling power
+    // for a charge or running sentry monitoring — both keep the car
+    // awake on their own, and quiet-mode polling would just leave
+    // battery_pct / sentry_mode_state stale on the dashboard.
+    let want_quiet = car_truly_asleep || parked_confirmed;
+    let in_quiet_mode = want_quiet && !actively_charging && !sentry_on;
 
     if in_quiet_mode {
         // Sleep-safe path. Acquire the radio for the brief BC call,
@@ -597,9 +665,28 @@ async fn tick(
                             Ok(c) => {
                                 try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
+                                // Also refresh the gate input so a
+                                // charge that starts mid-quiet bumps
+                                // us back to Active on the next tick.
+                                if let Some(cs) = c.charging_state {
+                                    *last_charging_state = Some(cs);
+                                }
                                 any_ok = true;
                             }
                             Err(e) => warn!("parked-awake charge refresh failed: {e}"),
+                        }
+                        // Closures refresh — gives us a sentry_mode
+                        // update so a remotely-enabled sentry session
+                        // also bumps us back to Active. No persisted
+                        // fields, so this doesn't affect `any_ok`.
+                        match sample_ble::sample_closures_ble(session).await {
+                            Ok(c) => {
+                                try_sync_clock(c.meta);
+                                if let Some(sm) = c.sentry_mode {
+                                    *last_sentry_mode = Some(sm);
+                                }
+                            }
+                            Err(e) => warn!("parked-awake closures refresh failed: {e}"),
                         }
                         *last_parked_awake_refresh = Some(Instant::now());
                     }
@@ -737,6 +824,13 @@ async fn tick(
                 Ok(c) => {
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
+                    // Refresh the gate input. Successful poll → last
+                    // known value advances; failure → keep previous
+                    // (don't downgrade to None and force a conservative
+                    // Active burst on a single transient failure).
+                    if let Some(cs) = c.charging_state {
+                        *last_charging_state = Some(cs);
+                    }
                     true
                 }
                 Err(e) => {
@@ -748,7 +842,30 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 4. TIRES (every 5 min) ──
+        // ── 4. CLOSURES (every 60s) ──
+        // Only field we consume is sentry_mode — fed into the
+        // quiet-mode gate. Door / window / charge-port state is
+        // available from the same response and could be surfaced
+        // in the UI later without an additional BLE call.
+        if schedule.closures_due(tick_now) {
+            let success = match sample_ble::sample_closures_ble(session).await {
+                Ok(c) => {
+                    try_sync_clock(c.meta);
+                    if let Some(sm) = c.sentry_mode {
+                        *last_sentry_mode = Some(sm);
+                    }
+                    true
+                }
+                Err(e) => {
+                    warn!("sample_closures failed: {e}");
+                    false
+                }
+            };
+            schedule.mark_closures(tick_now, success);
+            any_call_ran = true;
+        }
+
+        // ── 5. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
             let success = match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {
@@ -774,10 +891,26 @@ async fn tick(
             Some(s) if s.is_park() => {
                 *parked_polls = parked_polls.saturating_add(1);
                 if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
-                    info!(
-                        "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
-                        PARK_CONFIRMATIONS_BEFORE_QUIET
-                    );
+                    // Whether we actually drop to quiet on the next
+                    // tick depends on the new charging/sentry gate.
+                    // Log both the threshold-hit AND the gate outcome
+                    // so journalctl tells the operator why polling
+                    // did or didn't slow down.
+                    if actively_charging || sentry_on {
+                        info!(
+                            "{} consecutive Park observations — but staying Active \
+                             (actively_charging={}, sentry_on={}); car is awake for \
+                             a reason, quiet polling would freeze battery/sentry signals",
+                            PARK_CONFIRMATIONS_BEFORE_QUIET,
+                            actively_charging,
+                            sentry_on,
+                        );
+                    } else {
+                        info!(
+                            "{} consecutive Park observations — dropping to body-controller polling so the car can sleep",
+                            PARK_CONFIRMATIONS_BEFORE_QUIET
+                        );
+                    }
                 }
             }
             Some(sample::ShiftState::Unknown) => {

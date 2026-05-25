@@ -20,8 +20,8 @@ use sentryusb_tesla_ble::{
 use tracing::{info, warn};
 
 use crate::sample::{
-    BodyControllerSample, ChargeResult, ClimateResult, DriveResult, ResponseMeta, Sample,
-    ShiftState, TiresResult, now_secs,
+    BodyControllerSample, ChargeResult, ChargingState, ClimateResult, ClosuresResult,
+    DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult, now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -54,6 +54,45 @@ fn map_shift_state(ss: &car_server::ShiftState) -> ShiftState {
         Some(Type::N(_)) => ShiftState::Neutral,
         Some(Type::D(_)) => ShiftState::Drive,
         _ => ShiftState::Unknown,
+    }
+}
+
+/// Map car_server's nested `ChargeState.ChargingState` oneof to our
+/// flat `ChargingState`. Same pattern as `map_shift_state`. Returns
+/// `Unknown` if the oneof is empty (Tesla didn't include the field
+/// at all) — caller turns that into `None` so the phase machine's
+/// conservative default kicks in.
+fn map_charging_state(cs: &car_server::charge_state::ChargingState) -> ChargingState {
+    use car_server::charge_state::charging_state::Type;
+    match &cs.r#type {
+        Some(Type::Unknown(_)) => ChargingState::Unknown,
+        Some(Type::Disconnected(_)) => ChargingState::Disconnected,
+        Some(Type::NoPower(_)) => ChargingState::NoPower,
+        Some(Type::Starting(_)) => ChargingState::Starting,
+        Some(Type::Charging(_)) => ChargingState::Charging,
+        Some(Type::Complete(_)) => ChargingState::Complete,
+        Some(Type::Stopped(_)) => ChargingState::Stopped,
+        Some(Type::Calibrating(_)) => ChargingState::Calibrating,
+        None => ChargingState::Unknown,
+    }
+}
+
+/// Map `ClosuresState.SentryModeState` oneof to our flat `SentryMode`.
+/// Returns `None` to the caller when the oneof is empty, so the phase
+/// machine's conservative default (treat as "on" → stay Active) wins.
+fn map_sentry_mode(sm: &car_server::closures_state::SentryModeState) -> SentryMode {
+    use car_server::closures_state::sentry_mode_state::Type;
+    match &sm.r#type {
+        Some(Type::Off(_)) => SentryMode::Off,
+        Some(Type::Idle(_)) => SentryMode::Idle,
+        Some(Type::Armed(_)) => SentryMode::Armed,
+        Some(Type::Aware(_)) => SentryMode::Aware,
+        Some(Type::Panic(_)) => SentryMode::Panic,
+        Some(Type::Quiet(_)) => SentryMode::Quiet,
+        // Empty oneof — treat as Off, but callers should also be
+        // checking whether the parent field was even present (it's
+        // an optional sub-message). map_*_optional below handles both.
+        None => SentryMode::Off,
     }
 }
 
@@ -147,9 +186,43 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
                 *n as f64
             })
         });
+    // charging_state is a non-optional sub-message; the inner oneof
+    // can still be empty (mapped to Unknown by map_charging_state).
+    // We hand the phase machine an Option so it can tell "field
+    // populated with Unknown" apart from "we never extracted one" —
+    // both currently behave identically (conservative: stay Active),
+    // but keeping the distinction makes future logic changes safer.
+    let charging_state = charge.charging_state.as_ref().map(map_charging_state);
     let meta = build_meta(charge.timestamp.as_ref(), started);
 
-    Ok(ChargeResult { battery_pct, meta })
+    Ok(ChargeResult {
+        battery_pct,
+        charging_state,
+        meta,
+    })
+}
+
+/// `state closures` over BLE. Only field we currently care about is
+/// `sentry_mode_state`, which the phase machine uses to decide
+/// whether dropping to quiet polling is safe. Doors / windows /
+/// charge-port states are available from the same response and could
+/// be surfaced in the UI in the future without an additional poll.
+pub async fn sample_closures_ble(session: &PersistentSession) -> Result<ClosuresResult> {
+    let started = Instant::now();
+    let closures = session.get_closures().await?;
+    let elapsed = started.elapsed().as_millis();
+    info!("state-poll: closures=ok({}ms) via in-process BLE", elapsed);
+
+    // Tesla only populates `sentry_mode_state` on cars that support
+    // sentry mode — older / fleet vehicles return the parent message
+    // without this sub-field. Treating "absent" as None (rather than
+    // Off) lets the phase machine's conservative default (stay
+    // Active until we have proof) handle both "feature unsupported"
+    // and "first poll hasn't landed yet" the same way.
+    let sentry_mode = closures.sentry_mode_state.as_ref().map(map_sentry_mode);
+    let meta = build_meta(closures.timestamp.as_ref(), started);
+
+    Ok(ClosuresResult { sentry_mode, meta })
 }
 
 /// `state tire-pressure` over BLE. Converts Tesla's native bar →
