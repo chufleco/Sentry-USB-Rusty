@@ -42,18 +42,34 @@ function Field({ label, field, type = "text", placeholder, data, onChange, hint,
 }
 
 export function KeepAwakeStep({ data, onChange, onBatchChange }: StepProps) {
-  // Derive initial method from existing data, then track via _KEEP_AWAKE_METHOD
+  // Derive initial method from existing data, then track via _KEEP_AWAKE_METHOD.
+  //
+  // BLE is now split into two independent features: BLE-for-telemetry
+  // (just needs TESLA_BLE_VIN) and BLE-for-keep-awake (needs
+  // BLE_KEEP_AWAKE_ENABLED=yes too). So a bare VIN means "BLE telemetry
+  // only — pick whatever keep-awake method you want." Inferring "ble"
+  // here just because the VIN is set would clobber the user's
+  // "None" / "Tessie" / etc. choice every time they re-open the wizard
+  // after pairing BLE for telemetry from the settings page.
   const method = data._KEEP_AWAKE_METHOD
-    || (data.TESLA_BLE_VIN ? "ble"
+    || (data.TESLA_BLE_VIN && data.BLE_KEEP_AWAKE_ENABLED === "yes" ? "ble"
       : data.TESLAFI_API_TOKEN ? "teslafi"
       : data.TESSIE_API_TOKEN ? "tessie"
       : data.KEEP_AWAKE_WEBHOOK_URL ? "webhook"
       : "none")
 
   function setMethod(m: string) {
+    // BLE_KEEP_AWAKE_ENABLED is the source of truth for "use BLE to
+    // keep car awake" after the decoupling. Writing it explicitly here
+    // means re-running the wizard reliably reflects what the user
+    // picked. TESLA_BLE_VIN is intentionally NOT cleared when switching
+    // away from "ble" — telemetry may still be using it. Users who
+    // want to fully un-pair BLE do that from the BLE pair card.
     onBatchChange({
       _KEEP_AWAKE_METHOD: m,
-      TESLA_BLE_VIN: m === "ble" ? (data.TESLA_BLE_VIN || "") : "",
+      BLE_KEEP_AWAKE_ENABLED: m === "ble" ? "yes" : "no",
+      // TESLA_BLE_VIN intentionally not in the batch — leave the
+      // existing value alone since BLE telemetry may be using it.
       TESLAFI_API_TOKEN: m === "teslafi" ? (data.TESLAFI_API_TOKEN || "") : "",
       TESSIE_API_TOKEN: m === "tessie" ? (data.TESSIE_API_TOKEN || "") : "",
       TESSIE_VIN: m === "tessie" ? (data.TESSIE_VIN || "") : "",

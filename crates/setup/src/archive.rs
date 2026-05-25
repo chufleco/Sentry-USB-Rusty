@@ -152,12 +152,23 @@ async fn ensure_rsync(emitter: &SetupEmitter) -> Result<()> {
     Ok(())
 }
 
+/// True only when BLE is being used as the keep-awake mechanism.
+/// A VIN alone means BLE telemetry is set up — that doesn't block
+/// other keep-awake providers or require a Sentry case.
+fn ble_used_for_keep_awake(env: &SetupEnv) -> bool {
+    env.config.contains_key("TESLA_BLE_VIN")
+        && matches!(
+            env.config.get("BLE_KEEP_AWAKE_ENABLED").map(String::as_str),
+            Some("yes") | Some("true") | Some("1")
+        )
+}
+
 /// Check that at most one wake API is configured.
 fn validate_wake_apis(env: &SetupEnv) -> Result<()> {
     let apis = [
         env.config.contains_key("TESSIE_API_TOKEN"),
         env.config.contains_key("TESLAFI_API_TOKEN"),
-        env.config.contains_key("TESLA_BLE_VIN"),
+        ble_used_for_keep_awake(env),
         env.config.contains_key("KEEP_AWAKE_WEBHOOK_URL"),
     ];
     let count = apis.iter().filter(|&&v| v).count();
@@ -171,7 +182,7 @@ fn validate_wake_apis(env: &SetupEnv) -> Result<()> {
 fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     let has_api = env.config.contains_key("TESSIE_API_TOKEN")
         || env.config.contains_key("TESLAFI_API_TOKEN")
-        || env.config.contains_key("TESLA_BLE_VIN")
+        || ble_used_for_keep_awake(env)
         || env.config.contains_key("KEEP_AWAKE_WEBHOOK_URL");
 
     if has_api {

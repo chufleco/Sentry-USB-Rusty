@@ -79,8 +79,11 @@ function archiveError(data: SetupFormData): string | null {
 }
 
 function keepAwakeError(data: SetupFormData): string | null {
+  // Must mirror the inference in KeepAwakeStep.tsx — a bare VIN means
+  // BLE-for-telemetry only, not BLE-for-keep-awake. Only treat it as
+  // "ble" keep-awake when the explicit flag is set.
   const method = data._KEEP_AWAKE_METHOD
-    || (data.TESLA_BLE_VIN ? "ble"
+    || (data.TESLA_BLE_VIN && data.BLE_KEEP_AWAKE_ENABLED === "yes" ? "ble"
       : data.TESLAFI_API_TOKEN ? "teslafi"
         : data.TESSIE_API_TOKEN ? "tessie"
           : data.KEEP_AWAKE_WEBHOOK_URL ? "webhook"
