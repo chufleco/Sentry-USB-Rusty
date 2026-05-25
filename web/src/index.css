@@ -300,12 +300,24 @@ code, pre, .font-mono {
   align-items: center;
   gap: 8px;
 }
+/* Battery sits on its own row directly under the speed/wheel row.
+   Small top gap keeps the card compact while still reading as two
+   distinct lines (mirrors the layout in the user's reference). */
+.playback-info__row--battery {
+  margin-top: 4px;
+}
 .playback-info__speed {
   color: #e6e9ef;
   font-size: 14px;
   font-weight: 600;
   font-variant-numeric: tabular-nums;
 }
+/* Wheel state pill — neutral background as a chip behind the
+   autosteer-icon.png glyph. The image itself is a flat blue+white
+   PNG; the manual/FSD distinction comes from opacity + grayscale on
+   the glyph (engaged = full colour, manual = muted) instead of the
+   previous currentColor stroke trick that worked with the inline
+   SVG. */
 .playback-info__wheel {
   display: inline-flex;
   align-items: center;
@@ -313,12 +325,16 @@ code, pre, .font-mono {
   width: 22px;
   height: 22px;
   border-radius: 50%;
-  background: rgba(122, 130, 148, 0.18);
-  color: #8a93a3;
+  background: rgba(20, 25, 35, 0.85);
 }
-.playback-info__wheel--fsd {
-  background: rgba(59, 130, 246, 0.22);
-  color: #3b82f6;
+.playback-info__wheel-img {
+  display: block;
+  filter: grayscale(1);
+  opacity: 0.55;
+}
+.playback-info__wheel--fsd .playback-info__wheel-img {
+  filter: none;
+  opacity: 1;
 }
 /* Battery pill — green capsule with a fill bar inside, mirrors the
    chip style used on the row's drive-summary cards. The fill rect's
@@ -337,6 +353,36 @@ code, pre, .font-mono {
 }
 .playback-info__battery svg {
   flex: 0 0 auto;
+}
+
+/* Drive playback pulse — directional arrow that points the way the
+   car is heading at the current scrubber position (like a GPS
+   "you-are-here" indicator). Leaflet sets a translate transform on
+   the outer .leaflet-marker-icon element to position the marker;
+   the rotation lives on this inner wrapper so the two transforms
+   don't fight. The img is sized via attributes; the wrapper handles
+   centring so rotation pivots on the arrow's own midpoint. */
+.drive-pulse-marker {
+  /* Outer Leaflet marker — strip any default chrome so the divIcon
+     HTML is the only thing rendered. */
+  background: none;
+  border: none;
+}
+.drive-pulse {
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transform-origin: 50% 50%;
+  /* Soft drop-shadow makes the arrow legible on every tile style. */
+  filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.55));
+  pointer-events: none;
+}
+.drive-pulse img {
+  display: block;
+  user-select: none;
+  -webkit-user-drag: none;
 }
 
 /* Dark popup styling */

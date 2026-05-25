@@ -75,13 +75,70 @@ function endMarkerIcon() {
   })
 }
 
-function pulseMarkerIcon() {
+// Pulse marker — the bot that tracks the scrubber position along
+// the route. Replaced the old green dot with a directional arrow that
+// rotates to point along the current heading, matching how GPS apps
+// indicate "you are here, going that way". The inner `.drive-pulse`
+// wrapper carries the rotation transform; Leaflet's own translate
+// transform lives on the outer marker element so the two don't fight.
+function pulseMarkerIcon(bearingDeg: number) {
   return L.divIcon({
-    className: "",
-    html: '<div style="width:14px;height:14px;border-radius:50%;background:#34d399;border:2px solid #fff;box-shadow:0 0 8px rgba(52,211,153,0.7)"></div>',
-    iconSize: [14, 14],
-    iconAnchor: [7, 7],
+    className: "drive-pulse-marker",
+    html:
+      `<div class="drive-pulse" style="transform:rotate(${bearingDeg}deg)">` +
+      `<img src="/arrow.png" alt="" width="36" height="36" draggable="false"/>` +
+      `</div>`,
+    iconSize: [36, 36],
+    iconAnchor: [18, 18],
   })
+}
+
+// Bearing in degrees-clockwise-from-north between two GPS points.
+// Standard great-circle formula; for adjacent samples a few seconds
+// apart the lat/lng delta is tiny so this is fine without correction.
+function bearingBetween(
+  lat1: number,
+  lng1: number,
+  lat2: number,
+  lng2: number,
+): number {
+  const toRad = Math.PI / 180
+  const φ1 = lat1 * toRad
+  const φ2 = lat2 * toRad
+  const Δλ = (lng2 - lng1) * toRad
+  const y = Math.sin(Δλ) * Math.cos(φ2)
+  const x =
+    Math.cos(φ1) * Math.sin(φ2) -
+    Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ)
+  return ((Math.atan2(y, x) * 180) / Math.PI + 360) % 360
+}
+
+// Heading for the arrow at scrubber index `i`. Looks back ~3 samples
+// for stability against GPS jitter at low speeds (a single-sample
+// delta produces a twitchy arrow). For the first few samples we look
+// forward instead so the very first frame still has a sensible
+// direction. Returns 0 when there's no meaningful delta available.
+function headingAt(
+  points: [number, number, number, number][],
+  i: number,
+): number {
+  if (points.length < 2) return 0
+  const LOOKBACK = 3
+  let from = i - LOOKBACK
+  let to = i
+  if (from < 0) {
+    // Near start of drive — look forward instead so the arrow still
+    // orients meaningfully on frame 0.
+    from = i
+    to = Math.min(points.length - 1, i + LOOKBACK)
+    if (from === to) return 0
+  }
+  return bearingBetween(
+    points[from][0],
+    points[from][1],
+    points[to][0],
+    points[to][1],
+  )
 }
 
 function fsdEventIcon(kind: "disengagement" | "accel_push") {
@@ -96,17 +153,13 @@ function fsdEventIcon(kind: "disengagement" | "accel_push") {
   })
 }
 
-// SVG markup for the steering-wheel glyph in the playback info card.
-// Three spokes (top, lower-left, lower-right) sketch a Tesla-yoke look
-// in a 24-viewBox stroke-only icon — colour comes from CSS currentColor.
-const WHEEL_SVG =
-  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" width="14" height="14">' +
-  '<circle cx="12" cy="12" r="9"/>' +
-  '<circle cx="12" cy="12" r="2"/>' +
-  '<line x1="12" y1="3" x2="12" y2="10"/>' +
-  '<line x1="4.5" y1="16.5" x2="10" y2="13"/>' +
-  '<line x1="19.5" y1="16.5" x2="14" y2="13"/>' +
-  "</svg>"
+// Steering-wheel glyph in the playback info card. Uses the project
+// asset (blue circular wheel) served from web/public. The parent
+// `.playback-info__wheel` span carries the FSD/manual visual state
+// via CSS (full opacity for engaged, dim+grey for manual) — the
+// asset itself is a flat coloured PNG.
+const WHEEL_HTML =
+  '<img src="/autosteer-icon.png" alt="" width="18" height="18" draggable="false" class="playback-info__wheel-img"/>'
 
 const MPS_TO_MPH = 2.23694
 const MPS_TO_KPH = 3.6
@@ -160,13 +213,18 @@ function renderPlaybackHTML(
       ? `<span class="playback-info__battery" aria-label="Battery ${Math.round(battery)}%">` +
         `${batterySVG(battery)}${Math.round(battery)}%</span>`
       : ""
+  // Layout: time on top, then speed + wheel row, then battery on its
+  // own row below — matches the GPS-app convention the user requested
+  // (battery is reference info, not part of the primary speed/state).
   return (
     `<div class="playback-info__time">${time}</div>` +
     `<div class="playback-info__row">` +
     `<span class="playback-info__speed">${speed} ${unit}</span>` +
-    `<span class="${wheelClass}" title="${wheelTitle}" aria-label="${wheelTitle}">${WHEEL_SVG}</span>` +
-    batteryHtml +
-    `</div>`
+    `<span class="${wheelClass}" title="${wheelTitle}" aria-label="${wheelTitle}">${WHEEL_HTML}</span>` +
+    `</div>` +
+    (batteryHtml
+      ? `<div class="playback-info__row playback-info__row--battery">${batteryHtml}</div>`
+      : "")
   )
 }
 
@@ -283,7 +341,7 @@ export function DriveMap({
     // non-interactive markers. We still set keyboard:false so it
     // doesn't capture tab focus.
     pulseRef.current = L.marker(latLngs[0], {
-      icon: pulseMarkerIcon(),
+      icon: pulseMarkerIcon(headingAt(points, 0)),
       interactive: true,
       keyboard: false,
       zIndexOffset: 1000,
@@ -369,6 +427,18 @@ export function DriveMap({
     if (!pulse || points.length === 0) return
     const i = Math.min(points.length - 1, Math.max(0, currentIndex))
     pulse.setLatLng(L.latLng(points[i][0], points[i][1]))
+    // Rotate the arrow to match current heading. Direct DOM mutation
+    // of the inner div avoids setIcon's full element rebuild on every
+    // scrubber tick — Leaflet's own translate transform stays on the
+    // outer marker element, our rotate sits on the inner wrapper.
+    const el = pulse.getElement()
+    if (el) {
+      const arrow = el.querySelector(".drive-pulse") as HTMLElement | null
+      if (arrow) {
+        const bearing = headingAt(points, i)
+        arrow.style.transform = `rotate(${bearing}deg)`
+      }
+    }
     // Refresh the playback info card to match the new position.
     // setContent on an attached Leaflet tooltip patches its innerHTML
     // in place — no React render, no marker rebind, no map redraw.
