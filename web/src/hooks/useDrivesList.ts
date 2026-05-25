@@ -25,6 +25,27 @@ export interface DrivesFilters {
   minDistanceMi?: number
 }
 
+/**
+ * Aggregate stats for the currently filtered drive list. Recomputes
+ * whenever the date range / filters / underlying drives change so the
+ * summary strip always reflects the user's current selection
+ * (e.g. "Last 7 days" → last-7-days totals, not lifetime).
+ */
+export interface DrivesFilteredStats {
+  count: number
+  totalDistanceMi: number
+  totalDistanceKm: number
+  totalDurationMs: number
+  fsdEngagedMs: number
+  fsdDistanceMi: number
+  fsdDistanceKm: number
+  fsdPercent: number
+  fsdDisengagements: number
+  autopilotEngagedMs: number
+  autopilotPercent: number
+  tessieCount: number
+}
+
 export interface DrivesListState {
   drives: DriveSummary[]
   visible: DriveSummary[]
@@ -37,6 +58,7 @@ export interface DrivesListState {
   range: DateRange
   filters: DrivesFilters
   sortDir: "asc" | "desc"
+  filteredStats: DrivesFilteredStats
   loading: boolean
   error: string | null
   setPage: (n: number) => void
@@ -184,6 +206,53 @@ export function useDrivesList(): DrivesListState {
   const pageEnd = Math.min(total, safePage * PAGE_SIZE)
   const visible = filtered.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
+  // Aggregate stats over the *entire* filtered set (not just the visible
+  // page) — this is the "lifetime within current selection" number the
+  // header strip displays.
+  const filteredStats = useMemo<DrivesFilteredStats>(() => {
+    let totalDistanceMi = 0
+    let totalDistanceKm = 0
+    let totalDurationMs = 0
+    let fsdEngagedMs = 0
+    let fsdDistanceMi = 0
+    let fsdDistanceKm = 0
+    let fsdDisengagements = 0
+    let autopilotEngagedMs = 0
+    let tessieCount = 0
+
+    for (const d of filtered) {
+      totalDistanceMi += d.distanceMi
+      totalDistanceKm += d.distanceKm
+      totalDurationMs += d.durationMs
+      fsdEngagedMs += d.fsdEngagedMs
+      fsdDistanceMi += d.fsdDistanceMi
+      fsdDistanceKm += d.fsdDistanceKm
+      fsdDisengagements += d.fsdDisengagements
+      autopilotEngagedMs += d.autosteerEngagedMs + d.taccEngagedMs
+      if (d.source === "tessie") tessieCount += 1
+    }
+
+    const fsdPercent =
+      totalDurationMs > 0 ? (fsdEngagedMs / totalDurationMs) * 100 : 0
+    const autopilotPercent =
+      totalDurationMs > 0 ? (autopilotEngagedMs / totalDurationMs) * 100 : 0
+
+    return {
+      count: filtered.length,
+      totalDistanceMi,
+      totalDistanceKm,
+      totalDurationMs,
+      fsdEngagedMs,
+      fsdDistanceMi,
+      fsdDistanceKm,
+      fsdPercent,
+      fsdDisengagements,
+      autopilotEngagedMs,
+      autopilotPercent,
+      tessieCount,
+    }
+  }, [filtered])
+
   const updateParams = (mut: (p: URLSearchParams) => void) => {
     const next = new URLSearchParams(params)
     mut(next)
@@ -250,6 +319,7 @@ export function useDrivesList(): DrivesListState {
     range,
     filters,
     sortDir,
+    filteredStats,
     loading,
     error,
     setPage,
