@@ -383,6 +383,10 @@ function install_ble_daemon () {
     fi
   done
 
+  # DietPi ships a modprobe blacklist that prevents Bluetooth kernel modules
+  # from loading at boot. Remove it so hci0 is available after reboot.
+  rm -f /etc/modprobe.d/dietpi-disable_bluetooth.conf 2>/dev/null || true
+
   chmod +x /root/bin/sentryusb-ble.py 2>/dev/null || true
 
   # Install D-Bus policy file so BlueZ can call GATT methods on our daemon.
