@@ -10,10 +10,14 @@ then
   exit 0
 fi
 
-function readable() { 
+function readable() {
   local temp1=$(($1 / 1000))
   local temp2=$(($1 % 1000))
-  echo "${temp1}.${temp2}°C"
+  if [ "${TEMPERATURE_UNIT:-C}" = "F" ]; then
+    awk "BEGIN { printf \"%.1f°F\", ${temp1}.${temp2} * 9/5 + 32 }"
+  else
+    echo "${temp1}.${temp2}°C"
+  fi
 }
 
 counter=0

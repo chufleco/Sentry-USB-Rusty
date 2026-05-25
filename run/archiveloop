@@ -698,18 +698,24 @@ function clean_cam_mount {
 #   lapvideo.mp4
 #   laptelemetry.csv
 # Read the SoC temperature directly from the thermal zone, formatted to match the
-# temperature_monitor output (e.g. "84.512°C"). Echoes nothing on devices with no
-# thermal sensor. Called inline at the moment of an archive failure so the value
-# reflects the temperature *before* the chip cools: overheating (WiFi drop /
-# throttling) is a common cause of archive failures, and the periodic monitor only
-# samples once a minute, so by the time it logs the chip has already cooled.
+# temperature_monitor output. Echoes nothing on devices with no thermal sensor.
+# Called inline at the moment of an archive failure so the value reflects the
+# temperature *before* the chip cools: overheating (WiFi drop / throttling) is a
+# common cause of archive failures, and the periodic monitor only samples once a
+# minute, so by the time it logs the chip has already cooled.
+# Respects TEMPERATURE_UNIT (from sentryusb.conf): "F" → Fahrenheit, else Celsius.
 function soc_temperature () {
   local zone=/sys/class/thermal/thermal_zone0/temp
   [ -e "$zone" ] || return 0
   local raw
   raw=$(cat "$zone" 2>/dev/null) || return 0
   [ -n "$raw" ] || return 0
-  echo "$((raw / 1000)).$((raw % 1000))°C"
+  local c="$((raw / 1000)).$((raw % 1000))"
+  if [ "${TEMPERATURE_UNIT:-C}" = "F" ]; then
+    awk "BEGIN { printf \"%.1f°F\", $c * 9/5 + 32 }"
+  else
+    echo "${c}°C"
+  fi
 }
 
 function archive_teslacam_clips () {

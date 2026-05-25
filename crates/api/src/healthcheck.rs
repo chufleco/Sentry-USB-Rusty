@@ -37,6 +37,30 @@ fn item(name: &str, status: &'static str, detail: Option<String>) -> HealthItem 
 pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let mut categories: Vec<HealthCategory> = Vec::new();
 
+    // ── Config (needed early for temperature display unit) ────────────────
+    let active_cfg: std::collections::HashMap<String, String> =
+        sentryusb_config::parse_file(sentryusb_config::find_config_path())
+            .map(|(active, _commented)| active)
+            .unwrap_or_default();
+
+    let use_f = active_cfg
+        .get("TEMPERATURE_UNIT")
+        .map_or(false, |v| v.eq_ignore_ascii_case("F"));
+    let fmt_temp = |celsius: f64| -> String {
+        if use_f {
+            format!("{:.1}°F", celsius * 9.0 / 5.0 + 32.0)
+        } else {
+            format!("{:.1}°C", celsius)
+        }
+    };
+    let fmt_threshold = |celsius: f64| -> String {
+        if use_f {
+            format!("{:.0}°F", celsius * 9.0 / 5.0 + 32.0)
+        } else {
+            format!("{:.0}°C", celsius)
+        }
+    };
+
     // ── Hardware ──────────────────────────────────────────────────────────
     let mut hw = Vec::new();
     let mut cpu_temp_val: Option<f64> = None;
@@ -46,14 +70,22 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         }
     }
     match cpu_temp_val {
-        Some(t) if t >= 80.0 => hw.push(item("CPU temperature", "fail", Some(format!("{:.1}°C (>80°C)", t)))),
-        Some(t) if t >= 70.0 => hw.push(item("CPU temperature", "warn", Some(format!("{:.1}°C", t)))),
-        Some(t) => hw.push(item("CPU temperature", "pass", Some(format!("{:.1}°C", t)))),
-        None => hw.push(item("CPU temperature", "warn", Some("unavailable".to_string()))),
+        Some(t) if t >= 80.0 => hw.push(item("CPU temperature", "fail",
+            Some(format!("{} (>{})", fmt_temp(t), fmt_threshold(80.0))))),
+        Some(t) if t >= 70.0 => hw.push(item("CPU temperature", "warn",
+            Some(fmt_temp(t)))),
+        Some(t) => hw.push(item("CPU temperature", "pass",
+            Some(fmt_temp(t)))),
+        None => hw.push(item("CPU temperature", "warn",
+            Some("unavailable".to_string()))),
     }
     if let Ok(out) = sentryusb_shell::run("vcgencmd", &["measure_temp"]).await {
-        let s = out.trim().trim_start_matches("temp=").trim_end_matches("'C").to_string();
-        hw.push(item("GPU temperature", "pass", Some(s)));
+        let raw = out.trim().trim_start_matches("temp=").trim_end_matches("'C");
+        let detail = match raw.parse::<f64>() {
+            Ok(celsius) => fmt_temp(celsius),
+            Err(_) => raw.to_string(),
+        };
+        hw.push(item("GPU temperature", "pass", Some(detail)));
     }
     // Throttling
     if let Ok(out) = sentryusb_shell::run("vcgencmd", &["get_throttled"]).await {
@@ -116,14 +148,9 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
         Some(p) => st.push(item("Backingfiles free space", "pass", Some(format!("{:.1}% free", p)))),
         None => st.push(item("Backingfiles free space", "warn", Some("partition not mounted".to_string()))),
     }
-    // Load the active config so we only nag about disks the user
-    // actually asked for. If MUSIC_SIZE=0 (or unset) the user opted
-    // out of the music disk entirely — warning "music disk image
-    // missing" when they never configured it is just noise.
-    let active_cfg: std::collections::HashMap<String, String> =
-        sentryusb_config::parse_file(sentryusb_config::find_config_path())
-            .map(|(active, _commented)| active)
-            .unwrap_or_default();
+    // Only nag about disks the user actually asked for. If MUSIC_SIZE=0
+    // (or unset) the user opted out of the music disk entirely — warning
+    // "music disk image missing" when they never configured it is just noise.
     let user_wants = |size_key: &str| -> bool {
         // "0", "0G", "0M", "0K", empty, unset → disabled. Any non-zero
         // numeric prefix → enabled. Strict-enough for health: the
