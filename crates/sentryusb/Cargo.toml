@@ -6,9 +6,6 @@ edition = "2024"
 [dependencies]
 tokio = { workspace = true }
 libc = "0.2"
-serde = { workspace = true }
-serde_json = { workspace = true }
-anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 clap = { version = "4", features = ["derive"] }
@@ -21,11 +18,9 @@ tower-http = { version = "0.6", features = ["compression-full", "fs"] }
 # files (woff2, favicon, tiny entries) live raw.
 rust-embed = { version = "8" }
 
-sentryusb-config = { path = "../config", package = "sentryusb-config" }
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
 sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-api = { path = "../api", package = "sentryusb-api" }
-sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
 sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cloud-uploader" }
