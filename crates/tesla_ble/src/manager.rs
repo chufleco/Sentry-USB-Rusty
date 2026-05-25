@@ -56,7 +56,7 @@ use crate::auth;
 use crate::crypto::{SessionKey, derive_session_key};
 use crate::gatt::Connection;
 use crate::keys::KeyPair;
-use crate::proto::signatures::signature_data;
+use crate::proto::signatures::{SessionInfo, signature_data};
 use crate::proto::universal_message::{
     Domain, RoutableMessage, destination, routable_message,
 };
@@ -264,12 +264,12 @@ async fn run_session_task(
                 state: vds,
                 reply,
             } => {
-                let result = handle_query(&mut state, domain, vds).await;
+                let result = query_with_refresh_retry(&mut state, domain, vds).await;
                 if result.is_err() {
                     // Transport-level failures should force a fresh
                     // connect on the next query. Domain-fault failures
                     // already cleared their domain state inside
-                    // handle_query.
+                    // try_query_once.
                     if state.conn.is_some() && matches!(result.as_ref(), Err(e) if is_transport_error(e)) {
                         warn!("PersistentSession: connection lost ({:?}), dropping for reconnect", result.as_ref().err());
                         if let Some(conn) = state.conn.take() {
@@ -289,11 +289,84 @@ async fn run_session_task(
     }
 }
 
-async fn handle_query(
+/// Outer wrapper that handles SessionInfo-refresh responses. The car
+/// sometimes replies to a signed command with a fresh SessionInfo
+/// payload instead of an encrypted response, signaling "your session
+/// state is stale, here's the new state, please retry." Tesla's
+/// reference client does the same refresh-and-retry dance.
+///
+/// We do at most one retry per query — if even with refreshed state
+/// the retry still hits the same "needs refresh" outcome, something
+/// deeper is wrong and we surface the error instead of looping
+/// forever.
+async fn query_with_refresh_retry(
     state: &mut SessionState,
     domain: Domain,
     vds: VehicleDataState,
 ) -> Result<Vec<u8>> {
+    match try_query_once(state, domain, vds).await {
+        Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
+        Ok(QueryOutcome::SessionRefresh(info)) => {
+            apply_session_refresh(state, domain, info)?;
+            info!(
+                "PersistentSession: retrying {:?} after SessionInfo refresh",
+                vds
+            );
+            match try_query_once(state, domain, vds).await {
+                Ok(QueryOutcome::Plaintext(bytes)) => Ok(bytes),
+                Ok(QueryOutcome::SessionRefresh(_)) => {
+                    bail!("car requested SessionInfo refresh twice in a row — giving up")
+                }
+                Err(e) => Err(e),
+            }
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// One of two normal outcomes from a signed query.
+enum QueryOutcome {
+    /// Decrypted response payload — pass it through to the caller.
+    Plaintext(Vec<u8>),
+    /// Car returned a fresh SessionInfo asking us to update our
+    /// cached state and retry. Caller must call `apply_session_refresh`
+    /// and re-issue the query.
+    SessionRefresh(SessionInfo),
+}
+
+/// Apply a car-provided SessionInfo refresh: derive a new session
+/// key, replace the cached domain state, reset the local handshake
+/// clock so `estimated_car_clock` tracks the new baseline. Cheap —
+/// no GATT traffic, just ECDH + a HashMap insert.
+fn apply_session_refresh(
+    state: &mut SessionState,
+    domain: Domain,
+    info: SessionInfo,
+) -> Result<()> {
+    let key = derive_session_key(&state.keypair.secret, &info.public_key)
+        .context("deriving session key from refreshed SessionInfo")?;
+    info!(
+        "PersistentSession: refreshed {:?} session — counter={} clock_time={}",
+        domain, info.counter, info.clock_time
+    );
+    state.domains.insert(
+        domain,
+        DomainSession {
+            key,
+            epoch: info.epoch,
+            counter: info.counter,
+            clock_time_at_handshake: info.clock_time,
+            handshake_local_time: Instant::now(),
+        },
+    );
+    Ok(())
+}
+
+async fn try_query_once(
+    state: &mut SessionState,
+    domain: Domain,
+    vds: VehicleDataState,
+) -> Result<QueryOutcome> {
     ensure_connected(state).await?;
     ensure_domain_session(state, domain).await?;
 
@@ -342,6 +415,15 @@ async fn handle_query(
         .map(|s| s.signed_message_fault as u32)
         .unwrap_or(0);
 
+    // Check for a SessionInfo refresh first — the car uses this as
+    // the standard "your session is stale, here's fresh info" reply.
+    // It's not an error; it's an instruction to refresh and retry.
+    if let Some(routable_message::Payload::SessionInfo(info_bytes)) = &rm.payload {
+        let parsed = SessionInfo::decode(info_bytes.as_slice())
+            .context("decoding refreshed SessionInfo from car")?;
+        return Ok(QueryOutcome::SessionRefresh(parsed));
+    }
+
     if fault != 0 {
         // Counter/epoch faults are recoverable by re-handshaking the
         // domain. Drop our cached session state so the next query
@@ -368,18 +450,28 @@ async fn handle_query(
     }
 
     // Pull out the encrypted payload + AES_GCM_Response sig data.
-    let resp_sig = rm
-        .sub_sig_data
-        .as_ref()
-        .and_then(|s| match s {
-            routable_message::SubSigData::SignatureData(sd) => {
-                sd.sig_type.as_ref().and_then(|t| match t {
-                    signature_data::SigType::AesGcmResponseData(r) => Some(r),
-                    _ => None,
-                })
+    let resp_sig = match rm.sub_sig_data.as_ref() {
+        Some(routable_message::SubSigData::SignatureData(sd)) => {
+            match sd.sig_type.as_ref() {
+                Some(signature_data::SigType::AesGcmResponseData(r)) => r,
+                Some(other) => bail!(
+                    "response signature_data was not AES_GCM_Response — got {}. \
+                     Full response hex: {}",
+                    sig_type_name(other),
+                    hex::encode(&resp_bytes),
+                ),
+                None => bail!(
+                    "response signature_data has no sig_type. Full response hex: {}",
+                    hex::encode(&resp_bytes),
+                ),
             }
-        })
-        .context("response missing AES_GCM_Response signature_data")?;
+        }
+        None => bail!(
+            "response has no sub_sig_data at all. payload variant: {}. Full hex: {}",
+            payload_variant_name(rm.payload.as_ref()),
+            hex::encode(&resp_bytes),
+        ),
+    };
 
     let ciphertext = rm
         .payload
@@ -405,7 +497,7 @@ async fn handle_query(
         _ => unreachable!("we just signed with AES_GCM_PERSONALIZED"),
     };
 
-    let plaintext = auth::decrypt_response(
+    let plaintext = match auth::decrypt_response(
         &ds.key,
         &request_tag,
         from_domain,
@@ -416,10 +508,28 @@ async fn handle_query(
         &resp_sig.nonce,
         &resp_sig.tag,
         ciphertext,
-    )?;
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            // Decrypt failure with valid-looking sig_data almost
+            // always means our cached session state diverged from
+            // the car's view (e.g. an interleaving client bumped
+            // the car's counter or rolled the epoch). Drop the
+            // domain state so the wrapper retries with a fresh
+            // handshake and surface the original error so the
+            // caller knows what happened.
+            warn!(
+                "PersistentSession: decrypt failed for {:?} — \
+                 dropping domain state for re-handshake on retry",
+                domain
+            );
+            state.domains.remove(&domain);
+            return Err(e);
+        }
+    };
 
     debug!("PersistentSession: decrypted {} bytes", plaintext.len());
-    Ok(plaintext)
+    Ok(QueryOutcome::Plaintext(plaintext))
 }
 
 async fn ensure_connected(state: &mut SessionState) -> Result<()> {
@@ -487,6 +597,28 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
         },
     );
     Ok(())
+}
+
+/// Human-readable name for a SignatureData::sig_type variant. Used
+/// in error messages so an unexpected response shape tells us
+/// exactly what shape it had instead of "missing X" guesswork.
+fn sig_type_name(t: &signature_data::SigType) -> &'static str {
+    match t {
+        signature_data::SigType::AesGcmPersonalizedData(_) => "AES_GCM_PERSONALIZED",
+        signature_data::SigType::AesGcmResponseData(_) => "AES_GCM_RESPONSE",
+        signature_data::SigType::HmacPersonalizedData(_) => "HMAC_PERSONALIZED",
+        signature_data::SigType::SessionInfoTag(_) => "SESSION_INFO_TAG (HMAC)",
+    }
+}
+
+/// Human-readable name for a RoutableMessage::payload variant.
+fn payload_variant_name(p: Option<&routable_message::Payload>) -> &'static str {
+    match p {
+        Some(routable_message::Payload::ProtobufMessageAsBytes(_)) => "ProtobufMessageAsBytes (encrypted)",
+        Some(routable_message::Payload::SessionInfo(_)) => "SessionInfo (refresh)",
+        Some(routable_message::Payload::SessionInfoRequest(_)) => "SessionInfoRequest",
+        None => "<none>",
+    }
 }
 
 /// Heuristic: does this error look like the BLE link dropped (vs a
