@@ -22,6 +22,14 @@ path = "examples/body_controller.rs"
 name = "session_info"
 path = "examples/session_info.rs"
 
+[[example]]
+name = "derive_key"
+path = "examples/derive_key.rs"
+
+[[example]]
+name = "signed_request"
+path = "examples/signed_request.rs"
+
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -32,6 +40,8 @@ btleplug = "0.11"
 futures = "0.3"
 prost = "0.13"
 sha1 = "0.10"
+sha2 = "0.10"
+hmac = "0.12"
 hex = "0.4"
 uuid = "1"
 rand = "0.8"
@@ -40,6 +50,9 @@ rand = "0.8"
 # `pem` reads the on-disk private key file Tesla pairing produced.
 p256 = { version = "0.13", features = ["ecdh", "pem", "pkcs8"] }
 pem = "3"
+
+# AES-128-GCM for signed-command authentication.
+aes-gcm = "0.10"
 
 [build-dependencies]
 prost-build = "0.13"

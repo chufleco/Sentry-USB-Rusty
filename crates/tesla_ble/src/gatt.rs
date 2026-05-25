@@ -61,19 +61,71 @@ impl Connection {
             .await
             .context("create notification stream")?;
 
-        debug!("GATT ready");
-        Ok(Self {
+        let mut conn = Self {
             peripheral,
             tx_char,
             rx_char,
             rx_stream,
             rx_buffer: Vec::with_capacity(512),
-        })
+        };
+
+        // One-time post-subscribe settle: bluez can emit a subscribe-
+        // complete notification (or an initial GATT indication burst)
+        // 50-200ms after the subscribe() returns. If we don't drain
+        // them, the first round_trip's receive loop picks them up as
+        // garbage prefix bytes and mis-parses the framing — producing
+        // an "empty RoutableMessage with all fields None" error.
+        // 300ms quiet window is enough on every Pi bluez version
+        // we've tested.
+        conn.drain_until_quiet(Duration::from_millis(300)).await;
+
+        debug!("GATT ready");
+        Ok(conn)
+    }
+
+    /// Drain pending notifications and clear the unframe buffer.
+    /// Used before TX in `round_trip` (short quiet window — just clearing
+    /// in-flight stragglers between commands) and after subscribe in
+    /// `open` (longer quiet window — catches bluez's post-subscribe
+    /// notification burst). See `quiet_window` discussion in caller
+    /// sites for which to use.
+    async fn drain_until_quiet(&mut self, quiet_window: Duration) {
+        let mut drained = 0;
+        loop {
+            match timeout(quiet_window, self.rx_stream.next()).await {
+                Ok(Some(n)) => {
+                    drained += 1;
+                    debug!(
+                        "drained stale notification #{} on {} ({} bytes)",
+                        drained,
+                        n.uuid,
+                        n.value.len()
+                    );
+                }
+                // Timed out (queue quiet for `quiet_window`) or stream
+                // closed — done.
+                _ => break,
+            }
+        }
+        // Reset the unframe buffer too in case a partial frame is
+        // sitting there from a stale notification.
+        self.rx_buffer.clear();
+        if drained > 0 {
+            debug!("drained {} stale notification(s)", drained);
+        }
     }
 
     /// Send a framed payload (handles chunking) and wait for the next
     /// complete response frame to come back. Times out after `wait`.
     pub async fn round_trip(&mut self, payload: &[u8], wait: Duration) -> Result<Vec<u8>> {
+        // Drain anything queued before we TX, otherwise the first
+        // `next()` after our send could return a stale frame from
+        // a prior unrelated request and we'd parse that as our
+        // response. 50ms quiet window — enough to consume any
+        // stragglers from the previous round_trip without adding
+        // meaningful latency.
+        self.drain_until_quiet(Duration::from_millis(50)).await;
+
         let framed = frame(payload);
         // Tesla supports MTU up to 247; we'd negotiate that during
         // service discovery. btleplug doesn't currently expose the
@@ -98,6 +150,23 @@ impl Connection {
         timeout(wait, async {
             loop {
                 if let Some(payload) = try_unframe(&mut self.rx_buffer)? {
+                    // Tesla never sends RoutableMessages this small —
+                    // the minimum useful response has at least a
+                    // to_destination + uuid + status, which is well
+                    // over 8 bytes. A < 8-byte "frame" is almost
+                    // always bluez's subscribe-complete leakage or a
+                    // similar internal notification we mis-interpreted
+                    // as the length prefix of a real frame. Discard
+                    // and keep listening.
+                    if payload.len() < 8 {
+                        debug!(
+                            "ignoring suspiciously short frame ({} bytes): {} — \
+                             treating as framing desync, continuing to RX",
+                            payload.len(),
+                            hex::encode(&payload)
+                        );
+                        continue;
+                    }
                     debug!("unframed payload ({} bytes): {}", payload.len(), hex::encode(&payload));
                     return Ok::<_, anyhow::Error>(payload);
                 }

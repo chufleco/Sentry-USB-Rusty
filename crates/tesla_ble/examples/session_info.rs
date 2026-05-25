@@ -58,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
             resp.parsed.public_key.len(),
             resp.parsed.public_key.first().copied().unwrap_or(0)
         );
+        println!("  vehicle pubkey hex: {}", hex::encode(&resp.parsed.public_key));
         println!("  raw SessionInfo bytes: {}", resp.raw.len());
     }
 

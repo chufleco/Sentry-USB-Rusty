@@ -1,11 +1,14 @@
 //! Bluez-aware Tesla BLE client.
 
+pub mod auth;
 pub mod body_controller;
+pub mod crypto;
 pub mod gatt;
 pub mod keys;
 pub mod local_name;
 pub mod scan;
 pub mod session;
+pub mod state_query;
 pub mod transport;
 
 pub mod proto {
