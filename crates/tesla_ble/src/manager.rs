@@ -174,6 +174,18 @@ struct SessionState {
     /// the slot is being held (counter climbs steadily) vs being
     /// re-grabbed (counter resets often).
     queries_since_connect: u32,
+    /// Monotonic timestamp of the most recent query (signed or
+    /// body-controller) that fully succeeded. Read by the disconnect
+    /// diagnostic so a tester's log shows whether the link was
+    /// healthy right up to the drop ("last_ok=1s ago") or had been
+    /// silently degrading ("last_ok=45s ago"). Reset on each
+    /// successful connect.
+    last_successful_query_at: Option<Instant>,
+    /// Total connection drops detected by `handle_transport_error_if_any`
+    /// since the daemon started. Helps testers see at a glance how
+    /// flappy their BLE link is over a drive — every drop logs the
+    /// running total so a journalctl tail tells the whole story.
+    lifetime_drops: u32,
 }
 
 /// Log a connection-status summary every this many successful
@@ -206,6 +218,8 @@ impl PersistentSession {
             backoff: RECONNECT_BACKOFF_MIN,
             connected_at: None,
             queries_since_connect: 0,
+            last_successful_query_at: None,
+            lifetime_drops: 0,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -644,15 +658,37 @@ async fn try_signed_request_once(
 /// command triggers a fresh scan + connect. Protocol-level faults
 /// (INVALID_SIGNATURE, etc.) are handled separately inside the
 /// query/body_controller handlers and don't drop the connection.
+///
+/// On every drop, emits a single structured log line summarizing the
+/// connection's lifetime + freshness of last successful query +
+/// running drop count. Testers paste their journalctl tail and we
+/// can immediately distinguish slot contention (held=20m, last_ok=1s,
+/// many drops) from a degraded link (held=20m, last_ok=45s, occasional
+/// drops) from a flapping radio (held=10s repeatedly).
 async fn handle_transport_error_if_any<T>(
     state: &mut SessionState,
     result: &Result<T>,
 ) {
     if let Err(e) = result {
         if state.conn.is_some() && is_transport_error(e) {
+            state.lifetime_drops = state.lifetime_drops.saturating_add(1);
+            let held_secs = state
+                .connected_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
+            let last_ok = state
+                .last_successful_query_at
+                .map(|t| format!("{}s", t.elapsed().as_secs()))
+                .unwrap_or_else(|| "<never>".into());
             warn!(
-                "PersistentSession: connection lost ({:?}), dropping for reconnect",
-                e
+                "PersistentSession: connection lost — \
+                 held={}m{}s queries={} last_ok={}_ago drops_total={} reason={:#}",
+                held_secs / 60,
+                held_secs % 60,
+                state.queries_since_connect,
+                last_ok,
+                state.lifetime_drops,
+                e,
             );
             if let Some(conn) = state.conn.take() {
                 conn.close().await;
@@ -660,6 +696,10 @@ async fn handle_transport_error_if_any<T>(
             state.domains.clear();
             state.connected_at = None;
             state.queries_since_connect = 0;
+            // Intentionally NOT resetting last_successful_query_at —
+            // the value across the drop is useful for the next
+            // diagnostic line ("reconnected after Xs gap since last
+            // working query").
         }
     }
 }
@@ -731,6 +771,11 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
 /// slot is being held vs being re-grabbed each cycle.
 fn note_successful_query(state: &mut SessionState) {
     state.queries_since_connect = state.queries_since_connect.saturating_add(1);
+    // Record the success time so the disconnect diagnostic can show
+    // "last_ok=Xs ago" — distinguishes a clean drop (link was fine
+    // until it suddenly wasn't) from a degraded link (queries were
+    // already missing before the drop).
+    state.last_successful_query_at = Some(Instant::now());
     let n = state.queries_since_connect;
     if n == 1 || n % STATUS_LOG_EVERY_N_QUERIES == 0 {
         let uptime = state

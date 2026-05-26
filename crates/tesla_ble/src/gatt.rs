@@ -9,10 +9,25 @@ use btleplug::api::{
 use btleplug::platform::Peripheral;
 use futures::StreamExt;
 use tokio::time::{sleep, timeout};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::transport::{chunks_for_mtu, frame, try_unframe};
 use crate::uuids;
+
+/// Hard wall-clock cap on a single `peripheral.connect()` attempt.
+///
+/// btleplug delegates to bluez, which defaults to a ~30s connect
+/// timeout. That's catastrophic during slot contention: when a phone
+/// key is sitting on a Tesla BLE slot, every connect attempt blocks
+/// 30s before failing, so we get ~28 retries in 14 minutes instead
+/// of the ~150+ a tight timeout allows. The shorter we fail, the
+/// more chances we have to win the slot in the brief window the
+/// phone is silent (advertising, switching channels, etc.).
+///
+/// 8s is a balance: long enough that a genuinely-reachable car with
+/// a normal-quality link succeeds on the first try (real connects
+/// take 1-3s), short enough that a slot-blocked attempt fails fast.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Established BLE GATT connection to a Tesla car.
 pub struct Connection {
@@ -28,10 +43,36 @@ impl Connection {
     /// subscribe to notifications.
     pub async fn open(peripheral: Peripheral) -> Result<Self> {
         info!("connecting to vehicle GATT");
-        peripheral
-            .connect()
-            .await
-            .context("BLE connect")?;
+        // Wrap btleplug's connect() in our own timeout. btleplug uses
+        // bluez's default (~30s) which is far too long when racing a
+        // phone key for a slot. On the success path real connects
+        // land in 1-3s, so 8s is a generous cap that fails fast on
+        // slot contention without false-failing healthy connects.
+        let started = std::time::Instant::now();
+        match timeout(CONNECT_TIMEOUT, peripheral.connect()).await {
+            Ok(Ok(())) => {
+                debug!(
+                    "BLE connect succeeded in {}ms",
+                    started.elapsed().as_millis()
+                );
+            }
+            Ok(Err(e)) => return Err(e).context("BLE connect"),
+            Err(_) => {
+                // Best-effort cleanup so bluez doesn't leak a
+                // half-open connection slot on its side, which would
+                // make the *next* attempt fail with "already
+                // connecting".
+                let _ = peripheral.disconnect().await;
+                warn!(
+                    "BLE connect timed out after {}ms (slot likely held by phone key)",
+                    started.elapsed().as_millis()
+                );
+                bail!(
+                    "BLE connect timed out after {}s — slot likely held by another client",
+                    CONNECT_TIMEOUT.as_secs()
+                );
+            }
+        }
         peripheral
             .discover_services()
             .await

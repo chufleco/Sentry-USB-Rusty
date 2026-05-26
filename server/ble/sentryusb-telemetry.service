@@ -1,4 +1,12 @@
 [Unit]
+# Naming note: this unit is `sentryusb-telemetry.service` but the
+# binary it runs is `sentryusb-tesla-telemetry` (the crate name in
+# Cargo.toml is `sentryusb-tesla-telemetry` too). The asymmetry is
+# historical — the unit was named before the "tesla-" prefix was
+# added — and a rename now would break upgrade paths on every
+# existing install (systemd would lose track of the old unit). Use
+# `journalctl -u sentryusb-telemetry` (NOT `-u sentryusb-tesla-telemetry`)
+# to read this daemon's logs.
 Description=SentryUSB BLE Telemetry Sampler
 Documentation=https://github.com/Sentry-Six/Sentry-USB-Rusty
 After=bluetooth.target bluetooth.service dbus.service sentryusb.service
@@ -26,6 +34,31 @@ Type=simple
 # Clean up our own stale lock at startup (only if we own it AND it's
 # >24h old) so a crash mid-session doesn't leave the radio held forever.
 ExecStartPre=-/bin/bash -c 'f=/tmp/ble_radio_owner; if [ -e "$f" ] && [ "$(head -n1 "$f" 2>/dev/null)" = "telemetry" ] && [ $(( $(date +%s) - $(stat -c %Y "$f" 2>/dev/null || echo 0) )) -gt 86400 ]; then rm -f "$f"; fi; exit 0'
+# Tune bluez LE link parameters for in-car BLE stability.
+#
+# The Tesla-side BLE link drops every 10-20 min on a moving car with
+# the default bluez settings because the supervision_timeout is 720ms.
+# A 720ms gap in connection events (RF interference from another
+# device, the car body briefly shielding the antenna, a phone-key
+# scan burst) triggers a link-dead declaration. After that we have
+# to race phone keys for the slot, which we usually lose.
+#
+# These sysfs writes ask the kernel to use longer-supervision +
+# tighter-interval params on future connections, so brief dropouts
+# don't tear down the link.
+#
+# Values are in BLE units:
+#   conn_min/max_interval: 1.25ms per unit  (12 = 15ms, 24 = 30ms)
+#   supervision_timeout:   10ms per unit    (600 = 6000ms = 6 seconds)
+#
+# Defaults: min=24/max=40 interval, supervision=72 (720ms)
+# New:      min=12/max=24 interval, supervision=600 (6s)
+#
+# `|| true` everywhere — debugfs isn't always mounted on every Pi
+# image, and we'd rather start with default params than block boot.
+# Wildcard glob handles hci0/hci1/etc — both onboard and external
+# adapters get tuned.
+ExecStartPre=-/bin/bash -c 'for d in /sys/kernel/debug/bluetooth/hci*/; do [ -d "$d" ] || continue; echo 600 > "${d}supervision_timeout" 2>/dev/null || true; echo 12 > "${d}conn_min_interval" 2>/dev/null || true; echo 24 > "${d}conn_max_interval" 2>/dev/null || true; echo 0 > "${d}conn_latency" 2>/dev/null || true; done; exit 0'
 # Source sentryusb.conf so BLE_ENABLED and TESLA_BLE_VIN are visible
 # inside the daemon's env. The Rust code re-reads on each iteration,
 # but seeding the initial env here makes the systemd status output
