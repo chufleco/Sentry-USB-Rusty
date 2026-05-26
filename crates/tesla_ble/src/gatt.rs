@@ -29,6 +29,30 @@ use crate::uuids;
 /// take 1-3s), short enough that a slot-blocked attempt fails fast.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// Wire-format prefix of any RoutableMessage whose `to_destination`
+/// is `Destination { sub_destination: Domain(BROADCAST=0) }`.
+///
+/// Bytes:
+///   0x32 = (field 6 << 3) | 2 = to_destination, length-delimited
+///   0x02 = length 2
+///   0x08 = (field 1 << 3) | 0 = Destination.sub_destination.domain, varint
+///   0x00 = varint 0 = BROADCAST
+///
+/// The car's VEHICLE_SECURITY subsystem sometimes broadcasts state
+/// notifications (charge state changes, sentry events, etc.) to the
+/// whole BLE link with this prefix. If round_trip returned one to
+/// the manager as our "response," manager would try to decrypt it
+/// as a signed-query reply and fail with `"response has no
+/// sub_sig_data at all"` — broadcasts aren't authenticated and have
+/// no nonce/tag for AES-GCM. Discarding them at the transport layer
+/// keeps the manager's response-handling path simple.
+///
+/// Legitimate replies use `routing_address` for `to_destination`
+/// (a 16-byte UUID), which encodes as `32 12 12 10 <uuid>` — the
+/// byte at offset 2 is `0x12` (field 2 tag), not `0x08`, so this
+/// prefix doesn't false-match real responses.
+const BROADCAST_FRAME_PREFIX: &[u8] = &[0x32, 0x02, 0x08, 0x00];
+
 /// Established BLE GATT connection to a Tesla car.
 pub struct Connection {
     peripheral: Peripheral,
@@ -206,6 +230,22 @@ impl Connection {
                         );
                         continue;
                     }
+                    // Drop VCSEC's unsolicited broadcast notifications
+                    // before returning to the caller. These arrive
+                    // mid-query (especially right after connect, when
+                    // VCSEC bursts state-change events) and would
+                    // poison the response decoder with "no sub_sig_data"
+                    // errors. See BROADCAST_FRAME_PREFIX comment for
+                    // the byte-level reasoning.
+                    if payload.starts_with(BROADCAST_FRAME_PREFIX) {
+                        debug!(
+                            "discarding VCSEC BROADCAST notification ({} bytes): {} — \
+                             not a response to our request, continuing to RX",
+                            payload.len(),
+                            hex::encode(&payload[..payload.len().min(48)])
+                        );
+                        continue;
+                    }
                     debug!("unframed payload ({} bytes): {}", payload.len(), hex::encode(&payload));
                     return Ok::<_, anyhow::Error>(payload);
                 }
@@ -229,5 +269,45 @@ impl Connection {
         let _ = self.peripheral.disconnect().await;
         // Tiny grace period to let bluez clean up its connection state.
         sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn broadcast_prefix_matches_real_capture() {
+        // Exact bytes captured from a failing tester's bundle:
+        // a VCSEC unsolicited broadcast that previously poisoned
+        // our response decoder with "no sub_sig_data at all".
+        let raw = hex::decode(
+            "320208003a020802521f1a1d12160a14d261fa622f06da46cf0cf4751ab79e3d8e7a46801802220101",
+        )
+        .unwrap();
+        assert!(
+            raw.starts_with(BROADCAST_FRAME_PREFIX),
+            "filter must catch the exact bytes the bug fired on"
+        );
+    }
+
+    #[test]
+    fn broadcast_prefix_does_not_match_routing_address_to_destination() {
+        // A normal reply to us has to_destination = routing_address
+        // (16-byte UUID). Encoding: 32 12 12 10 <uuid bytes>.
+        // The byte at offset 2 is 0x12 (field 2 tag, routing_address)
+        // — not 0x08 — so the broadcast filter must NOT match.
+        let normal_reply_prefix: [u8; 4] = [0x32, 0x12, 0x12, 0x10];
+        assert!(!normal_reply_prefix.starts_with(BROADCAST_FRAME_PREFIX));
+    }
+
+    #[test]
+    fn broadcast_prefix_does_not_match_other_domain() {
+        // A frame addressed to (some other) Domain, e.g. INFOTAINMENT(3),
+        // would encode as 32 02 08 03. Even though the first three
+        // bytes match, the fourth doesn't — only the literal
+        // BROADCAST (=0) variant should be filtered.
+        let to_infotainment: [u8; 4] = [0x32, 0x02, 0x08, 0x03];
+        assert!(!to_infotainment.starts_with(BROADCAST_FRAME_PREFIX));
     }
 }
