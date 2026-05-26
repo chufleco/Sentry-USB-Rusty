@@ -1,81 +1,161 @@
-# SentryUSB (Rust)
+<h1 align="center">Sentry USB</h1>
 
-Raspberry Pi USB gadget that exposes a Tesla dashcam drive with a modern web UI
-for review, archive, and lock-chime customization. Rust rewrite of the original
-Go version, feature-parity and drop-in compatible with existing SD-card layouts.
+<p align="center">
+  <strong>Turn a Raspberry Pi into a smart USB drive for your Tesla's dashcam.</strong><br>
+  Auto-archives. Modern web UI. Multi-camera viewer. Privacy-first.
+</p>
+
+<p align="center">
+  <a href="https://github.com/Sentry-Six/Sentry-USB-Rusty/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/Sentry-Six/Sentry-USB-Rusty"></a>
+  <a href="https://discord.gg/9QZEzVwdnt"><img alt="Discord" src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+</p>
+
+<p align="center">
+  <img src="docs/images/hero-dashboard.png" alt="Sentry USB dashboard" width="900">
+</p>
+
+---
+
+## What it does
+
+- **Plugs into your Tesla's USB port** and pretends to be a dashcam drive.
+- **Tracks every drive** — route on a map, distance, speed, and the dashcam clips that recorded it — built from the metadata Tesla embeds in each clip.
+- **Enriches drives with Tesla BLE telemetry** — battery, HVAC, cabin and exterior temps, TPMS, odometer, and location — pulled over Bluetooth and layered onto each trip for a much fuller picture than the dashcam metadata gives you on its own.
+- **Archives clips automatically** to your NAS, cloud, or wherever — over WiFi, in the background.
+- **Keeps the car awake** (and the dashcam recording) via the same BLE link — no Tesla API subscription needed.
+- **Privacy-first.** No fingerprinting by default; everything sensitive is opt-in.
+
+The Rust rewrite of the original Go version. Same `sentryusb.conf`, faster server, more reliable.
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/images/drives-list.png" alt="Drives list" width="900"><br>
+  <em>Every drive your Tesla recorded — route, distance, duration, battery deltas, and FSD usage — with rolling totals for the selected time range.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/drive-detail.png" alt="Drive detail" width="900"><br>
+  <em>Per-drive deep view: speed curve, battery deltas, climate with HVAC runtime, odometer, and FSD analytics — alongside the route map and synchronized multi-camera dashcam playback.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/setup-wizard.png" alt="Setup Wizard" width="900"><br>
+  <em>11-step setup wizard — no SSH, no config files.</em>
+</p>
+
+<p align="center">
+  <img src="docs/images/settings.png" alt="Settings" width="900"><br>
+  <em>Everything reconfigurable from the browser.</em>
+</p>
+
+---
+
+## Features
+
+| | |
+|---|---|
+| **Drives tracking** | Every trip with route, distance, duration, battery deltas, and FSD usage — plus the dashcam clips one click in |
+| **Tesla BLE telemetry** | Adds battery, HVAC, cabin/exterior temps, TPMS, odometer, and location to each drive — beyond what Tesla's dashcam metadata carries on its own |
+| **Multi-camera viewer** | Synchronized 6-camera playback with HW3-aware adaptive grid and drift correction |
+| **Auto-archive** | CIFS / SMB, rsync, rclone (cloud), NFS — kicks off whenever the Pi sees known WiFi |
+| **Keep awake** | BLE (free, same link as telemetry), TeslaFi, Tessie, or generic webhook |
+| **Sentry Cloud (beta)** | Encrypted cloud sync — drives are encrypted on the Pi before they leave your network |
+| **Notifications** | Pushover, ntfy, Gotify, Discord, Telegram, Slack, Signal, Matrix, AWS SNS, IFTTT, Webhook, iOS app |
+| **Privacy-first** | No device fingerprint by default. Opt-in analytics, full per-flow disclosure |
+
+---
+
+## Install
+
+> **No prebuilt SD card image yet.** You start from stock Raspberry Pi OS Lite and run a one-liner over SSH. A prebuilt image is on the roadmap — for now this is the only supported install path. See the [full Getting Started guide](https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki/Getting-Started) for the click-by-click walkthrough.
+
+On a Pi already running **Raspberry Pi OS Lite (64-bit)**:
+
+```bash
+sudo -i
+curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
+```
+
+Then open `http://sentryusb.local` in a browser and the setup wizard takes you the rest of the way.
+
+### Hardware
+
+| Tier | Boards | Notes |
+|------|--------|-------|
+| **Recommended** | Raspberry Pi 4B, Raspberry Pi 5 | USB 2.0 OTG — fastest archiving, smoothest UI |
+| **Tested** | Raspberry Pi Zero 2 W, Raspberry Pi 3 (A+/B/B+) | USB 2.0 OTG — works fine, slower archive speeds |
+| **Community** | Radxa Rock Pi 4C+, Radxa Zero 3W | USB 3.0 OTG — reported working, not officially supported |
+
+Plus a **256 GB+ MicroSD card** and a **USB 3.0 data cable** (not charge-only) between the Pi and your Tesla. Use a 3.0 cable even on USB 2.0 boards — it delivers more power and keeps lower-end Pis stable.
+
+---
 
 ## Privacy
 
-By default, SentryUSB does **not** transmit any device identifier to our
-servers. Everything it sends out, listed in one place:
+By default, Sentry USB sends **no device identifier** to our servers. Here's everything it ever sends:
 
 | When | What | Identifier? |
 |---|---|---|
 | Daily update check | Software version, CPU arch, board model | None by default |
 | Once per install | Empty ping (no body) | None — anonymous counter |
-| Wraps / lock chime submissions | The file + your IP for rate-limiting | None (no device fingerprint) |
-| Sentry Cloud (if signed in) | Your account login + synced files | Account credentials |
+| Wraps / lock chime submissions | The file + your IP for rate-limiting | None |
+| Sentry Cloud (if signed in) | Your account + synced files | Account credentials |
 | iOS push pairing (if enabled) | Random pairing ID | Not tied to hardware |
 
-The only way a device fingerprint is sent is if you explicitly opt in to
-**Settings → Privacy → Analytics opt-in** (default: off). That's the GDPR
-Art. 21 right-to-object mechanism — it's a toggle, not an email, and the
-default is the opted-out state. Full details in
-[`wiki/Privacy.md`](wiki/Privacy.md).
+The only way a device fingerprint is sent is if you explicitly opt in to **Settings → Privacy → Analytics opt-in** (default: off). Full disclosure including legal basis, retention, and how to disable each flow lives in [`wiki/Privacy.md`](wiki/Privacy.md).
 
-## Install (fresh Pi)
+---
 
-```
-sudo -i
-curl -fsSL https://raw.githubusercontent.com/Sentry-Six/Sentry-USB-Rusty/main/install-pi.sh | bash
-```
+## Documentation
 
-Then open `http://sentryusb.local` in a browser and follow the setup wizard.
+- **[Wiki](https://github.com/Sentry-Six/Sentry-USB-Rusty/wiki)** — Getting Started, Setup Wizard Guide, Archive Methods, Notifications, Privacy, Troubleshooting, FAQ
+- **[BUILD.md](BUILD.md)** — Building from source
+
+---
 
 ## Build from source
 
 Prerequisites: Rust stable, Node 20+, and `cross` (`cargo install cross`).
 
-```
+```bash
 # Web UI
 cd web && npm ci && npm run build && cd ..
-# Copy built assets into embedded static dir
 rm -rf crates/sentryusb/static && cp -r web/dist crates/sentryusb/static
 
 # Binaries (aarch64)
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
 
-# For Pi Zero W / ARMv7:
+# Pi Zero W / ARMv7:
 cross build --release --target armv7-unknown-linux-gnueabihf -p sentryusb
 ```
 
-See `BUILD.md` for details.
+See [BUILD.md](BUILD.md) for details.
 
-## Build a full Pi image
+### Build a full Pi image (advanced)
 
-```
+```bash
 ./build-image.sh                 # 64-bit image (Pi 3/4/5/Zero 2)
 ./build-image.sh --32bit         # 32-bit image (Pi Zero W)
 ```
 
-Output: `deploy/sentryusb-*.img.gz`, flash with Raspberry Pi Imager.
+The build-image script is for developers and CI; end users should use the curl-one-liner install above.
 
-## Architecture
+---
 
-- `crates/sentryusb` — main daemon binary (embeds web UI via `rust_embed`)
-- `crates/api` — axum HTTP + WebSocket handlers
-- `crates/config` — configuration parser
-- `crates/drives` — USB gadget drive management
-- `crates/notify` — push-notification fan-out
-- `crates/setup` — partition, image, and system setup phases
-- `crates/shell` — shell command helpers
-- `crates/usb_gadget` — configfs gadget control
-- `crates/ws` — WebSocket hub
-- `server/ble/` — Python BLE GATT peripheral (iOS app pairing)
-- `run/`, `setup/pi/`, `tools/`, `tests/` — shell helpers & pi-gen stage scripts
-- `pi-gen-sources/` — Raspberry Pi OS image build configuration
-- `web/` — React + Vite web UI source
+## Based on
+
+A Rust rewrite of the original Go [`Scottmg1/Sentry-USB`](https://github.com/Scottmg1/Sentry-USB), itself a modernized fork of [TeslaUSB](https://github.com/marcone/teslausb) by marcone and contributors.
+
+## Community
+
+- **Discord** — [discord.gg/9QZEzVwdnt](https://discord.gg/9QZEzVwdnt) — fastest help, real humans
+- **Issues** — [github.com/Sentry-Six/Sentry-USB-Rusty/issues](https://github.com/Sentry-Six/Sentry-USB-Rusty/issues) — reproducible bugs
+- **Site** — [sentryusb.com](https://sentryusb.com)
 
 ## License
 
-MIT — see `LICENSE`.
+MIT — see [LICENSE](LICENSE).

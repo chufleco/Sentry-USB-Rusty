@@ -6,6 +6,8 @@ them up — no SSH, no config files.
 
 ## Install in one line
 
+> **No prebuilt SD card image yet.** The install path is: flash stock **Raspberry Pi OS Lite (64-bit)**, SSH in, and run the one-liner below. A prebuilt image will come later — for now this is the only supported install route. Full step-by-step in [Getting Started](Getting-Started).
+
 On a Pi already running Pi OS:
 
 ```bash

@@ -5,6 +5,7 @@
 - [Setup Wizard Guide](Setup-Wizard-Guide)
 - [Archive Methods](Archive-Methods)
 - [Notifications](Notifications)
+- [Privacy](Privacy)
 - [Sentry Cloud](Sentry-Cloud)
 - [Troubleshooting](Troubleshooting)
 - [FAQ](FAQ)

@@ -21,6 +21,16 @@ The car isn't seeing the Pi as a USB drive.
 3. Power-cycle the Pi (unplug, wait 5 seconds, plug back in).
 4. SSH into the Pi and check the USB gadget service: `systemctl status sentryusb-gadget`.
 
+## BLE Keep Awake stops working / can't pair
+
+The Bluetooth keep-awake holds your Tesla awake by talking to the car over BLE. If pairing fails or the connection drops, **Logs → Bluetooth** has a live diagnostic dump.
+
+**Try:**
+1. **Logs → Bluetooth** — shows which adapter the daemon picked, connection state, sample-DB counts, and the recent sampler journal lines.
+2. Click **Download Bluetooth Bundle** on that tab to grab a ZIP (config, journals, BlueZ state) for sharing on Discord — saves a lot of back-and-forth.
+3. Re-pair from **Settings → Bluetooth Keep Awake → Pair Vehicle**. The pair handler power-cycles the adapter and verifies the link before declaring success.
+4. Make sure your Tesla account in the car has BLE pairing enabled (Controls → Locks → PIN to Drive isn't required, but the car must accept new BLE peers).
+
 ## CIFS/SMB connection fails
 
 **Try:**
@@ -31,10 +41,6 @@ The car isn't seeing the Pi as a USB drive.
    sudo mount -t cifs //<server>/<share> /mnt -o username=<user>
    ```
    If that errors, the error message tells you exactly what's wrong.
-
-## "Reinstall required" banner in Settings
-
-Your Pi is running the old Go version of Sentry USB and the auto-updater has been disabled because it can't safely upgrade in place. See [Rusty Migration](Rusty-Migration) for the re-image steps. `sentryusb.conf` survives.
 
 ## Still stuck?
 
