@@ -292,7 +292,21 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
         )
     })?;
 
-    // Remount root read-write
+    // Remount root read-write. TeslaUSB-style images mount / read-only
+    // and put the writable portion behind an overlay or a per-script
+    // `remountfs_rw` helper. Try the helper first (which handles the
+    // overlay correctly on those setups), fall back to plain
+    // `mount -o remount,rw /` for vanilla rootfs images, and only then
+    // try the legacy `mount / -o remount,rw` ordering that used to be
+    // here. None of these are fatal individually — we try all three so
+    // at least one succeeds on every install layout. (Previously the
+    // single `mount / -o remount,rw` call silently failed on some
+    // images, which then caused every downstream `mv` into /root/bin
+    // to fail without surfacing an error — that's the root cause of
+    // the "UI says updated to v3.3.1 but binary on disk is still
+    // v3.3.0" bug we hit on the Rock Pi 4C+ tester.)
+    let _ = sentryusb_shell::run("/root/bin/remountfs_rw", &[]).await;
+    let _ = sentryusb_shell::run("mount", &["-o", "remount,rw", "/"]).await;
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
     let tmp = "/tmp/sentryusb-update";
@@ -342,6 +356,13 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
             repo, suffix
         )
     };
+    // Track per-binary install outcomes so the response message
+    // tells the user exactly what landed and what didn't. Previously
+    // these were all `let _ = ...` which silently swallowed failures
+    // — a read-only /root/bin (TeslaUSB safety pattern) would make
+    // the mv fail but the response still said "Updated to v3.3.1",
+    // leaving the user with v3.3.0 on disk and v3.3.1 in the UI.
+    let mut install_warnings: Vec<String> = Vec::new();
     let head_ok = sentryusb_shell::run_with_timeout(
         std::time::Duration::from_secs(15),
         "curl",
@@ -351,36 +372,89 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     .is_ok();
     if head_ok {
         let telemetry_tmp = "/tmp/sentryusb-tesla-telemetry-update";
-        if sentryusb_shell::run_with_timeout(
+        match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
             "curl",
             &["-fsSL", &telemetry_url, "-o", telemetry_tmp],
         )
         .await
-        .is_ok()
         {
-            let _ = sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await;
-            let _ = sentryusb_shell::run("chmod", &["+x", telemetry_tmp]).await;
-            let _ = sentryusb_shell::run(
-                "mv",
-                &[telemetry_tmp, "/root/bin/sentryusb-tesla-telemetry"],
-            )
-            .await;
-            // Service file is installed by migrate.rs (sentryusb's
-            // startup script). Restart here so the freshly-installed
-            // binary picks up immediately rather than waiting for the
-            // post-reboot start.
-            let _ = sentryusb_shell::run(
-                "systemctl",
-                &["daemon-reload"],
-            )
-            .await;
-            let _ = sentryusb_shell::run(
-                "systemctl",
-                &["restart", "sentryusb-telemetry"],
-            )
-            .await;
+            Ok(_) => {
+                // mkdir + chmod failures are tolerable individually
+                // (the dir likely exists; non-executable still gets
+                // executed if we fix perms later). The mv is the
+                // one we MUST surface — if it fails the binary on
+                // disk doesn't get replaced.
+                if let Err(e) =
+                    sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await
+                {
+                    install_warnings.push(format!(
+                        "telemetry: mkdir /root/bin failed: {e}"
+                    ));
+                }
+                if let Err(e) =
+                    sentryusb_shell::run("chmod", &["+x", telemetry_tmp]).await
+                {
+                    install_warnings.push(format!(
+                        "telemetry: chmod +x failed: {e}"
+                    ));
+                }
+                match sentryusb_shell::run(
+                    "mv",
+                    &[
+                        telemetry_tmp,
+                        "/root/bin/sentryusb-tesla-telemetry",
+                    ],
+                )
+                .await
+                {
+                    Ok(_) => {
+                        // Service file is installed by migrate.rs
+                        // (sentryusb's startup script). Restart here
+                        // so the freshly-installed binary picks up
+                        // immediately rather than waiting for the
+                        // post-reboot start.
+                        let _ = sentryusb_shell::run(
+                            "systemctl",
+                            &["daemon-reload"],
+                        )
+                        .await;
+                        let _ = sentryusb_shell::run(
+                            "systemctl",
+                            &["restart", "sentryusb-telemetry"],
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        install_warnings.push(format!(
+                            "telemetry binary install FAILED \
+                             (mv to /root/bin/sentryusb-tesla-telemetry): \
+                             {e} — likely read-only rootfs; if your image \
+                             uses an overlay you may need to remount manually \
+                             or wait for the next reboot"
+                        ));
+                        // Clean up the temp file so it doesn't sit
+                        // around eating /tmp forever.
+                        let _ = sentryusb_shell::run("rm", &["-f", telemetry_tmp]).await;
+                    }
+                }
+            }
+            Err(e) => {
+                install_warnings.push(format!(
+                    "telemetry binary download FAILED ({}): {e}",
+                    telemetry_url
+                ));
+            }
         }
+    } else {
+        // Release doesn't have a telemetry binary at this URL. This
+        // is a legitimate skip on older releases that predate the
+        // crate; surface it at info level only (no warning) since
+        // it's not actionable for the user.
+        tracing::info!(
+            "release does not include a telemetry binary at {} — skipping",
+            telemetry_url
+        );
     }
 
     // ── BLE-action one-shot CLI ──
@@ -412,23 +486,55 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     .is_ok();
     if head_ok_action {
         let action_tmp = "/tmp/sentryusb-ble-action-update";
-        if sentryusb_shell::run_with_timeout(
+        match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
             "curl",
             &["-fsSL", &action_url, "-o", action_tmp],
         )
         .await
-        .is_ok()
         {
-            let _ = sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await;
-            let _ = sentryusb_shell::run("chmod", &["+x", action_tmp]).await;
-            let _ = sentryusb_shell::run(
-                "mv",
-                &[action_tmp, "/root/bin/sentryusb-ble-action"],
-            )
-            .await;
-            // No service to restart — awake_start invokes it on demand.
+            Ok(_) => {
+                if let Err(e) =
+                    sentryusb_shell::run("mkdir", &["-p", "/root/bin"]).await
+                {
+                    install_warnings.push(format!(
+                        "ble-action: mkdir /root/bin failed: {e}"
+                    ));
+                }
+                if let Err(e) =
+                    sentryusb_shell::run("chmod", &["+x", action_tmp]).await
+                {
+                    install_warnings.push(format!(
+                        "ble-action: chmod +x failed: {e}"
+                    ));
+                }
+                if let Err(e) = sentryusb_shell::run(
+                    "mv",
+                    &[action_tmp, "/root/bin/sentryusb-ble-action"],
+                )
+                .await
+                {
+                    install_warnings.push(format!(
+                        "ble-action binary install FAILED \
+                         (mv to /root/bin/sentryusb-ble-action): {e} — \
+                         likely read-only rootfs"
+                    ));
+                    let _ = sentryusb_shell::run("rm", &["-f", action_tmp]).await;
+                }
+                // No service to restart — awake_start invokes it on demand.
+            }
+            Err(e) => {
+                install_warnings.push(format!(
+                    "ble-action binary download FAILED ({}): {e}",
+                    action_url
+                ));
+            }
         }
+    } else {
+        tracing::info!(
+            "release does not include a ble-action binary at {} — skipping",
+            action_url
+        );
     }
 
     // Determine the tag to record. Use the requested target if any (it
@@ -453,10 +559,42 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
         let _ = std::fs::write("/opt/sentryusb/version", &tag);
     }
 
-    Ok(format!(
-        "Updated to {}.",
-        if tag.is_empty() { "latest".to_string() } else { tag }
-    ))
+    // Roll any per-binary install warnings into the user-visible
+    // success message. Without this the response was always "Updated
+    // to vX.Y.Z" regardless of whether the auxiliary binaries (telemetry
+    // sampler, ble-action CLI) actually landed on disk — causing the
+    // exact "UI says updated but binary on disk is the old one"
+    // confusion we hit on the Rock Pi 4C+ tester. Surface failures
+    // here so the user knows to investigate (usually: read-only
+    // rootfs needs a remount, or a release missing one of the assets).
+    if install_warnings.is_empty() {
+        Ok(format!(
+            "Updated to {}.",
+            if tag.is_empty() { "latest".to_string() } else { tag }
+        ))
+    } else {
+        // Log full detail to the journal for ops, return a condensed
+        // version to the UI (4kB cap so a flood of warnings doesn't
+        // blow up the WebSocket message).
+        for w in &install_warnings {
+            tracing::warn!("update.rs: {}", w);
+        }
+        let joined = install_warnings.join("\n  • ");
+        let mut msg = format!(
+            "Updated to {} — but with warnings:\n  • {}",
+            if tag.is_empty() {
+                "latest".to_string()
+            } else {
+                tag.clone()
+            },
+            joined
+        );
+        if msg.len() > 4096 {
+            msg.truncate(4093);
+            msg.push_str("...");
+        }
+        Ok(msg)
+    }
 }
 
 /// GET /api/system/version
