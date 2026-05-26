@@ -977,7 +977,17 @@ fn write_live_session_status(out: &mut String) {
                               issues. Typical values: -40 (very strong) to\n    \
                               -85 (weak); below -90 the link is usually\n    \
                               unusable.\n  \
-         drops_total=... — cumulative connection drops since daemon start\n",
+         drops_total=... — cumulative connection drops since daemon start\n  \
+         desync_recoveries=... — how many times our buffer started with a\n    \
+                              too-large length prefix and we silently cleared\n    \
+                              + kept RX'ing within the same query. Zero is\n    \
+                              ideal. Low non-zero (a few per hour) is normal\n    \
+                              cleanup of stale BLE notifications. Steadily\n    \
+                              climbing is a leading indicator the link is\n    \
+                              being polluted by something we don't filter yet\n    \
+                              (unknown VCSEC broadcast type, chunked-response\n    \
+                              straggler, etc.); each entry corresponds to a\n    \
+                              query that ultimately succeeded.\n",
     );
 }
 

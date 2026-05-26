@@ -59,6 +59,15 @@ pub struct Connection {
     tx_char: Characteristic,
     rx_stream: futures::stream::BoxStream<'static, ValueNotification>,
     rx_buffer: Vec<u8>,
+    /// Running tally of "buffer started with a too-large length prefix,
+    /// we cleared and continued" events since this counter was last
+    /// drained. Caller (PersistentSession::run_session_task) reads via
+    /// `take_framing_desync_recoveries()` and folds into a lifetime
+    /// total surfaced in the live status file + periodic status log.
+    /// Lives on Connection (not SessionState) so it captures
+    /// every recovery — even ones that happen on a query that
+    /// ultimately times out.
+    framing_desync_recoveries: u32,
 }
 
 impl Connection {
@@ -130,6 +139,7 @@ impl Connection {
             tx_char,
             rx_stream,
             rx_buffer: Vec::with_capacity(512),
+            framing_desync_recoveries: 0,
         };
 
         // One-time post-subscribe settle: bluez can emit a subscribe-
@@ -293,6 +303,8 @@ impl Connection {
                         );
                         self.rx_buffer.clear();
                         desyncs += 1;
+                        self.framing_desync_recoveries =
+                            self.framing_desync_recoveries.saturating_add(1);
                         if desyncs > MAX_DESYNCS {
                             return Err(e).context(format!(
                                 "exceeded {MAX_DESYNCS} framing desyncs in one round_trip — \
@@ -374,6 +386,18 @@ impl Connection {
         let _ = self.peripheral.disconnect().await;
         // Tiny grace period to let bluez clean up its connection state.
         sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Read-and-reset the per-connection framing-desync recovery
+    /// counter. Returns how many in-round_trip recoveries fired since
+    /// the last call (zero if the link has been clean). Used by
+    /// PersistentSession to roll the per-connection count into a
+    /// session-lifetime total that's surfaced in the live status
+    /// file and periodic status log — gives us visibility into how
+    /// often the recovery path is actually being exercised in the
+    /// wild, vs being a dead-code safety net.
+    pub fn take_framing_desync_recoveries(&mut self) -> u32 {
+        std::mem::take(&mut self.framing_desync_recoveries)
     }
 }
 

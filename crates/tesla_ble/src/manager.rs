@@ -209,6 +209,20 @@ struct SessionState {
     /// Written to the live status file so the bundle's "current
     /// connection" section can show who we're talking to.
     last_peer_mac: Option<String>,
+    /// Cumulative count of "buffer started with a too-large length
+    /// prefix, we cleared and continued" events across this daemon's
+    /// lifetime (i.e. summed across reconnects). Surfaced in the
+    /// live status file + periodic status log + persistent disconnect
+    /// log so a bundle shows whether the recovery path is firing in
+    /// the wild — a low count over many hours means Tesla is sending
+    /// us clean frames; a steadily-climbing count means our buffer is
+    /// regularly being polluted (stale notifications, unsolicited
+    /// broadcasts whose framing doesn't match BROADCAST_FRAME_PREFIX,
+    /// chunked-response stragglers) and is a leading indicator we
+    /// should investigate what's filling it. Each entry corresponds
+    /// to ONE successful in-round_trip recovery — the query that
+    /// triggered it still succeeded.
+    framing_desync_recoveries: u32,
 }
 
 /// How many successful queries to keep timing samples for. Picks the
@@ -274,6 +288,7 @@ impl PersistentSession {
             recent_latencies_ms: VecDeque::with_capacity(SAMPLES_FOR_PERCENTILES),
             last_scan_rssi: None,
             last_peer_mac: None,
+            framing_desync_recoveries: 0,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -501,6 +516,27 @@ async fn run_session_task(
                 let _ = reply.send(result);
             }
             Command::Shutdown => break,
+        }
+        // Drain any framing-desync recoveries that fired during this
+        // command into the session-lifetime counter. Done outside the
+        // match so it covers all three query paths in one place and
+        // catches recoveries whether the query ultimately succeeded
+        // or failed (a failed query that recovered N times before
+        // hitting MAX_DESYNCS is still useful telemetry). Folded into
+        // SessionState (not Connection) so the count survives
+        // reconnects — testers care about cumulative pollution
+        // across a session, not per-connection.
+        if let Some(conn) = state.conn.as_mut() {
+            let n = conn.take_framing_desync_recoveries();
+            if n > 0 {
+                state.framing_desync_recoveries =
+                    state.framing_desync_recoveries.saturating_add(n);
+                // Refresh the status file on every nonzero drain so
+                // testers reading /mutable/sentryusb-ble-status.txt
+                // (or the bundle) see the latest count without
+                // waiting for the next connect/disconnect transition.
+                write_status_file(&state, ConnectionEvent::Connected);
+            }
         }
     }
     if let Some(conn) = state.conn.take() {
@@ -827,7 +863,7 @@ async fn handle_transport_error_if_any<T>(
             warn!(
                 "PersistentSession: connection lost — \
                  held={}m{}s queries={} last_ok={}_ago drops_total={} \
-                 p50/p95/p99={}/{}/{}ms scan_rssi={} reason={:#}",
+                 p50/p95/p99={}/{}/{}ms scan_rssi={} desync_recoveries={} reason={:#}",
                 held_secs / 60,
                 held_secs % 60,
                 state.queries_since_connect,
@@ -837,6 +873,7 @@ async fn handle_transport_error_if_any<T>(
                 p95,
                 p99,
                 scan_rssi_str,
+                state.framing_desync_recoveries,
                 e,
             );
             // Persist the same data to /mutable/sentryusb-ble-disconnects.log
@@ -853,6 +890,7 @@ async fn handle_transport_error_if_any<T>(
                 p95,
                 p99,
                 state.last_scan_rssi,
+                state.framing_desync_recoveries,
                 &format!("{:#}", e),
             );
 
@@ -890,6 +928,7 @@ fn append_disconnect_log(
     p95: u128,
     p99: u128,
     scan_rssi: Option<i16>,
+    desync_recoveries: u32,
     reason: &str,
 ) {
     use std::io::Write;
@@ -918,9 +957,10 @@ fn append_disconnect_log(
 
     let line = format!(
         "{} held={}s queries={} last_ok={}s drops_total={} \
-         scan_rssi={} p50={}ms p95={}ms p99={}ms reason=\"{}\"\n",
+         scan_rssi={} p50={}ms p95={}ms p99={}ms desync_recoveries={} \
+         reason=\"{}\"\n",
         ts, held_secs, queries, last_ok_secs, lifetime_drops,
-        scan_rssi_str, p50, p95, p99, reason_safe,
+        scan_rssi_str, p50, p95, p99, desync_recoveries, reason_safe,
     );
 
     let result = std::fs::OpenOptions::new()
@@ -1101,12 +1141,12 @@ fn write_status_file(state: &SessionState, event: ConnectionEvent) {
         .unwrap_or_else(|| "?".into());
     let line = match event {
         ConnectionEvent::Connected => format!(
-            "state=connected since={} mac={} scan_rssi={} drops_total={}\n",
-            ts, mac, rssi, state.lifetime_drops,
+            "state=connected since={} mac={} scan_rssi={} drops_total={} desync_recoveries={}\n",
+            ts, mac, rssi, state.lifetime_drops, state.framing_desync_recoveries,
         ),
         ConnectionEvent::Disconnected => format!(
-            "state=disconnected since={} last_mac={} last_scan_rssi={} drops_total={}\n",
-            ts, mac, rssi, state.lifetime_drops,
+            "state=disconnected since={} last_mac={} last_scan_rssi={} drops_total={} desync_recoveries={}\n",
+            ts, mac, rssi, state.lifetime_drops, state.framing_desync_recoveries,
         ),
     };
     let _ = std::fs::write(STATUS_FILE_PATH, line);
@@ -1142,7 +1182,7 @@ fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
             .unwrap_or(0);
         let (p50, p95, p99) = compute_percentiles(&state.recent_latencies_ms);
         info!(
-            "PersistentSession: held for {}m{}s, {} queries (latency p50/p95/p99 = {}/{}/{}ms over last {})",
+            "PersistentSession: held for {}m{}s, {} queries (latency p50/p95/p99 = {}/{}/{}ms over last {}, desync_recoveries={})",
             uptime / 60,
             uptime % 60,
             n,
@@ -1150,6 +1190,7 @@ fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
             p95,
             p99,
             state.recent_latencies_ms.len(),
+            state.framing_desync_recoveries,
         );
     }
 }
