@@ -457,25 +457,6 @@ export default function Dashboard() {
           useFahrenheit={useFahrenheit}
           keepAwakeIdle={keepAwakeMode == null}
         />
-        {/* Car status overview — sits in the same row as System,
-            spans 2 tile columns. Shows last-known battery / cabin
-            temps / tire health as compact chips, with the tire-
-            pressure history chart hidden behind an expand toggle on
-            the Tires chip. The chart bundle (recharts ~380KB) stays
-            unloaded until the user expands it. Only mounts once we
-            have at least one BLE telemetry sample so users without
-            BLE pairing don't see an empty placeholder. */}
-        {carStatusSample && carStatusSample.ts != null && (
-          <div style={{ gridColumn: "span 2" }}>
-            <CarStatusCard
-              sample={carStatusSample}
-              latestDriveEnd={latestDriveEnd}
-              tireHistory={tireHistory ?? undefined}
-              useFahrenheit={useFahrenheit}
-              lockChimeName={activeChimeName}
-            />
-          </div>
-        )}
         <NetworkTile status={status} />
         <StorageTile
           status={status}
@@ -494,6 +475,28 @@ export default function Dashboard() {
         />
         {isAwayActive && <AwayModeTile />}
       </div>
+
+      {/* Car status overview — shows last-known battery / cabin temps
+          / tire health as compact chips, with the tire-pressure
+          history chart hidden behind an expand toggle on the Tires
+          chip. The chart bundle (recharts ~380KB) stays unloaded
+          until the user expands it.
+          Lives below the tile-grid (not inside it) — keeping the
+          tile-grid as 4 same-height cards in one row, and putting
+          the car summary on its own row constrained to ~2 tile
+          widths so on wide monitors it doesn't stretch into a long
+          horizontal strip. */}
+      {carStatusSample && carStatusSample.ts != null && (
+        <div className="max-w-[640px]">
+          <CarStatusCard
+            sample={carStatusSample}
+            latestDriveEnd={latestDriveEnd}
+            tireHistory={tireHistory ?? undefined}
+            useFahrenheit={useFahrenheit}
+            lockChimeName={activeChimeName}
+          />
+        </div>
+      )}
     </div>
   )
 }
@@ -784,20 +787,15 @@ function ActivityTile({
     : processing
     ? ("processing" as const)
     : null
-  const phasePill = phase ? (
-    <Pill kind={phase === "archiving" ? "accent" : "sky"}>
-      <LiveDot /> {phase}
-    </Pill>
-  ) : null
 
-  // When Keep Awake is showing, the stats row gets crowded so the
-  // FSD link migrates to the top-right header action slot. When
-  // Keep Awake is hidden, FSD stays inline at the end of the stats
-  // row — same look as before this card merged.
+  // FSD link always lives inline at the end of the stats row, even
+  // when Keep Awake is showing — the previous "move it to the
+  // header action slot when KA visible" trick caused the title to
+  // collide with the phase badge AND the FSD chip in the same row.
   const fsdLink = driveStats && driveStats.fsd_engaged_ms > 0 ? (
     <Link
       to="/fsd"
-      className="flex items-center gap-1 text-[10px] text-emerald-400 transition-colors hover:text-emerald-300"
+      className="ml-auto flex items-center gap-1 text-[10px] text-emerald-400 transition-colors hover:text-emerald-300"
     >
       <Zap className="h-3 w-3" />
       FSD {driveStats.fsd_percent}%
@@ -806,13 +804,23 @@ function ActivityTile({
   ) : null
 
   return (
-    <StatusTile
-      icon={<Zap className="h-4 w-4" />}
-      halo="violet"
-      title="Activity"
-      badge={phasePill}
-      action={keepAwakeVisible ? fsdLink : null}
-    >
+    <div className="relative">
+      {/* Phase notification — pinned to the card's top-right corner
+          as an absolutely-positioned pill so it doesn't crowd the
+          ⚡ ACTIVITY title or the inline FSD link. Only renders
+          during an actual archive/process run. */}
+      {phase && (
+        <div className="pointer-events-none absolute right-2 top-2 z-10">
+          <Pill kind={phase === "archiving" ? "accent" : "sky"}>
+            <LiveDot /> {phase}
+          </Pill>
+        </div>
+      )}
+      <StatusTile
+        icon={<Zap className="h-4 w-4" />}
+        halo="violet"
+        title="Activity"
+      >
       {driveStats ? (
         driveStats.processed_count === 0 && driveStats.drives_count === 0 ? (
           <p className="t-xs">
@@ -841,9 +849,7 @@ function ActivityTile({
                 </span>{" "}
                 <span className="text-slate-500">{metric ? "km" : "mi"}</span>
               </span>
-              {!keepAwakeVisible && fsdLink && (
-                <span className="ml-auto">{fsdLink}</span>
-              )}
+              {fsdLink}
             </div>
 
             {archiveProgress && archiveProgress.total > 0 ? (
@@ -882,7 +888,8 @@ function ActivityTile({
           <KeepAwakeInline keepAwake={keepAwake} />
         </>
       )}
-    </StatusTile>
+      </StatusTile>
+    </div>
   )
 }
 
