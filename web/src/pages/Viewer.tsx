@@ -21,7 +21,9 @@ interface ClipSet {
 }
 
 // Camera grid layout: pillars top, repeaters bottom (matches Sentry Studio)
-const CAMERAS_GRID = ["left_pillar", "front", "right_pillar", "left_repeater", "back", "right_repeater"]
+const CAMERAS_GRID_HW4 = ["left_pillar", "front", "right_pillar", "left_repeater", "back", "right_repeater"]
+// HW3: no pillar cameras, use 2x2 grid
+const CAMERAS_GRID_HW3 = ["front", "back", "left_repeater", "right_repeater"]
 const CAMERA_LABELS: Record<string, string> = {
   front: "Front",
   back: "Rear",
@@ -137,6 +139,13 @@ export default function Viewer() {
       .catch(() => {})
   }, [])
 
+  // Detect HW3 vs HW4 — check if ANY clip set has pillar cameras
+  const hasPillars = useMemo(
+    () => clipSets.some((s) => "left_pillar" in s.cameras || "right_pillar" in s.cameras),
+    [clipSets]
+  )
+  const CAMERAS_GRID = hasPillars ? CAMERAS_GRID_HW4 : CAMERAS_GRID_HW3
+
   // Telemetry for the current clip set
   const currentSet = clipSets[currentSetIdx] as ClipSet | undefined
   const frontFile = currentSet?.cameras["front"]?.split("/").pop() ?? null
@@ -152,6 +161,10 @@ export default function Viewer() {
   const seekBarRef = useRef<HTMLDivElement>(null)
   const animFrameRef = useRef<number>(0)
   const pendingSeekRef = useRef<number | null>(null)
+
+  // Cross-segment preloading: hidden <video> elements for the next segment
+  const preloadedVideosRef = useRef<Map<string, HTMLVideoElement>>(new Map())
+  const preloadedForIdxRef = useRef<number>(-1)
 
   // Refs for high-frequency values — avoids triggering React renders at video frame rate
   const currentTimeRef = useRef(0)
@@ -330,6 +343,86 @@ export default function Viewer() {
 
     return () => { cancelled = true; cleanups.forEach((c) => c()) }
   }, [clipSets, currentSetIdx])
+
+  // Drift correction: re-sync any camera >200ms off the master every 2s
+  useEffect(() => {
+    if (!playing) return
+    const DRIFT_THRESHOLD = 0.2 // seconds
+    const interval = setInterval(() => {
+      const master = masterVideoRef.current
+      if (!master || master.paused) return
+      const masterTime = master.currentTime
+      videoRefs.current.forEach((v) => {
+        if (v === master || v.paused) return
+        if (Math.abs(v.currentTime - masterTime) > DRIFT_THRESHOLD) {
+          v.currentTime = masterTime
+        }
+      })
+    }, 2000)
+    return () => clearInterval(interval)
+  }, [playing])
+
+  // Clean up preloaded videos
+  const cleanupPreloaded = useCallback(() => {
+    preloadedVideosRef.current.forEach((v) => { v.src = ""; v.remove() })
+    preloadedVideosRef.current.clear()
+    preloadedForIdxRef.current = -1
+  }, [])
+
+  // Cross-segment preloading: when within 5s of segment end, preload next segment's active cameras
+  useEffect(() => {
+    if (!playing || clipSets.length === 0) return
+    const PRELOAD_WINDOW = 5 // seconds before end to start preloading
+
+    const checkInterval = setInterval(() => {
+      const master = masterVideoRef.current
+      if (!master || !Number.isFinite(master.duration)) return
+
+      const timeRemaining = master.duration - master.currentTime
+      const nextIdx = currentSetIdxRef.current + 1
+
+      if (timeRemaining <= PRELOAD_WINDOW && nextIdx < clipSets.length) {
+        // Already preloaded for this segment?
+        if (preloadedForIdxRef.current === nextIdx) return
+
+        // Clean up any stale preloads
+        cleanupPreloaded()
+        preloadedForIdxRef.current = nextIdx
+
+        const nextSet = clipSets[nextIdx]
+        activeCameras.forEach((cam) => {
+          const url = nextSet.cameras[cam]
+          if (!url) return
+          const v = document.createElement("video")
+          v.preload = "auto"
+          v.muted = true
+          v.playsInline = true
+          v.src = url
+          // Hidden — just for buffering
+          v.style.display = "none"
+          document.body.appendChild(v)
+          preloadedVideosRef.current.set(cam, v)
+        })
+      } else if (timeRemaining > PRELOAD_WINDOW && preloadedForIdxRef.current !== -1) {
+        // User seeked away from the end — clean up
+        cleanupPreloaded()
+      }
+    }, 1000)
+
+    return () => {
+      clearInterval(checkInterval)
+    }
+  }, [playing, clipSets, activeCameras, cleanupPreloaded])
+
+  // Clean up preloaded videos on segment change (they've served their purpose or are stale)
+  useEffect(() => {
+    cleanupPreloaded()
+  }, [currentSetIdx, cleanupPreloaded])
+
+  // Clean up preloaded videos on unmount
+  useEffect(() => {
+    return () => cleanupPreloaded()
+  }, [cleanupPreloaded])
 
   // Set master video ref (front camera preferred)
   useEffect(() => {
@@ -756,7 +849,9 @@ export default function Viewer() {
               <div
                 className={cn(
                   "relative min-h-0 flex-1",
-                  focusedCamera ? "" : "grid grid-cols-2 grid-rows-3 gap-0.5 md:grid-cols-3 md:grid-rows-2"
+                  focusedCamera ? "" : hasPillars
+                    ? "grid grid-cols-2 grid-rows-3 gap-0.5 md:grid-cols-3 md:grid-rows-2"
+                    : "grid grid-cols-2 grid-rows-2 gap-0.5"
                 )}
               >
                 {camerasToShow.map((cam) => {
@@ -793,9 +888,22 @@ export default function Viewer() {
                           onLoadedData={(e) => {
                             const v = e.currentTarget
                             v.playbackRate = playbackSpeedRef.current
+
+                            // Determine target time: pending seek (segment change) or
+                            // master video's current time (mid-playback camera activation)
+                            let targetTime: number | null = null
                             if (pendingSeekRef.current !== null) {
-                              v.currentTime = pendingSeekRef.current
+                              targetTime = pendingSeekRef.current
                               if (cam === "front" || !currentSet.cameras["front"]) pendingSeekRef.current = null
+                            } else {
+                              const master = masterVideoRef.current
+                              if (master && master !== v && master.currentTime > 0.1) {
+                                targetTime = master.currentTime
+                              }
+                            }
+
+                            if (targetTime !== null) {
+                              v.currentTime = targetTime
                             }
                             if (playingRef.current) v.play().catch(() => { })
                           }}
