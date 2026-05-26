@@ -70,6 +70,16 @@ const TIRES_INTERVAL: Duration = Duration::from_secs(300);
 /// remote sentry toggle from the Tesla app reaches us within ~1 tick.
 const CLOSURES_INTERVAL: Duration = Duration::from_secs(60);
 
+/// How often to refresh `state location` in Active mode. 60s — same
+/// cadence as climate/charge/closures. Location is the ONLY state
+/// query that returns `location_name` (the human-readable address
+/// the UI shows), so without this sub-sampler the address never
+/// updates after the in-process BLE cutover. 60s is the right
+/// balance: during a drive the address changes every few minutes
+/// at most (it's a reverse-geocoded place name, not raw GPS), and
+/// 60s catches any meaningful change within one cycle.
+const LOCATION_INTERVAL: Duration = Duration::from_secs(60);
+
 /// Sample cadence for sleep-safe `body-controller-state` calls in
 /// Quiet mode. 30s (down from 60s) halves the worst-case wakeup
 /// latency — important because the user_presence flip is what
@@ -162,6 +172,10 @@ struct Schedule {
     /// poll cycle. Same cadence as climate/charge so the gate's
     /// inputs are roughly co-fresh.
     next_closures: Instant,
+    /// `state location` — the sole source of `location_name` (the
+    /// reverse-geocoded address the UI shows). Without this, the
+    /// displayed address freezes at whatever was in the DB pre-cutover.
+    next_location: Instant,
     /// Consecutive failure counters — used by the fast-retry
     /// pattern. On a successful sub-sample they reset to 0; on
     /// failure they increment and drive a 3s retry until
@@ -172,25 +186,29 @@ struct Schedule {
     charge_failures: u32,
     tires_failures: u32,
     closures_failures: u32,
+    location_failures: u32,
 }
 
 impl Schedule {
     fn new(now: Instant) -> Self {
         Self {
-            // Drive + climate + tires + closures fire immediately on
-            // first tick — get a baseline snapshot, including the
-            // sentry_mode + (after the 30s charge offset) charging_state
-            // signals the quiet-mode gate depends on.
+            // Drive + climate + tires + closures + location fire
+            // immediately on first tick — get a baseline snapshot,
+            // including the sentry_mode + (after the 30s charge
+            // offset) charging_state signals the quiet-mode gate
+            // depends on, and the address for the live-data panel.
             next_drive: now,
             next_climate: now,
             next_charge: now + CHARGE_INITIAL_OFFSET,
             next_tires: now,
             next_closures: now,
+            next_location: now,
             drive_failures: 0,
             climate_failures: 0,
             charge_failures: 0,
             tires_failures: 0,
             closures_failures: 0,
+            location_failures: 0,
         }
     }
     fn drive_due(&self, now: Instant) -> bool { now >= self.next_drive }
@@ -198,6 +216,7 @@ impl Schedule {
     fn charge_due(&self, now: Instant) -> bool { now >= self.next_charge }
     fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
     fn closures_due(&self, now: Instant) -> bool { now >= self.next_closures }
+    fn location_due(&self, now: Instant) -> bool { now >= self.next_location }
 
     /// Compute the next-due instant for a sub-sampler that just ran.
     /// On success: normal interval. On failure within MAX_FAST_RETRIES:
@@ -235,6 +254,10 @@ impl Schedule {
         self.closures_failures = if success { 0 } else { self.closures_failures.saturating_add(1) };
         self.next_closures = Self::next_after(now, success, self.closures_failures, CLOSURES_INTERVAL);
     }
+    fn mark_location(&mut self, now: Instant, success: bool) {
+        self.location_failures = if success { 0 } else { self.location_failures.saturating_add(1) };
+        self.next_location = Self::next_after(now, success, self.location_failures, LOCATION_INTERVAL);
+    }
 
     /// When should the next tick fire? Min of all next-due timestamps
     /// across every sub-sampler. The main loop sleeps until this
@@ -245,6 +268,7 @@ impl Schedule {
             .min(self.next_charge)
             .min(self.next_tires)
             .min(self.next_closures)
+            .min(self.next_location)
     }
 }
 
@@ -688,6 +712,19 @@ async fn tick(
                             }
                             Err(e) => warn!("parked-awake closures refresh failed: {e}"),
                         }
+                        // Location refresh — covers the "car moved
+                        // remotely while parked" case (Autopark,
+                        // valet, towed). 3-min cadence in quiet is
+                        // plenty since by definition the user isn't
+                        // driving when this fires.
+                        match sample_ble::sample_location_ble(session).await {
+                            Ok(l) => {
+                                try_sync_clock(l.meta);
+                                refresh.location_name = l.location_name;
+                                any_ok = true;
+                            }
+                            Err(e) => warn!("parked-awake location refresh failed: {e}"),
+                        }
                         *last_parked_awake_refresh = Some(Instant::now());
                     }
 
@@ -865,7 +902,30 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 5. TIRES (every 5 min) ──
+        // ── 5. LOCATION (every 60s) ──
+        // The only state query that returns `location_name` (the
+        // reverse-geocoded address). Without this, the displayed
+        // address freezes at whatever was in the DB pre-cutover —
+        // the fix for the long-running "my address never updates"
+        // bug. Cheap call (small payload), 60s is plenty fresh for
+        // a human-readable place name.
+        if schedule.location_due(tick_now) {
+            let success = match sample_ble::sample_location_ble(session).await {
+                Ok(l) => {
+                    try_sync_clock(l.meta);
+                    sample.location_name = l.location_name;
+                    true
+                }
+                Err(e) => {
+                    warn!("sample_location failed: {e}");
+                    false
+                }
+            };
+            schedule.mark_location(tick_now, success);
+            any_call_ran = true;
+        }
+
+        // ── 6. TIRES (every 5 min) ──
         if schedule.tires_due(tick_now) {
             let success = match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {

@@ -21,7 +21,8 @@ use tracing::{info, warn};
 
 use crate::sample::{
     BodyControllerSample, ChargeResult, ChargingState, ClimateResult, ClosuresResult,
-    DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult, now_secs,
+    DriveResult, LocationResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult,
+    now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -96,11 +97,11 @@ fn map_sentry_mode(sm: &car_server::closures_state::SentryModeState) -> SentryMo
     }
 }
 
-/// `state drive` over BLE. Carries the three signals that matter for
-/// drive tracking: shift state (phase machine), odometer (mile
-/// counter), and a placeholder for location_name (which actually
-/// lives in `state location` — kept None here for parity with the
-/// shell-out path, which also returned None for drive's location).
+/// `state drive` over BLE. Carries the two signals that matter for
+/// drive tracking: shift state (phase machine) and odometer (mile
+/// counter). `location_name` is always None here — it lives in
+/// `state location` instead and is fetched by the dedicated
+/// `sample_location_ble` sub-sampler.
 pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult> {
     let started = Instant::now();
     let drive = session.get_drive().await?;
@@ -198,6 +199,35 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     Ok(ChargeResult {
         battery_pct,
         charging_state,
+        meta,
+    })
+}
+
+/// `state location` over BLE. The ONLY source of `location_name`
+/// (the reverse-geocoded address string the UI displays). `state
+/// drive` doesn't carry it — that was the bug behind "address never
+/// updates" for the entire post-cutover window: tesla-control's JSON
+/// happened to bundle location_name into the drive response, so the
+/// shell-out path got it for free; the typed in-process path asks
+/// for only what each `state X` returns and `state drive` omits it.
+///
+/// GPS coordinates (latitude/longitude/heading/etc.) are also in
+/// LocationState but we don't surface them anywhere yet — adding
+/// them is a few lines whenever we have a UI surface for them.
+pub async fn sample_location_ble(session: &PersistentSession) -> Result<LocationResult> {
+    let started = Instant::now();
+    let location = session.get_location().await?;
+    let elapsed = started.elapsed().as_millis();
+    info!("state-poll: location=ok({}ms) via in-process BLE", elapsed);
+
+    let location_name = location.optional_location_name.as_ref().map(|v| {
+        let car_server::location_state::OptionalLocationName::LocationName(n) = v;
+        n.clone()
+    });
+    let meta = build_meta(location.timestamp.as_ref(), started);
+
+    Ok(LocationResult {
+        location_name,
         meta,
     })
 }

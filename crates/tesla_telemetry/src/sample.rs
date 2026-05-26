@@ -185,6 +185,23 @@ pub struct ClimateResult {
     pub meta: ResponseMeta,
 }
 
+/// Result of a successful `sample_location` call. Tesla's
+/// `state location` query is the only state-query that returns
+/// `location_name` (the reverse-geocoded address string the UI
+/// surfaces) — `state drive` doesn't include it, despite carrying
+/// shift/odometer.
+///
+/// This was a real bug for a long time: the tesla-control shell-out
+/// path happened to extract location_name from one of the bundled
+/// JSON fields, so the displayed address kept updating; when we
+/// cut over to typed in-process BLE we only polled `state drive`
+/// and the address froze at whatever value was last in the DB. Adding
+/// this struct + the dedicated location sub-sampler is the fix.
+pub struct LocationResult {
+    pub location_name: Option<String>,
+    pub meta: ResponseMeta,
+}
+
 /// Result of a successful `sample_charge` call. Slow-changing.
 ///
 /// `charging_state` is in-memory only (not persisted to the DB) — the
