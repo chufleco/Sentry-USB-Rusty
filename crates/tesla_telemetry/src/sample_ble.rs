@@ -218,12 +218,30 @@ pub async fn sample_location_ble(session: &PersistentSession) -> Result<Location
     let started = Instant::now();
     let location = session.get_location().await?;
     let elapsed = started.elapsed().as_millis();
-    info!("state-poll: location=ok({}ms) via in-process BLE", elapsed);
 
     let location_name = location.optional_location_name.as_ref().map(|v| {
         let car_server::location_state::OptionalLocationName::LocationName(n) = v;
         n.clone()
     });
+    // Include the value in the log so a bundle can show whether Tesla
+    // actually returns location_name on each poll vs returning a
+    // LocationState with no optional_location_name set. Tesla appears
+    // to omit the field for parked-and-unchanged vehicles, which
+    // looks like "location never updates" from the UI side (the
+    // sampler writes None → DB row has NULL → "latest non-null"
+    // query returns the prior value). Knowing whether the field
+    // was Some/None lets us decide whether to push the user to
+    // expect that behaviour or to retry / hit a different state.
+    match &location_name {
+        Some(n) => info!(
+            "state-poll: location=ok({}ms) name=\"{}\" via in-process BLE",
+            elapsed, n
+        ),
+        None => info!(
+            "state-poll: location=ok({}ms) name=<absent> via in-process BLE",
+            elapsed
+        ),
+    }
     let meta = build_meta(location.timestamp.as_ref(), started);
 
     Ok(LocationResult {
