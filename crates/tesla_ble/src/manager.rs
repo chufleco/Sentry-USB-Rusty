@@ -876,6 +876,27 @@ async fn handle_transport_error_if_any<T>(
                 state.framing_desync_recoveries,
                 e,
             );
+            // Capture the kernel's view of what just happened.
+            // Especially valuable for short-held drops (held=0, link
+            // died before our first write): dmesg will usually show
+            // the HCI disconnect-complete event with a numeric reason
+            // — 0x05 (authentication failure), 0x13 (remote user
+            // terminated), 0x3D / 0x3E (conn failed to establish),
+            // 0x22 (LMP/LL response timeout). Bounded + best-effort:
+            // if dmesg isn't readable or takes too long we just skip.
+            // Only fire on the recent-drop pattern (held < 5s) where
+            // the kernel's reason is most diagnostic — established
+            // links that drop after minutes/hours usually have
+            // obvious reasons (supervision timeout, range) that
+            // don't need this extra capture.
+            if held_secs < 5 {
+                if let Some(snippet) = capture_recent_bluetooth_dmesg().await {
+                    warn!(
+                        "PersistentSession: kernel/dmesg events around the drop:\n{}",
+                        snippet
+                    );
+                }
+            }
             // Persist the same data to /mutable/sentryusb-ble-disconnects.log
             // so the bundle download includes drops from before the
             // current journalctl rotation. Best-effort — if the
@@ -1274,4 +1295,70 @@ fn is_transport_error(e: &anyhow::Error) -> bool {
         || msg.contains("waiting for response")
         || msg.contains("not connected")
         || msg.contains("Peripheral")
+}
+
+/// Snapshot recent kernel Bluetooth-related lines (HCI events,
+/// connection complete/disconnect, supervision timeout, auth failure,
+/// etc.) so a disconnect that fires before any query succeeds — the
+/// "held=0s queries=0" pattern — comes with the kernel's view of why.
+///
+/// Returns Some(text) on success, None if dmesg isn't readable or
+/// times out. Bounded shell-out (2s wall clock) so a hung dmesg can't
+/// stall the session task. Filters down to the last ~25 BLE-relevant
+/// lines so the journal doesn't explode if dmesg has a long history.
+///
+/// Why this matters: btleplug surfaces "Failed to initiate write" as
+/// an opaque string, but the underlying HCI disconnect reason is in
+/// dmesg. Common reasons we expect to see:
+///   * "disconnect reason 0x05" — Authentication Failure (bad pair)
+///   * "disconnect reason 0x13" — Remote User Terminated Connection
+///   * "disconnect reason 0x22" — LMP/LL Response Timeout
+///   * "disconnect reason 0x3D/0x3E" — Conn Failed to be Established
+///   * "link supervision timeout" — RF / range / interference
+async fn capture_recent_bluetooth_dmesg() -> Option<String> {
+    use tokio::process::Command;
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        Command::new("dmesg")
+            .arg("--ctime") // human-readable timestamps for the journal
+            .output(),
+    )
+    .await;
+    let output = match result {
+        Ok(Ok(o)) if o.status.success() => o,
+        _ => return None,
+    };
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Grab the LAST N lines matching anything Bluetooth-relevant.
+    // Keywords cover all the variants modern kernels use.
+    let keywords = [
+        "Bluetooth",
+        "hci0",
+        "hci1",
+        "BCM",
+        "BTM",
+        "RTL",
+        "BNEP",
+        "disconnect reason",
+        "supervision timeout",
+        "Authentication failed",
+        "Connection failed",
+    ];
+    let matching: Vec<&str> = text
+        .lines()
+        .filter(|l| keywords.iter().any(|k| l.contains(k)))
+        .collect();
+    if matching.is_empty() {
+        return None;
+    }
+    // Last 25 lines is plenty — for a held=0s drop the relevant
+    // events landed within the last few seconds.
+    let tail: Vec<&str> = matching
+        .iter()
+        .rev()
+        .take(25)
+        .rev()
+        .copied()
+        .collect();
+    Some(tail.join("\n"))
 }

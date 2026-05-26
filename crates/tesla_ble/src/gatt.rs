@@ -239,6 +239,33 @@ impl Connection {
             chunks.len(),
             hex::encode(&framed)
         );
+        // Pre-write liveness check. Diagnostic: when a tester sees
+        // a wall of "BLE write: Failed to initiate write" errors that
+        // fire within ~100ms of "connected", we want to know whether
+        // bluez had already marked the link dead before we even tried
+        // — that's a totally different bug class from "the write
+        // itself failed on a healthy link." If is_connected returns
+        // false here, the LL link died between our subscribe and the
+        // first TX, which usually means either Tesla actively dropped
+        // us (bad pair, phone-key slot contention) or the RF link
+        // failed (range, interference, supervision timeout).
+        match self.peripheral.is_connected().await {
+            Ok(true) => {
+                debug!("pre-TX is_connected=true; proceeding with {} chunk(s)", chunks.len());
+            }
+            Ok(false) => {
+                bail!(
+                    "BLE write: peripheral.is_connected()=false before TX — \
+                     link died between subscribe and first write (typically \
+                     pair-auth failure, phone-key slot race, or RF drop)"
+                );
+            }
+            Err(e) => {
+                // Probe failed — log but proceed; the write below
+                // will surface the real error if there is one.
+                debug!("pre-TX is_connected() probe errored ({}), proceeding anyway", e);
+            }
+        }
         for chunk in chunks {
             self.peripheral
                 .write(&self.tx_char, chunk, WriteType::WithoutResponse)
