@@ -93,6 +93,31 @@ pub fn mark_permanent_skip(store: &DriveStore, file: &str) -> Result<()> {
     })
 }
 
+/// Clear `cloud_uploaded_at` for routes whose BLE telemetry rollup is
+/// populated locally but was uploaded before the BLE columns made it
+/// into the encrypted blob (Phase 1 cutover). The next sweep re-encrypts
+/// and re-uploads them. Returns the number of rows reset.
+///
+/// `battery_pct_start` is the canonical signal because it's the most
+/// reliably populated BLE column (every clip whose 60s window crossed at
+/// least one sample has it). Skip-sentinel rows (`= -1`) are never
+/// reset — those were rejected by the cloud for size and re-uploading
+/// won't help. Tessie-sourced rows are also skipped because they aren't
+/// in the upload eligibility set anyway.
+pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
+    store.with_locked_conn(|conn| -> Result<_> {
+        let changed = conn.execute(
+            "UPDATE routes SET cloud_uploaded_at = NULL \
+             WHERE cloud_uploaded_at IS NOT NULL \
+               AND cloud_uploaded_at > 0 \
+               AND battery_pct_start IS NOT NULL \
+               AND (source IS NULL OR source != 'tessie')",
+            [],
+        )?;
+        Ok(changed as i64)
+    })
+}
+
 pub fn pending_count(store: &DriveStore) -> i64 {
     store
         .with_locked_conn(|conn| {

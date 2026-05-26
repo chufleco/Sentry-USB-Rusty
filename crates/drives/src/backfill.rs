@@ -244,6 +244,9 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            // Backfill only recomputes non-BLE aggregates; BLE columns
+            // stay whatever `write_route_telemetry` last wrote.
+            ..Default::default()
         };
         let agg = compute_route_aggregates(&route);
         decoded.push((r.file.clone(), agg));

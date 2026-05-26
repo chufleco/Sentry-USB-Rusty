@@ -668,6 +668,24 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     source: clip.route.source.clone(),
                     external_signature: clip.route.external_signature.clone(),
                     tessie_autopilot_percent: clip.route.tessie_autopilot_percent,
+                    // BLE rollup belongs to the whole clip's 60s window;
+                    // copy through to each derived sub-segment so the
+                    // per-drive aggregator can still see start/end
+                    // battery, temps, etc.
+                    battery_pct_start: clip.route.battery_pct_start,
+                    battery_pct_end: clip.route.battery_pct_end,
+                    interior_temp_min: clip.route.interior_temp_min,
+                    interior_temp_max: clip.route.interior_temp_max,
+                    exterior_temp_avg: clip.route.exterior_temp_avg,
+                    hvac_runtime_s: clip.route.hvac_runtime_s,
+                    tire_fl_psi: clip.route.tire_fl_psi,
+                    tire_fr_psi: clip.route.tire_fr_psi,
+                    tire_rl_psi: clip.route.tire_rl_psi,
+                    tire_rr_psi: clip.route.tire_rr_psi,
+                    odometer_mi_start: clip.route.odometer_mi_start,
+                    odometer_mi_end: clip.route.odometer_mi_end,
+                    location_name_start: clip.route.location_name_start.clone(),
+                    location_name_end: clip.route.location_name_end.clone(),
                 },
                 timestamp: clip.timestamp + offset,
             },
@@ -2190,21 +2208,7 @@ fn round1(v: f64) -> f64 {
 impl Route {
     /// Create an empty Route (used for park boundary markers in clip splitting).
     fn empty() -> Self {
-        Route {
-            file: String::new(),
-            date: String::new(),
-            points: Vec::new(),
-            gear_states: Vec::new(),
-            autopilot_states: Vec::new(),
-            speeds: Vec::new(),
-            accel_positions: Vec::new(),
-            raw_park_count: 0,
-            raw_frame_count: 0,
-            gear_runs: Vec::new(),
-            source: None,
-            external_signature: None,
-            tessie_autopilot_percent: None,
-        }
+        Route::default()
     }
 }
 
@@ -3057,6 +3061,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         }
     }
 
@@ -3301,6 +3306,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         }
     }
 

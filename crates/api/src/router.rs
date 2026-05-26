@@ -230,7 +230,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/cloud/pair/begin", post(crate::cloud::pair_begin))
         .route("/api/cloud/pair/cancel", post(crate::cloud::pair_cancel))
         .route("/api/cloud/unpair", post(crate::cloud::unpair))
-        .route("/api/cloud/upload-now", post(crate::cloud::upload_now));
+        .route("/api/cloud/upload-now", post(crate::cloud::upload_now))
+        .route("/api/cloud/backfill-ble", post(crate::cloud::backfill_ble));
 
     api.with_state(state)
 }

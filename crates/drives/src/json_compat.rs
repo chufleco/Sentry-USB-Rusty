@@ -504,7 +504,13 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 "SELECT file, date_dir, raw_park_count, raw_frame_count,
                         points_blob, gear_states_blob, ap_states_blob,
                         speeds_blob, accel_blob, gear_runs_blob,
-                        source, external_signature, tessie_autopilot_percent
+                        source, external_signature, tessie_autopilot_percent,
+                        battery_pct_start, battery_pct_end,
+                        interior_temp_min, interior_temp_max, exterior_temp_avg,
+                        hvac_runtime_s,
+                        tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+                        odometer_mi_start, odometer_mi_end,
+                        location_name_start, location_name_end
                  FROM routes
                  ORDER BY file",
             )
@@ -586,6 +592,66 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 *self.error.borrow_mut() = Some(e);
                 S::Error::custom("col tessie_autopilot_percent")
             })?;
+            // BLE telemetry rollup — Option<f64>/Option<String>, all
+            // NULL on pre-v6 rows or clips whose 60s window had no
+            // samples. Per-column .get to keep the streaming-row error
+            // shape consistent.
+            let battery_pct_start: Option<f64> = row.get(13).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col battery_pct_start")
+            })?;
+            let battery_pct_end: Option<f64> = row.get(14).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col battery_pct_end")
+            })?;
+            let interior_temp_min: Option<f64> = row.get(15).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col interior_temp_min")
+            })?;
+            let interior_temp_max: Option<f64> = row.get(16).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col interior_temp_max")
+            })?;
+            let exterior_temp_avg: Option<f64> = row.get(17).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col exterior_temp_avg")
+            })?;
+            let hvac_runtime_s: Option<i64> = row.get(18).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col hvac_runtime_s")
+            })?;
+            let tire_fl_psi: Option<f64> = row.get(19).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col tire_fl_psi")
+            })?;
+            let tire_fr_psi: Option<f64> = row.get(20).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col tire_fr_psi")
+            })?;
+            let tire_rl_psi: Option<f64> = row.get(21).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col tire_rl_psi")
+            })?;
+            let tire_rr_psi: Option<f64> = row.get(22).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col tire_rr_psi")
+            })?;
+            let odometer_mi_start: Option<f64> = row.get(23).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col odometer_mi_start")
+            })?;
+            let odometer_mi_end: Option<f64> = row.get(24).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col odometer_mi_end")
+            })?;
+            let location_name_start: Option<String> = row.get(25).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col location_name_start")
+            })?;
+            let location_name_end: Option<String> = row.get(26).map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("col location_name_end")
+            })?;
 
             let points: Vec<GpsPoint> = decode_points(pb.as_deref())
                 .map_err(|e| S::Error::custom(format!("decode points {}: {}", file, e)))?
@@ -616,6 +682,20 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 source,
                 external_signature,
                 tessie_autopilot_percent,
+                battery_pct_start,
+                battery_pct_end,
+                interior_temp_min,
+                interior_temp_max,
+                exterior_temp_avg,
+                hvac_runtime_s,
+                tire_fl_psi,
+                tire_fr_psi,
+                tire_rl_psi,
+                tire_rr_psi,
+                odometer_mi_start,
+                odometer_mi_end,
+                location_name_start,
+                location_name_end,
             };
             seq.serialize_element(&route)?;
             // `route` drops here — its ~10 KB of decoded BLOBs goes back

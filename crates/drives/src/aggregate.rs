@@ -241,6 +241,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         }
     }
 
@@ -305,6 +306,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         };
         let agg = compute_route_aggregates(&r);
         assert_eq!(agg.fsd_disengagements, 1);
@@ -336,6 +338,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         };
         let agg = compute_route_aggregates(&r);
         assert_eq!(agg.fsd_disengagements, 0);

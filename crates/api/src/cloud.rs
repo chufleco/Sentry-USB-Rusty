@@ -94,6 +94,27 @@ pub async fn upload_now(State(state): State<AppState>) -> impl IntoResponse {
     (StatusCode::ACCEPTED, Json(json!({ "ok": true })))
 }
 
+/// POST /api/cloud/backfill-ble — one-shot re-upload of every route
+/// whose local BLE rollup is non-NULL but was uploaded before the BLE
+/// fields rode inside the encrypted blob. Returns the count queued and
+/// nudges the sweep loop. Idempotent — calling twice in a row returns 0
+/// the second time.
+pub async fn backfill_ble(State(state): State<AppState>) -> impl IntoResponse {
+    match state.cloud.uploader.backfill_ble_reupload() {
+        Ok(queued) => {
+            if queued > 0 {
+                state.cloud.uploader.nudge();
+            }
+            (StatusCode::OK, Json(json!({ "ok": true, "queued": queued }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct QueueQuery {
 

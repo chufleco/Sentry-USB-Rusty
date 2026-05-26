@@ -342,6 +342,10 @@ impl DriveStore {
                 source: None,
                 external_signature: None,
                 tessie_autopilot_percent: None,
+                // BLE telemetry rollup is written separately by
+                // `write_route_telemetry` after this insert lands; leave
+                // None here.
+                ..Default::default()
             };
             let agg = compute_route_aggregates(&route);
             insert_or_update_route(&tx, &norm, &route, &agg, now)?;
@@ -1307,53 +1311,21 @@ fn select_all_routes(conn: &Connection) -> Result<Vec<Route>> {
         "SELECT file, date_dir, raw_park_count, raw_frame_count,
                 points_blob, gear_states_blob, ap_states_blob,
                 speeds_blob, accel_blob, gear_runs_blob,
-                source, external_signature, tessie_autopilot_percent
+                source, external_signature, tessie_autopilot_percent,
+                battery_pct_start, battery_pct_end,
+                interior_temp_min, interior_temp_max, exterior_temp_avg,
+                hvac_runtime_s,
+                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+                odometer_mi_start, odometer_mi_end,
+                location_name_start, location_name_end
          FROM routes
          ORDER BY file",
     )?;
-    let rows = stmt.query_map([], |row| {
-        let pb: Option<Vec<u8>> = row.get(4)?;
-        let gb: Option<Vec<u8>> = row.get(5)?;
-        let ab: Option<Vec<u8>> = row.get(6)?;
-        let sb: Option<Vec<u8>> = row.get(7)?;
-        let acb: Option<Vec<u8>> = row.get(8)?;
-        let rb: Option<Vec<u8>> = row.get(9)?;
-        let source: Option<String> = row.get(10)?;
-        let external_signature: Option<String> = row.get(11)?;
-        let tessie_autopilot_percent: Option<f64> = row.get(12)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as u32,
-            row.get::<_, i64>(3)? as u32,
-            pb, gb, ab, sb, acb, rb,
-            source, external_signature, tessie_autopilot_percent,
-        ))
-    })?;
+    let rows = stmt.query_map([], route_row_mapper)?;
 
     let mut out = Vec::new();
     for r in rows {
-        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb,
-             source, external_signature, tessie_autopilot_percent) = r?;
-        let points = decode_points(pb.as_deref())
-            .with_context(|| format!("decode points {}", file))?
-            .unwrap_or_default();
-        let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
-        let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
-        let speeds = decode_f32s(sb.as_deref())
-            .with_context(|| format!("decode speeds {}", file))?
-            .unwrap_or_default();
-        let accel_positions = decode_f32s(acb.as_deref())
-            .with_context(|| format!("decode accel {}", file))?
-            .unwrap_or_default();
-        let gear_runs = decode_gear_runs(rb.as_deref())
-            .with_context(|| format!("decode gear_runs {}", file))?
-            .unwrap_or_default();
-        out.push(Route {
-            file, date, points, gear_states, autopilot_states,
-            speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
-            source, external_signature, tessie_autopilot_percent,
-        });
+        out.push(build_route_from_row(r?)?);
     }
     Ok(out)
 }
@@ -1371,7 +1343,13 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
         "SELECT file, date_dir, raw_park_count, raw_frame_count,
                 points_blob, gear_states_blob, ap_states_blob,
                 speeds_blob, accel_blob, gear_runs_blob,
-                source, external_signature, tessie_autopilot_percent
+                source, external_signature, tessie_autopilot_percent,
+                battery_pct_start, battery_pct_end,
+                interior_temp_min, interior_temp_max, exterior_temp_avg,
+                hvac_runtime_s,
+                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+                odometer_mi_start, odometer_mi_end,
+                location_name_start, location_name_end
          FROM routes
          WHERE file IN ({})
          ORDER BY file",
@@ -1384,51 +1362,107 @@ fn select_routes_by_files(conn: &Connection, files: &[&str]) -> Result<Vec<Route
     let params: Vec<&dyn ToSql> = normalized.iter().map(|s| s as &dyn ToSql).collect();
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params.as_slice(), |row| {
-        let pb: Option<Vec<u8>> = row.get(4)?;
-        let gb: Option<Vec<u8>> = row.get(5)?;
-        let ab: Option<Vec<u8>> = row.get(6)?;
-        let sb: Option<Vec<u8>> = row.get(7)?;
-        let acb: Option<Vec<u8>> = row.get(8)?;
-        let rb: Option<Vec<u8>> = row.get(9)?;
-        let source: Option<String> = row.get(10)?;
-        let external_signature: Option<String> = row.get(11)?;
-        let tessie_autopilot_percent: Option<f64> = row.get(12)?;
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, i64>(2)? as u32,
-            row.get::<_, i64>(3)? as u32,
-            pb, gb, ab, sb, acb, rb,
-            source, external_signature, tessie_autopilot_percent,
-        ))
-    })?;
+    let rows = stmt.query_map(params.as_slice(), route_row_mapper)?;
 
     let mut out = Vec::with_capacity(files.len());
     for r in rows {
-        let (file, date, raw_park_count, raw_frame_count, pb, gb, ab, sb, acb, rb,
-             source, external_signature, tessie_autopilot_percent) = r?;
-        let points = decode_points(pb.as_deref())
-            .with_context(|| format!("decode points {}", file))?
-            .unwrap_or_default();
-        let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
-        let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
-        let speeds = decode_f32s(sb.as_deref())
-            .with_context(|| format!("decode speeds {}", file))?
-            .unwrap_or_default();
-        let accel_positions = decode_f32s(acb.as_deref())
-            .with_context(|| format!("decode accel {}", file))?
-            .unwrap_or_default();
-        let gear_runs = decode_gear_runs(rb.as_deref())
-            .with_context(|| format!("decode gear_runs {}", file))?
-            .unwrap_or_default();
-        out.push(Route {
-            file, date, points, gear_states, autopilot_states,
-            speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
-            source, external_signature, tessie_autopilot_percent,
-        });
+        out.push(build_route_from_row(r?)?);
     }
     Ok(out)
+}
+
+/// Tuple shape that [`route_row_mapper`] returns. Carries raw column
+/// values straight from the row; [`build_route_from_row`] decodes the
+/// blob columns and assembles the `Route`. Kept as a free-standing
+/// tuple to avoid a one-off struct used only by these two selects.
+type RouteRow = (
+    String, String, u32, u32,
+    Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>,
+    Option<Vec<u8>>, Option<Vec<u8>>, Option<Vec<u8>>,
+    Option<String>, Option<String>, Option<f64>,
+    // BLE telemetry rollup — populated by
+    // `aggregate_telemetry::write_route_telemetry`. NULL on rows whose
+    // clip-window had no telemetry samples, or pre-v6 rows.
+    Option<f64>, Option<f64>,
+    Option<f64>, Option<f64>, Option<f64>,
+    Option<i64>,
+    Option<f64>, Option<f64>, Option<f64>, Option<f64>,
+    Option<f64>, Option<f64>,
+    Option<String>, Option<String>,
+);
+
+/// Shared row mapper for the two route SELECTs above. The column order
+/// in both SQL strings must match this exactly.
+fn route_row_mapper(row: &rusqlite::Row<'_>) -> rusqlite::Result<RouteRow> {
+    Ok((
+        row.get::<_, String>(0)?,
+        row.get::<_, String>(1)?,
+        row.get::<_, i64>(2)? as u32,
+        row.get::<_, i64>(3)? as u32,
+        row.get::<_, Option<Vec<u8>>>(4)?,
+        row.get::<_, Option<Vec<u8>>>(5)?,
+        row.get::<_, Option<Vec<u8>>>(6)?,
+        row.get::<_, Option<Vec<u8>>>(7)?,
+        row.get::<_, Option<Vec<u8>>>(8)?,
+        row.get::<_, Option<Vec<u8>>>(9)?,
+        row.get::<_, Option<String>>(10)?,
+        row.get::<_, Option<String>>(11)?,
+        row.get::<_, Option<f64>>(12)?,
+        row.get::<_, Option<f64>>(13)?,
+        row.get::<_, Option<f64>>(14)?,
+        row.get::<_, Option<f64>>(15)?,
+        row.get::<_, Option<f64>>(16)?,
+        row.get::<_, Option<f64>>(17)?,
+        row.get::<_, Option<i64>>(18)?,
+        row.get::<_, Option<f64>>(19)?,
+        row.get::<_, Option<f64>>(20)?,
+        row.get::<_, Option<f64>>(21)?,
+        row.get::<_, Option<f64>>(22)?,
+        row.get::<_, Option<f64>>(23)?,
+        row.get::<_, Option<f64>>(24)?,
+        row.get::<_, Option<String>>(25)?,
+        row.get::<_, Option<String>>(26)?,
+    ))
+}
+
+/// Decode blob columns + assemble a `Route` from a [`RouteRow`] tuple.
+fn build_route_from_row(r: RouteRow) -> Result<Route> {
+    let (
+        file, date, raw_park_count, raw_frame_count,
+        pb, gb, ab, sb, acb, rb,
+        source, external_signature, tessie_autopilot_percent,
+        battery_pct_start, battery_pct_end,
+        interior_temp_min, interior_temp_max, exterior_temp_avg,
+        hvac_runtime_s,
+        tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+        odometer_mi_start, odometer_mi_end,
+        location_name_start, location_name_end,
+    ) = r;
+    let points = decode_points(pb.as_deref())
+        .with_context(|| format!("decode points {}", file))?
+        .unwrap_or_default();
+    let gear_states = decode_u8s(gb.as_deref()).unwrap_or_default();
+    let autopilot_states = decode_u8s(ab.as_deref()).unwrap_or_default();
+    let speeds = decode_f32s(sb.as_deref())
+        .with_context(|| format!("decode speeds {}", file))?
+        .unwrap_or_default();
+    let accel_positions = decode_f32s(acb.as_deref())
+        .with_context(|| format!("decode accel {}", file))?
+        .unwrap_or_default();
+    let gear_runs = decode_gear_runs(rb.as_deref())
+        .with_context(|| format!("decode gear_runs {}", file))?
+        .unwrap_or_default();
+    Ok(Route {
+        file, date, points, gear_states, autopilot_states,
+        speeds, accel_positions, raw_park_count, raw_frame_count, gear_runs,
+        source, external_signature, tessie_autopilot_percent,
+        battery_pct_start, battery_pct_end,
+        interior_temp_min, interior_temp_max, exterior_temp_avg,
+        hvac_runtime_s,
+        tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+        odometer_mi_start, odometer_mi_end,
+        location_name_start, location_name_end,
+    })
 }
 
 /// Select BLOB-free summary rows — metadata + v2 aggregate columns +

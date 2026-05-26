@@ -90,7 +90,7 @@ pub struct GearRun {
 }
 
 /// A single clip's extracted route data (stored in SQLite).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Route {
     pub file: String,
@@ -121,6 +121,40 @@ pub struct Route {
     /// Tessie-reported autopilot percentage for this drive.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tessie_autopilot_percent: Option<f64>,
+    // ── Per-clip BLE telemetry rollup (writes to cloud blob) ───────────
+    // Mirrors the `routes` table BLE columns populated by
+    // `aggregate_telemetry::write_route_telemetry`. All optional — clips
+    // whose 60s window had no telemetry samples, or Pis without the BLE
+    // feature enabled, leave these NULL. Skip-serialize keeps the wire +
+    // cloud blob compact when telemetry isn't present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_pct_end: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior_temp_min: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub interior_temp_max: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exterior_temp_avg: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hvac_runtime_s: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_fl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_fr_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_rl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tire_rr_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odometer_mi_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub odometer_mi_end: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_name_start: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location_name_end: Option<String>,
 }
 
 fn u32_is_zero(n: &u32) -> bool { *n == 0 }
@@ -571,6 +605,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         };
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""gearStates":"AAEAAA==""#), "serialized: {}", s);

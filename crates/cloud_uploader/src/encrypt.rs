@@ -72,6 +72,7 @@ mod tests {
             source: None,
             external_signature: None,
             tessie_autopilot_percent: None,
+            ..Default::default()
         }
     }
 
@@ -125,5 +126,79 @@ mod tests {
         let cached = "deadbeef".repeat(8);
         let e = encrypt_route(&route, &pi_key, "u", "p", Some(&cached)).unwrap();
         assert_eq!(e.route_id, cached);
+    }
+
+    /// BLE rollup fields ride inside the encrypted route blob — defend
+    /// the wire shape across future refactors. Cloud renders these on
+    /// the per-clip + per-drive summaries; losing them silently here
+    /// would be invisible until a user opened a drive on the dashboard.
+    #[test]
+    fn ble_telemetry_roundtrips_through_blob() {
+        let pi_key = [3u8; 32];
+        let user_id = "user-cuid-xyz";
+        let pi_id = "pi-cuid-123";
+        let mut route = sample_route();
+        route.battery_pct_start = Some(82.0);
+        route.battery_pct_end = Some(79.5);
+        route.interior_temp_min = Some(19.0);
+        route.interior_temp_max = Some(24.5);
+        route.exterior_temp_avg = Some(11.0);
+        route.hvac_runtime_s = Some(45);
+        route.tire_fl_psi = Some(40.5);
+        route.tire_fr_psi = Some(40.0);
+        route.tire_rl_psi = Some(38.5);
+        route.tire_rr_psi = Some(39.0);
+        route.odometer_mi_start = Some(12_345.5);
+        route.odometer_mi_end = Some(12_346.2);
+        route.location_name_start = Some("Home".to_string());
+        route.location_name_end = Some("123 Main St".to_string());
+
+        let encrypted = encrypt_route(&route, &pi_key, user_id, pi_id, None).unwrap();
+        let wrapped = B64.decode(&encrypted.wrapped_route_key_b64).unwrap();
+        let blob = B64.decode(&encrypted.route_blob_b64).unwrap();
+        let pi_key_obj = aead::Key::from_bytes(&pi_key).unwrap();
+        let wrap_aad = aad::route_key(user_id, pi_id, &encrypted.route_id);
+        let recovered_key_bytes = aead::open(&pi_key_obj, &wrap_aad, &wrapped).unwrap();
+        let recovered_key: [u8; 32] = recovered_key_bytes.as_slice().try_into().unwrap();
+        let blob_aad = aad::route_blob(user_id, pi_id, &encrypted.route_id);
+        let route_key = aead::Key::from_bytes(&recovered_key).unwrap();
+        let plaintext = aead::open(&route_key, &blob_aad, &blob).unwrap();
+        let recovered: Route = serde_json::from_slice(&plaintext).unwrap();
+
+        assert_eq!(recovered.battery_pct_start, Some(82.0));
+        assert_eq!(recovered.battery_pct_end, Some(79.5));
+        assert_eq!(recovered.interior_temp_min, Some(19.0));
+        assert_eq!(recovered.interior_temp_max, Some(24.5));
+        assert_eq!(recovered.exterior_temp_avg, Some(11.0));
+        assert_eq!(recovered.hvac_runtime_s, Some(45));
+        assert_eq!(recovered.tire_fl_psi, Some(40.5));
+        assert_eq!(recovered.tire_fr_psi, Some(40.0));
+        assert_eq!(recovered.tire_rl_psi, Some(38.5));
+        assert_eq!(recovered.tire_rr_psi, Some(39.0));
+        assert_eq!(recovered.odometer_mi_start, Some(12_345.5));
+        assert_eq!(recovered.odometer_mi_end, Some(12_346.2));
+        assert_eq!(recovered.location_name_start.as_deref(), Some("Home"));
+        assert_eq!(recovered.location_name_end.as_deref(), Some("123 Main St"));
+    }
+
+    /// Routes without BLE telemetry should still serialize compactly —
+    /// `skip_serializing_if = "Option::is_none"` keeps the wire small
+    /// for Pis without the BLE feature enabled, and the cloud's
+    /// `#[serde(default)]` deserialization fills None for every field.
+    #[test]
+    fn route_without_ble_omits_fields_from_blob() {
+        let route = sample_route();
+        let json = serde_json::to_string(&route).unwrap();
+        // None of the BLE field names appear in the camelCase JSON.
+        for name in [
+            "batteryPctStart", "batteryPctEnd",
+            "interiorTempMin", "interiorTempMax", "exteriorTempAvg",
+            "hvacRuntimeS",
+            "tireFlPsi", "tireFrPsi", "tireRlPsi", "tireRrPsi",
+            "odometerMiStart", "odometerMiEnd",
+            "locationNameStart", "locationNameEnd",
+        ] {
+            assert!(!json.contains(name), "BLE field {} leaked into no-telemetry blob: {}", name, json);
+        }
     }
 }

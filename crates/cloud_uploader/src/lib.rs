@@ -80,6 +80,15 @@ impl CloudUploader {
     pub fn pending_queue(&self, limit: i64) -> anyhow::Result<Vec<db_ext::QueueEntry>> {
         db_ext::pending_queue(&self.inner.store, limit)
     }
+
+    /// One-shot backfill: reset `cloud_uploaded_at` on already-uploaded
+    /// routes whose BLE rollup is non-NULL so the next sweep re-uploads
+    /// them with the BLE fields baked into the encrypted blob. Returns
+    /// the number of routes queued for re-upload. Caller should `nudge()`
+    /// after this lands rows.
+    pub fn backfill_ble_reupload(&self) -> anyhow::Result<i64> {
+        db_ext::backfill_ble_reupload(&self.inner.store)
+    }
 }
 
 pub struct SpawnOptions {
