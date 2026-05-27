@@ -360,21 +360,17 @@ impl Connection {
         // an explicit cap makes the failure mode "loud" instead of
         // "silently maxed out at the timeout boundary."
         //
-        // 256 (was 16): the Rock Pi 4C+ on kernel 6.18 with its
-        // BCM4345C0 chip can emit 50+ garbage notifications per real
-        // response — apparently the chip duplicates frames OR splits
-        // them at weird boundaries, so bluez delivers the same
-        // partial-frame bytes to us many times in a few milliseconds.
-        // At MAX_DESYNCS=16 we'd bail before the real response could
-        // accumulate. A tester bundle showed desync_recoveries=5956
-        // in 49 minutes (122/min average, peaks much higher) with 0
-        // successful queries because every round_trip hit the old
-        // cap. 256 gives the recovery loop enough headroom for the
-        // chip's noise without sacrificing the wall-clock timeout
-        // safety net. On clean stacks (Pi 5 USB dongle, etc.) we
-        // never get close to 16 desyncs in one round_trip, so this
-        // doesn't change behavior there.
-        const MAX_DESYNCS: u32 = 256;
+        // (Briefly bumped to 256 in 4836e6e while we thought the
+        // Rock Pi 4C+ tester's "desync_recoveries=5956 / no
+        // successful queries" was a chip-noise problem requiring
+        // huge recovery headroom. Root cause turned out to be our
+        // TX side using ATT_Write_Cmd (WriteWithoutResponse) —
+        // tesla-control uses ATT_Write_Req (WriteWithResponse) and
+        // works on that exact hardware. The desync storms were
+        // downstream of the 14-second TX-to-response gap that
+        // resulted, not a primary symptom. Reverted to 16 since
+        // healthy round_trips only see 0-2 recoveries.)
+        const MAX_DESYNCS: u32 = 16;
         let mut desyncs: u32 = 0;
         timeout(wait, async {
             loop {
