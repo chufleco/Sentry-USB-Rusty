@@ -333,7 +333,22 @@ impl Connection {
         // that point the wall-clock timeout should fire anyway, but
         // an explicit cap makes the failure mode "loud" instead of
         // "silently maxed out at the timeout boundary."
-        const MAX_DESYNCS: u32 = 16;
+        //
+        // 256 (was 16): the Rock Pi 4C+ on kernel 6.18 with its
+        // BCM4345C0 chip can emit 50+ garbage notifications per real
+        // response — apparently the chip duplicates frames OR splits
+        // them at weird boundaries, so bluez delivers the same
+        // partial-frame bytes to us many times in a few milliseconds.
+        // At MAX_DESYNCS=16 we'd bail before the real response could
+        // accumulate. A tester bundle showed desync_recoveries=5956
+        // in 49 minutes (122/min average, peaks much higher) with 0
+        // successful queries because every round_trip hit the old
+        // cap. 256 gives the recovery loop enough headroom for the
+        // chip's noise without sacrificing the wall-clock timeout
+        // safety net. On clean stacks (Pi 5 USB dongle, etc.) we
+        // never get close to 16 desyncs in one round_trip, so this
+        // doesn't change behavior there.
+        const MAX_DESYNCS: u32 = 256;
         let mut desyncs: u32 = 0;
         timeout(wait, async {
             loop {
