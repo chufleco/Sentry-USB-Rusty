@@ -382,9 +382,30 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
             _ = sigusr1.recv() => {
-                info!("SIGUSR1 received — forcing a full state poll on next tick");
+                info!("SIGUSR1 received — forcing a full state poll on next tick (all sub-samplers due immediately)");
                 let now = Instant::now();
+                // Build a fresh schedule, then override every next_*
+                // field so ALL sub-samplers fire on the very next
+                // tick — no CHARGE_INITIAL_OFFSET, no FAST_RETRY
+                // gating, no per-type pacing. The user explicitly
+                // asked for a fresh full read; honor that by polling
+                // drive + climate + charge + closures + tires all
+                // in one cycle.
+                //
+                // (Schedule::new normally staggers `next_charge` by
+                // CHARGE_INITIAL_OFFSET = 30s to avoid hammering the
+                // car with everything at once on a fresh daemon
+                // startup. That's the right call for startup but the
+                // wrong call here — when the user clicks "Poll now"
+                // and waits 8s to see results, a 30s charge delay
+                // would leave the battery field stale and look
+                // broken even though everything else updated.)
                 schedule = Schedule::new(now);
+                schedule.next_drive = now;
+                schedule.next_climate = now;
+                schedule.next_charge = now;
+                schedule.next_closures = now;
+                schedule.next_tires = now;
                 last_parked_awake_refresh = None;
                 last_parked_awake_tpms_refresh = None;
                 // Reset parked_polls so the phase machine flips to

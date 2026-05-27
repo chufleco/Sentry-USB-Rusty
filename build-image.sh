@@ -9,9 +9,12 @@
 #
 # Usage:
 #   ./build-image.sh                         # 64-bit image (Pi 3/4/5/Zero 2)
-#   ./build-image.sh --32bit                 # 32-bit image (Pi Zero W)
+#   ./build-image.sh --32bit                 # 32-bit image (armhf — Pi 3 with 32-bit Pi OS)
 #   ./build-image.sh /path/to/binary         # 64-bit with local binary
 #   ./build-image.sh --32bit /path/to/binary # 32-bit with local binary
+#
+# Note: the original armv6 Pi Zero W / Pi 1 are no longer supported; SentryUSB
+# requires Pi Zero 2 W or newer.
 #
 # Output:
 #   deploy/sentryusb-*.img.gz — ready to flash with Raspberry Pi Imager
@@ -47,17 +50,18 @@ for arg in "$@"; do
 done
 
 if $BUILD_32BIT; then
-    ARCH_LABEL="32-bit (armhf — Pi Zero W)"
+    ARCH_LABEL="32-bit (armhf — Pi 3 with 32-bit Pi OS)"
     # 32-bit: single binary; SUFFIXES list has one entry to keep the
     # loop logic below uniform with the 64-bit path.
     SUFFIXES=("linux-armv7")
     CPUS=("cortex-a7")
     RUST_TARGET="armv7-unknown-linux-gnueabihf"
     # Tesla vehicle-command is Go; cross-compile targets map independently
-    # from our Rust targets. GOARM=6 keeps the tesla binaries runnable on
-    # the original Pi Zero W, which is the lowest bar on this image path.
+    # from our Rust targets. GOARM=7 matches the Rust target (cortex-a7);
+    # the upstream armv6 tarball stays compatible for any board, but Go's
+    # GOARM=7 produces faster code on the targets we still support.
     GO_ARCH="arm"
-    GO_ARM="6"
+    GO_ARM="7"
     CONFIG_FILE="pi-gen-config-32bit"
 else
     ARCH_LABEL="64-bit (arm64 — Pi 3/4/5/Zero 2)"

@@ -313,15 +313,24 @@ pub async fn delete_file(State(_s): State<AppState>, Query(params): Query<Delete
 ///
 /// Multipart form: `file` (required, the file payload) and `path` (required,
 /// destination directory). Filename is taken from the upload part's
-/// Content-Disposition `filename=`.
+/// Content-Disposition `filename=`. Streams directly to disk — no in-memory
+/// buffering, so files of any size can be uploaded on low-RAM devices.
 pub async fn upload_file(
     State(_s): State<AppState>,
     mut multipart: axum::extract::Multipart,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let mut dest_dir: Option<String> = None;
-    let mut file_data: Option<(String, Vec<u8>)> = None;
+    let mut filename: Option<String> = None;
+    let mut written: u64 = 0;
+    let mut file_written = false;
 
-    while let Ok(Some(field)) = multipart.next_field().await {
+    // First pass: we may receive `path` before or after `file`, but we need
+    // `path` to know where to write. Read fields in order — if `file` arrives
+    // before `path`, buffer the filename and stream to a temp file, then rename.
+    // In practice the frontend sends `file` first, `path` second.
+    let mut temp_path: Option<PathBuf> = None;
+
+    while let Ok(Some(mut field)) = multipart.next_field().await {
         let name = field.name().unwrap_or("").to_string();
         match name.as_str() {
             "path" => {
@@ -330,41 +339,68 @@ pub async fn upload_file(
                 }
             }
             "file" => {
-                let filename = field
+                let fname = field
                     .file_name()
                     .unwrap_or("upload.bin")
                     .to_string();
-                match field.bytes().await {
-                    Ok(bytes) => file_data = Some((filename, bytes.to_vec())),
+                filename = Some(fname);
+
+                // Stream to a temp file to avoid holding the entire upload in RAM
+                let tmp = std::env::temp_dir().join(format!("sentryusb-upload-{}", std::process::id()));
+                let mut file = match tokio::fs::File::create(&tmp).await {
+                    Ok(f) => f,
                     Err(e) => {
                         return crate::json_error(
-                            StatusCode::BAD_REQUEST,
-                            &format!("Failed to read upload: {}", e),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to create temp file: {}", e),
                         );
                     }
+                };
+
+                // Stream chunks directly to disk
+                while let Ok(Some(chunk)) = field.chunk().await {
+                    use tokio::io::AsyncWriteExt;
+                    if let Err(e) = file.write_all(&chunk).await {
+                        let _ = tokio::fs::remove_file(&tmp).await;
+                        return crate::json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &format!("Failed to write chunk: {}", e),
+                        );
+                    }
+                    written += chunk.len() as u64;
                 }
+
+                use tokio::io::AsyncWriteExt;
+                let _ = file.flush().await;
+                temp_path = Some(tmp);
+                file_written = true;
             }
             _ => {}
         }
     }
 
-    let (filename, bytes) = match file_data {
-        Some(f) => f,
-        None => return crate::json_error(StatusCode::BAD_REQUEST, "Missing file in upload"),
-    };
+    if !file_written {
+        return crate::json_error(StatusCode::BAD_REQUEST, "Missing file in upload");
+    }
+    let filename = filename.unwrap_or_else(|| "upload.bin".to_string());
     let dest_dir = match dest_dir {
         Some(d) if !d.is_empty() => d,
-        _ => return crate::json_error(StatusCode::BAD_REQUEST, "Missing path parameter"),
+        _ => {
+            if let Some(tmp) = &temp_path { let _ = tokio::fs::remove_file(tmp).await; }
+            return crate::json_error(StatusCode::BAD_REQUEST, "Missing path parameter");
+        }
     };
 
     let dest_path = format!("{}/{}", dest_dir.trim_end_matches('/'), filename);
     let (clean, allowed) = is_path_allowed(&dest_path);
     if !allowed {
+        if let Some(tmp) = &temp_path { let _ = tokio::fs::remove_file(tmp).await; }
         return crate::json_error(StatusCode::FORBIDDEN, "Access denied");
     }
 
     if let Some(parent) = clean.parent() {
-        if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Err(e) = tokio::fs::create_dir_all(parent).await {
+            if let Some(tmp) = &temp_path { let _ = tokio::fs::remove_file(tmp).await; }
             return crate::json_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("Failed to create directory: {}", e),
@@ -372,12 +408,19 @@ pub async fn upload_file(
         }
     }
 
-    let size = bytes.len();
-    if let Err(e) = std::fs::write(&clean, &bytes) {
-        return crate::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("Failed to write file: {}", e),
-        );
+    // Move temp file to final destination
+    if let Some(tmp) = temp_path {
+        if let Err(_) = tokio::fs::rename(&tmp, &clean).await {
+            // rename fails across filesystems — fall back to copy+delete
+            if let Err(e) = tokio::fs::copy(&tmp, &clean).await {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return crate::json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("Failed to write file: {}", e),
+                );
+            }
+            let _ = tokio::fs::remove_file(&tmp).await;
+        }
     }
 
     (
@@ -385,7 +428,7 @@ pub async fn upload_file(
         Json(serde_json::json!({
             "name": filename,
             "path": dest_path,
-            "size": size.to_string(),
+            "size": written.to_string(),
         })),
     )
 }

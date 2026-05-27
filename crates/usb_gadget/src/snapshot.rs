@@ -9,8 +9,6 @@
 //!   * waiting for autofs to be active before symlinking through it
 //!   * generating + diffing a TOC of clip filenames so identical
 //!     snapshots get discarded instead of accumulating
-//!   * deleting `/mutable/TeslaCam/{Saved,Sentry}Clips/...` symlinks
-//!     when the user nukes a clip from the car's touchscreen viewer
 //!   * the explicit `<snapdir>/mnt` symlink that lets per-clip symlinks
 //!     resolve before the first autofs trigger
 //!   * walking RecentClips / SavedClips / SentryClips / TeslaTrackMode
@@ -127,12 +125,11 @@ pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
         return Ok(None);
     }
 
-    // ── cleanup symlinks for clips deleted on the car (bash 313-316) ──
-    if let Some(prev) = prev_toc.as_ref() {
-        if let Err(e) = cleanup_deleted_clips(prev, &toc_path_tmp) {
-            warn!("cleanup_deleted_clips: {}", e);
-        }
-    }
+    // The car's firmware auto-deletes Sentry events when the cam disk
+    // fills, which is indistinguishable from a user deletion via the
+    // touchscreen viewer. We used to mirror those deletions into the
+    // snapshot symlinks; that was wrong — it threw away the very events
+    // snapshots exist to preserve. Don't sync deletions either way.
 
     // ── Pre-create the <snapdir>/mnt symlink (bash 317) ───────────────
     // make_links_for_snapshot links each clip with a target like
@@ -348,54 +345,6 @@ fn toc_has_additions(old_toc: &str, new_toc: &str) -> Result<bool> {
         }
     }
     Ok(false)
-}
-
-/// Remove `/mutable/TeslaCam/{Saved,Sentry}Clips/...` symlinks for clips
-/// the user removed via the car's touchscreen viewer.
-///
-/// RecentClips intentionally NOT cleaned up here — that's how the bash
-/// version works (line 137 comment). RecentClips refresh on the next
-/// archive cycle anyway.
-fn cleanup_deleted_clips(old_toc: &str, new_toc: &str) -> Result<()> {
-    let old = std::fs::read_to_string(old_toc).unwrap_or_default();
-    let new = std::fs::read_to_string(new_toc)?;
-
-    let new_set: std::collections::HashSet<&str> = new
-        .lines()
-        .map(|l| l.split_once(' ').map(|x| x.1).unwrap_or(""))
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    let mut count = 0usize;
-    for line in old.lines() {
-        let relpath = match line.split_once(' ') {
-            Some((_, p)) if !p.is_empty() => p,
-            _ => continue,
-        };
-        if new_set.contains(relpath) {
-            continue;
-        }
-        if !(relpath.starts_with("TeslaCam/SavedClips/")
-            || relpath.starts_with("TeslaCam/SentryClips/"))
-        {
-            continue;
-        }
-        let target = format!("/mutable/{}", relpath);
-        let target_path = Path::new(&target);
-        if target_path.symlink_metadata().is_ok() {
-            // is_ok() catches both symlink-to-file and dangling symlink.
-            let _ = std::fs::remove_file(&target);
-            count += 1;
-            if let Some(parent) = target_path.parent() {
-                let _ = std::fs::remove_dir(parent); // empty-only
-            }
-        }
-    }
-
-    if count > 0 {
-        info!("Removed {} symlink(s) for clips deleted from car's viewer", count);
-    }
-    Ok(())
 }
 
 /// Build `/mutable/TeslaCam/{RecentClips,SavedClips,SentryClips,TeslaTrackMode}`

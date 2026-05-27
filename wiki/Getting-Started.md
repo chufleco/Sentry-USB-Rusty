@@ -2,6 +2,8 @@
 
 Total time: roughly **10–15 minutes** of hands-on work, plus the time it takes to download and flash Pi OS.
 
+> **There's no prebuilt Sentry USB SD image yet.** You flash stock Raspberry Pi OS Lite first, then run the installer over SSH. A bundled image will come later — for now this is the only supported install path.
+
 ## 1. Flash the SD card
 
 You'll use **Raspberry Pi Imager** to write Pi OS to your microSD card.

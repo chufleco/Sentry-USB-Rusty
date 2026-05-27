@@ -141,24 +141,35 @@ pub fn enable() -> Result<()> {
     // stance of `enable_gadget.sh:19-23`.
     if gadget.exists() {
         if gadget_dir_is_complete(&gadget) {
+            // On kernel 6.18+, a UDC unbind closes the LUN backing file.
+            // Rebinding without refreshing the LUN produces "(no medium)".
+            // Clear and rewrite each LUN file so the kernel re-opens it.
+            let func_dir = gadget.join("functions/mass_storage.0");
+            for (i, (image_path, _)) in DISK_IMAGES.iter().enumerate() {
+                let lun_file = func_dir.join(format!("lun.{}/file", i));
+                if lun_file.exists() && Path::new(image_path).exists() {
+                    let _ = fs::write(&lun_file, "\n");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let _ = fs::write(&lun_file, image_path);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
             return bind_udc(&gadget);
         }
         info!("USB gadget dir exists but is incomplete — tearing down and rebuilding");
         disable()?;
     }
 
-    // Load the composite module AND the mass_storage function module.
-    // Listing both is necessary because `disable()` unloads
-    // `usb_f_mass_storage` at the end of every teardown, and on Pi 5 /
-    // Linux 6.12 the kernel's request_module auto-load *doesn't*
-    // reliably re-trigger when we mkdir `functions/mass_storage.0`
-    // below — so the mkdir fails with ENOENT and the rest of the
-    // rebuild path silently bails out, leaving the gadget half-built
-    // (configs/strings present, functions/ empty). The shell
-    // `enable_gadget.sh:25` happens to work at boot only because the
-    // function module is still loaded from initramfs at that point.
+    // Load the composite module and the mass_storage function module as
+    // separate modprobe calls. Passing both on one command line causes
+    // `libcomposite: unknown parameter 'usb_f_mass_storage' ignored` on
+    // kernel 6.18+ — the second name is parsed as a module parameter,
+    // not a separate module to load.
     let _ = std::process::Command::new("modprobe")
-        .args(["libcomposite", "usb_f_mass_storage"])
+        .arg("libcomposite")
+        .status();
+    let _ = std::process::Command::new("modprobe")
+        .arg("usb_f_mass_storage")
         .status();
 
     // Create gadget directory structure
@@ -228,6 +239,14 @@ pub fn enable() -> Result<()> {
     ensure_symlink(&func_dir, &cfg_dir.join("mass_storage.0"))?;
 
     info!("USB gadget configured with {} LUN(s)", lun);
+
+    // Kernel 6.18+ needs time for the configfs LUN file attribute writes
+    // to propagate before the UDC bind activates the mass_storage function.
+    // Without this, the function activates with "LUN: removable file:
+    // (no medium)" even though the file attribute reads back correctly.
+    // 3 seconds is the empirically determined minimum on rockchip64.
+    std::thread::sleep(std::time::Duration::from_secs(3));
+
     bind_udc(&gadget)
 }
 

@@ -2,18 +2,46 @@
 
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::Context;
 use prost::Message;
 use rand::RngCore;
-use tracing::{debug, info};
+use thiserror::Error;
+use tracing::{debug, info, warn};
 
 use crate::gatt::Connection;
 use crate::keys::KeyPair;
-use crate::proto::signatures::SessionInfo;
+use crate::proto::signatures::{SessionInfo, SessionInfoStatus};
 use crate::proto::universal_message::{
     Destination, Domain, RoutableMessage, SessionInfoRequest, destination,
     routable_message,
 };
+
+/// Distinct session-handshake error so callers (notably the API
+/// crate's pair handler and the UI status broadcasts) can render a
+/// specific message for "your key isn't paired on the car" instead of
+/// the generic "decode failed" path. Mirrors tesla-control's
+/// `protocol.ErrKeyNotPaired` (returned by `protocol.GetError` when the
+/// car's SessionInfo response status is
+/// `SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST`).
+#[derive(Debug, Error)]
+pub enum SessionError {
+    /// Tesla returned a SessionInfo whose `status` field explicitly
+    /// says our public key isn't on the car's whitelist. The user
+    /// needs to re-run the pair flow and tap the card on the
+    /// center-console NFC reader — this is NOT a transport bug or a
+    /// retryable error.
+    #[error(
+        "key not paired with car (SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST) — \
+         re-pair from the SentryUSB UI and tap your card on the center console"
+    )]
+    KeyNotPaired,
+    /// Any other handshake failure (decode error, transport error,
+    /// unexpected payload shape). Carries the underlying anyhow chain
+    /// so existing call sites that just bail/propagate don't lose
+    /// diagnostic detail.
+    #[error(transparent)]
+    Other(#[from] anyhow::Error),
+}
 
 /// Result of one SessionInfoRequest exchange. The raw bytes match
 /// what tesla-control writes into its session-cache JSON, so we
@@ -27,16 +55,22 @@ pub struct SessionInfoResponse {
 }
 
 /// Send SessionInfoRequest to `domain` and decode the response.
+///
+/// Returns `SessionError::KeyNotPaired` if the car responds with
+/// `SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST` — distinct from generic
+/// transport/decode failures so the caller can render a clear "re-pair
+/// your card" error in the UI instead of "AES-GCM decrypt failed three
+/// minutes later because we tried to use an unauthorized session."
 pub async fn request_session_info(
     conn: &mut Connection,
     keypair: &KeyPair,
     domain: Domain,
-) -> Result<SessionInfoResponse> {
+) -> std::result::Result<SessionInfoResponse, SessionError> {
     let payload = build_request(keypair, domain);
     debug!(
         "session-info: TX {} bytes to {:?}",
         payload.len(),
-        domain
+        domain,
     );
     // Validator: must decode as a RoutableMessage. Same rationale
     // as the other round_trip callers; the session-info handshake
@@ -76,29 +110,58 @@ fn build_request(keypair: &KeyPair, domain: Domain) -> Vec<u8> {
     msg.encode_to_vec()
 }
 
-fn parse_response(bytes: &[u8], domain: Domain) -> Result<SessionInfoResponse> {
+fn parse_response(
+    bytes: &[u8],
+    domain: Domain,
+) -> std::result::Result<SessionInfoResponse, SessionError> {
     debug!("session-info RX hex: {}", hex::encode(bytes));
-    let routable =
-        RoutableMessage::decode(bytes).context("decode outer Routable")?;
+    let routable = RoutableMessage::decode(bytes)
+        .context("decode outer Routable")?;
     debug!("session-info RX decoded: {:#?}", routable);
+
     let raw = match routable.payload {
         Some(routable_message::Payload::SessionInfo(b)) => b,
-        Some(other) => bail!("expected session_info, got {:?}", other),
-        None => bail!(
-            "response has no payload (signed_message_status={:?}, to={:?}, from={:?})",
-            routable.signed_message_status,
-            routable.to_destination,
-            routable.from_destination
-        ),
+        Some(other) => {
+            return Err(SessionError::Other(anyhow::anyhow!(
+                "expected session_info payload, got {:?}",
+                other
+            )));
+        }
+        None => {
+            return Err(SessionError::Other(anyhow::anyhow!(
+                "response has no payload (signed_message_status={:?}, to={:?}, from={:?})",
+                routable.signed_message_status,
+                routable.to_destination,
+                routable.from_destination
+            )));
+        }
     };
-    let parsed =
-        SessionInfo::decode(raw.as_slice()).context("decode SessionInfo proto")?;
+    let parsed = SessionInfo::decode(raw.as_slice())
+        .context("decode SessionInfo proto")?;
+
+    // Promote KEY_NOT_ON_WHITELIST to a distinct error so the UI can
+    // tell the user to re-pair their card. Matches tesla-control's
+    // `protocol.GetError` behavior. Without this check the bytes
+    // would parse fine, we'd derive a useless session key, and the
+    // next encrypted query would fail with AES-GCM decrypt error —
+    // a confusing failure mode that hides the actual problem.
+    if parsed.status == SessionInfoStatus::KeyNotOnWhitelist as i32 {
+        warn!(
+            "session-info from {:?}: car returned KEY_NOT_ON_WHITELIST — \
+             our public key is not paired with this VIN. \
+             User must re-pair from the SentryUSB UI and tap the card on the console.",
+            domain,
+        );
+        return Err(SessionError::KeyNotPaired);
+    }
+
     info!(
-        "session-info from {:?}: counter={}, clock_time={}, pubkey={} bytes",
+        "session-info from {:?}: counter={}, clock_time={}, pubkey={} bytes, status={}",
         domain,
         parsed.counter,
         parsed.clock_time,
-        parsed.public_key.len()
+        parsed.public_key.len(),
+        parsed.status,
     );
     Ok(SessionInfoResponse {
         domain,

@@ -59,6 +59,15 @@ pub struct Connection {
     tx_char: Characteristic,
     rx_stream: futures::stream::BoxStream<'static, ValueNotification>,
     rx_buffer: Vec<u8>,
+    /// Running tally of "buffer started with a too-large length prefix,
+    /// we cleared and continued" events since this counter was last
+    /// drained. Caller (PersistentSession::run_session_task) reads via
+    /// `take_framing_desync_recoveries()` and folds into a lifetime
+    /// total surfaced in the live status file + periodic status log.
+    /// Lives on Connection (not SessionState) so it captures
+    /// every recovery — even ones that happen on a query that
+    /// ultimately times out.
+    framing_desync_recoveries: u32,
 }
 
 impl Connection {
@@ -130,6 +139,7 @@ impl Connection {
             tx_char,
             rx_stream,
             rx_buffer: Vec::with_capacity(512),
+            framing_desync_recoveries: 0,
         };
 
         // One-time post-subscribe settle: bluez can emit a subscribe-
@@ -217,53 +227,187 @@ impl Connection {
         self.drain_until_quiet(Duration::from_millis(100)).await;
 
         let framed = frame(payload);
-        // Tesla supports MTU up to 247; we'd negotiate that during
-        // service discovery. btleplug doesn't currently expose the
-        // negotiated MTU directly, so we conservatively chunk for 247
-        // — Tesla's preferred max.
-        const MTU: usize = 247;
-        let chunks = chunks_for_mtu(&framed, MTU);
+        // Chunk at the BLE default ATT_MTU (23) — 20 byte payload per
+        // ATT write after the 3-byte ATT header. This matches what
+        // tesla-control's go-ble library does when its explicit MTU
+        // exchange fails: see vehicle-command/pkg/connector/ble/ble.go
+        // tryToConnect():
+        //
+        //     txMtu, err := client.ExchangeMTU(maxBLEMTUSize)
+        //     if err != nil {
+        //         conn.blockLength = ble.DefaultMTU - 3 // = 20
+        //     } else {
+        //         conn.blockLength = min(txMtu, ...) - 3
+        //     }
+        //
+        // Why we use the conservative default unconditionally:
+        // btleplug 0.11.x does NOT expose an MTU exchange API at all
+        // (no `peripheral.request_mtu()`, no way to query the
+        // negotiated MTU after connect). On bluez setups where the
+        // stack didn't auto-negotiate a larger MTU during service
+        // discovery — which depends on bluez version, kernel, chip
+        // firmware, and post-pair adapter state — our previous
+        // hardcoded 247 produced WriteWithoutResponse calls of
+        // 80-200+ bytes, which bluez rejects with "Failed to
+        // initiate write" because the data can't fit in a single
+        // ATT_Write_Cmd at the default MTU.
+        //
+        // This was THE root cause of the tester's 323-drop streak:
+        // all "BLE write: Failed to initiate write" within 100ms of
+        // connect. tesla-control on the same hardware/pair worked
+        // because go-ble's WriteCharacteristic path also chunks to
+        // blockLength regardless of MTU exchange outcome.
+        //
+        // 20-byte chunks cost a few extra ATT_Write_Cmds per query
+        // (a ~100 byte session-info request goes from 1 write to 5)
+        // but is universally accepted. Once btleplug exposes MTU
+        // exchange (or we drop to D-Bus to call bluez's RequestMTU
+        // ourselves) we can bump this back up.
+        const ATT_DEFAULT_PAYLOAD: usize = 23;
+        let chunks = chunks_for_mtu(&framed, ATT_DEFAULT_PAYLOAD);
         debug!(
             "TX framed ({} bytes in {} chunk(s)): {}",
             framed.len(),
             chunks.len(),
             hex::encode(&framed)
         );
+        // Pre-write liveness check. Diagnostic: when a tester sees
+        // a wall of "BLE write: Failed to initiate write" errors that
+        // fire within ~100ms of "connected", we want to know whether
+        // bluez had already marked the link dead before we even tried
+        // — that's a totally different bug class from "the write
+        // itself failed on a healthy link." If is_connected returns
+        // false here, the LL link died between our subscribe and the
+        // first TX, which usually means either Tesla actively dropped
+        // us (bad pair, phone-key slot contention) or the RF link
+        // failed (range, interference, supervision timeout).
+        match self.peripheral.is_connected().await {
+            Ok(true) => {
+                debug!("pre-TX is_connected=true; proceeding with {} chunk(s)", chunks.len());
+            }
+            Ok(false) => {
+                bail!(
+                    "BLE write: peripheral.is_connected()=false before TX — \
+                     link died between subscribe and first write (typically \
+                     pair-auth failure, phone-key slot race, or RF drop)"
+                );
+            }
+            Err(e) => {
+                // Probe failed — log but proceed; the write below
+                // will surface the real error if there is one.
+                debug!("pre-TX is_connected() probe errored ({}), proceeding anyway", e);
+            }
+        }
         for chunk in chunks {
+            // WithResponse (was WithoutResponse): ATT_Write_Req +
+            // ATT_Write_Rsp round-trip per chunk instead of fire-
+            // and-forget ATT_Write_Cmd. tesla-control uses this
+            // (`noRsp=false` in go-ble's WriteCharacteristic
+            // — see vehicle-command/pkg/connector/ble/ble.go:121).
+            //
+            // Why we changed: tester btmon on a Rock Pi 4C+ showed
+            // our 6-chunk session-info request TX completing in
+            // 20ms but Tesla taking 14 seconds to send the FIRST
+            // response notification — almost certainly because the
+            // chip→Tesla path was losing/delaying our Write_Cmd
+            // chunks and Tesla had to wait for some timeout before
+            // assuming the request was complete. By that time our
+            // 10s round_trip already gave up, the connection got
+            // declared dead, and we cycled forever.
+            //
+            // WriteWithResponse forces Tesla to ACK each chunk before
+            // we send the next. Can't lose a chunk because the ACK is
+            // required to proceed. Adds ~50ms per chunk (= ~300ms
+            // for the 6-chunk session-info request) but that's a
+            // rounding error vs the 14s timeout failure mode.
+            //
+            // On the working setup (Pi 5 USB Realtek dongle) this
+            // is essentially neutral — the chunks were landing fine
+            // either way, the only cost is the per-chunk ACK
+            // round-trip which is fast.
             self.peripheral
-                .write(&self.tx_char, chunk, WriteType::WithoutResponse)
+                .write(&self.tx_char, chunk, WriteType::WithResponse)
                 .await
                 .context("BLE write")?;
         }
 
         // Receive until we have a complete framed payload.
+        //
+        // `desyncs` counts how many times we've hit a too-large length
+        // prefix in this single round_trip. We recover inline (clear
+        // the polluting bytes, keep RX'ing for the real response)
+        // rather than bailing — the wall-clock `timeout` still bounds
+        // total wait time, and recovering in-flight lets a Tesla query
+        // succeed even when bluez handed us a partial-frame straggler
+        // right after our drain exited.
+        //
+        // Why this matters in practice: tester bundles showed
+        // sample_charge / sample_climate failing on EVERY tick (373
+        // and 377 failures vs 0 successes for charge in a 10h window)
+        // while sample_drive / sample_closures / sample_tires worked
+        // fine. The pattern was a single 100-150 byte stale
+        // notification landing in rx_buffer between drain end and
+        // Tesla's actual response — try_unframe read its first 2
+        // bytes as a length (always > 1024 since the bytes were
+        // mid-payload garbage), the old code bailed, and the whole
+        // query failed. With inline recovery, the buffer gets cleared
+        // and we wait for the next notification — which IS Tesla's
+        // real response — and the query succeeds.
+        //
+        // We do cap recovery at MAX_DESYNCS to avoid pathological
+        // spinning if the link is genuinely flooded with garbage; at
+        // that point the wall-clock timeout should fire anyway, but
+        // an explicit cap makes the failure mode "loud" instead of
+        // "silently maxed out at the timeout boundary."
+        //
+        // (Briefly bumped to 256 in 4836e6e while we thought the
+        // Rock Pi 4C+ tester's "desync_recoveries=5956 / no
+        // successful queries" was a chip-noise problem requiring
+        // huge recovery headroom. Root cause turned out to be our
+        // TX side using ATT_Write_Cmd (WriteWithoutResponse) —
+        // tesla-control uses ATT_Write_Req (WriteWithResponse) and
+        // works on that exact hardware. The desync storms were
+        // downstream of the 14-second TX-to-response gap that
+        // resulted, not a primary symptom. Reverted to 16 since
+        // healthy round_trips only see 0-2 recoveries.)
+        const MAX_DESYNCS: u32 = 16;
+        let mut desyncs: u32 = 0;
         timeout(wait, async {
             loop {
                 let unframed = match try_unframe(&mut self.rx_buffer) {
                     Ok(v) => v,
                     Err(e) => {
                         // try_unframe fails when the length prefix says
-                        // something insane (> 1024). That's a hard sign
-                        // of buffer desync — bytes from one frame are
-                        // being interpreted as a length prefix of
-                        // another. Clear the buffer so the NEXT chunk
-                        // arriving has a chance of being a clean
-                        // length prefix, log the head bytes for
-                        // diagnostics, and bubble up so the caller
-                        // retries with a fresh round_trip (which will
-                        // run a full drain).
+                        // something insane (> 1024). Bytes from one
+                        // frame are being interpreted as a length
+                        // prefix of another — most often a stale
+                        // notification that snuck in after drain
+                        // exited. Clear the polluting bytes and KEEP
+                        // RX'ing within this same round_trip; Tesla's
+                        // real response is usually the next chunk to
+                        // arrive.
                         let head_hex = hex::encode(
                             &self.rx_buffer[..self.rx_buffer.len().min(64)],
                         );
                         warn!(
                             "framing desync: try_unframe rejected {} buffer bytes \
-                             (head: {}…) — clearing buffer and surfacing error so \
-                             caller retries clean",
+                             ({}); head: {}… — clearing buffer, continuing to RX \
+                             within the same round_trip",
                             self.rx_buffer.len(),
+                            e,
                             head_hex,
                         );
                         self.rx_buffer.clear();
-                        return Err(e);
+                        desyncs += 1;
+                        self.framing_desync_recoveries =
+                            self.framing_desync_recoveries.saturating_add(1);
+                        if desyncs > MAX_DESYNCS {
+                            return Err(e).context(format!(
+                                "exceeded {MAX_DESYNCS} framing desyncs in one round_trip — \
+                                 giving up so caller can re-handshake"
+                            ));
+                        }
+                        continue;
                     }
                 };
                 if let Some(payload) = unframed {
@@ -338,6 +482,18 @@ impl Connection {
         let _ = self.peripheral.disconnect().await;
         // Tiny grace period to let bluez clean up its connection state.
         sleep(Duration::from_millis(100)).await;
+    }
+
+    /// Read-and-reset the per-connection framing-desync recovery
+    /// counter. Returns how many in-round_trip recoveries fired since
+    /// the last call (zero if the link has been clean). Used by
+    /// PersistentSession to roll the per-connection count into a
+    /// session-lifetime total that's surfaced in the live status
+    /// file and periodic status log — gives us visibility into how
+    /// often the recovery path is actually being exercised in the
+    /// wild, vs being a dead-code safety net.
+    pub fn take_framing_desync_recoveries(&mut self) -> u32 {
+        std::mem::take(&mut self.framing_desync_recoveries)
     }
 }
 

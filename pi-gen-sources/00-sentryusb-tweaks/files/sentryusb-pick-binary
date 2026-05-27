@@ -10,7 +10,6 @@
 #
 # Detection rules:
 #   * armv7 userspace (32-bit Pi) → linux-armv7
-#   * armv6 userspace (legacy Pi Zero / Pi 1) → linux-armv6
 #   * aarch64 with HWCAP_ATOMICS (LSE in /proc/cpuinfo Features) → linux-arm64-a76
 #     ↳ Pi 5 (Cortex-A76), and any future ARMv8.1+ board
 #   * aarch64 with CPU part 0xD08 (Cortex-A72) → linux-arm64-a72
@@ -41,7 +40,12 @@ detect_variant() {
     if command -v dpkg >/dev/null 2>&1; then
         case "$(dpkg --print-architecture 2>/dev/null)" in
             armhf) echo "linux-armv7"; return ;;
-            armel) echo "linux-armv6"; return ;;
+            armel)
+                # armv6 (original Pi Zero W / Pi 1) is no longer supported.
+                # Fall through so the fallback chain has a chance to find
+                # an installed binary, but log the situation loudly.
+                log "armel userspace detected; armv6 builds are no longer produced"
+                ;;
             arm64) ;; # fall through to aarch64 sub-detection
             *) ;;    # fall through too — let uname decide
         esac
@@ -49,7 +53,9 @@ detect_variant() {
 
     case "$(uname -m)" in
         armv7l) echo "linux-armv7"; return ;;
-        armv6l) echo "linux-armv6"; return ;;
+        armv6l)
+            log "armv6l kernel detected; armv6 builds are no longer produced"
+            ;;
         aarch64) ;;
         *)
             # Unknown — return the broadest aarch64 binary as a guess.
@@ -89,7 +95,7 @@ PICKED_PATH="${INSTALL_DIR}/sentryusb-${PICKED}"
 # image was built before this scheme.
 if [ ! -x "$PICKED_PATH" ]; then
     log "preferred variant ${PICKED} not installed at ${PICKED_PATH}, walking fallbacks"
-    for fallback in linux-arm64-a72 linux-arm64-a53 linux-armv7 linux-armv6; do
+    for fallback in linux-arm64-a72 linux-arm64-a53 linux-armv7; do
         if [ -x "${INSTALL_DIR}/sentryusb-${fallback}" ]; then
             PICKED="$fallback"
             PICKED_PATH="${INSTALL_DIR}/sentryusb-${fallback}"

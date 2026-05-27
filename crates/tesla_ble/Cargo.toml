@@ -48,6 +48,7 @@ path = "examples/typed_query.rs"
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
@@ -57,7 +58,6 @@ prost = "0.13"
 prost-types = "0.13"
 sha1 = "0.10"
 sha2 = "0.10"
-hmac = "0.12"
 hex = "0.4"
 uuid = "1"
 rand = "0.8"

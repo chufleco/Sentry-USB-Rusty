@@ -93,8 +93,11 @@ export default function Files() {
   const [error, setError] = useState<string | null>(null)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const uploadRef = useRef<HTMLInputElement>(null)
+  const folderUploadRef = useRef<HTMLInputElement>(null)
   const [uploads, setUploads] = useState<UploadProgress[]>([])
   const [uploading, setUploading] = useState(false)
+  const [dragging, setDragging] = useState(false)
+  const dragCounter = useRef(0)
   const [effectiveBase, setEffectiveBase] = useState("")
   const [search, setSearch] = useState("")
   const [sortOption, setSortOption] = useState<SortOption>("name-asc")
@@ -290,11 +293,8 @@ export default function Files() {
     })
   }
 
-  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const fileList = e.target.files
-    if (!fileList || fileList.length === 0) return
-
-    const fileArr = Array.from(fileList)
+  const processFiles = useCallback(async (fileArr: globalThis.File[]) => {
+    if (fileArr.length === 0) return
     const initial: UploadProgress[] = fileArr.map((f) => ({
       fileName: f.name,
       loaded: 0,
@@ -306,19 +306,55 @@ export default function Files() {
     setUploads(initial)
     setUploading(true)
 
-    // Upload all files in parallel
-    await Promise.all(fileArr.map((f, i) => uploadFileWithProgress(f, currentPath, i)))
+    // Upload files sequentially to avoid overwhelming low-RAM devices
+    for (let i = 0; i < fileArr.length; i++) {
+      await uploadFileWithProgress(fileArr[i], currentPath, i)
+    }
 
-    // All uploads finished — auto-refresh
     fetchFiles(currentPath)
     if (uploadRef.current) uploadRef.current.value = ""
+    if (folderUploadRef.current) folderUploadRef.current.value = ""
 
-    // Keep progress visible briefly, then clear
     setTimeout(() => {
       setUploads([])
       setUploading(false)
     }, 2000)
   }, [currentPath])
+
+  const handleUpload = useCallback(async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const fileList = e.target.files
+    if (!fileList || fileList.length === 0) return
+    await processFiles(Array.from(fileList))
+  }, [processFiles])
+
+  const handleDragEnter = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter.current++
+    if (e.dataTransfer.items?.length) setDragging(true)
+  }, [])
+
+  const handleDragLeave = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    dragCounter.current--
+    if (dragCounter.current === 0) setDragging(false)
+  }, [])
+
+  const handleDragOver = useCallback((e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+  }, [])
+
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
+    e.preventDefault()
+    e.stopPropagation()
+    setDragging(false)
+    dragCounter.current = 0
+    if (uploading) return
+    const files = Array.from(e.dataTransfer.files)
+    if (files.length > 0) await processFiles(files)
+  }, [uploading, processFiles])
 
   function handleDownloadSelected() {
     if (selected.size === 0) return
@@ -387,6 +423,19 @@ export default function Files() {
             {uploading ? "Uploading..." : "Upload"}
           </button>
           <input ref={uploadRef} type="file" multiple className="hidden" onChange={handleUpload} />
+          <button
+            onClick={() => folderUploadRef.current?.click()}
+            disabled={uploading}
+            className={cn(
+              "glass-card glass-card-hover flex items-center gap-1.5 px-3 py-1.5 text-sm transition-colors",
+              uploading ? "text-slate-600 cursor-not-allowed" : "text-slate-400 hover:text-slate-200"
+            )}
+          >
+            <FolderOpen className="h-4 w-4" />
+            Upload Folder
+          </button>
+          {/* @ts-expect-error webkitdirectory is non-standard but supported in all major browsers */}
+          <input ref={folderUploadRef} type="file" multiple webkitdirectory="" className="hidden" onChange={handleUpload} />
         </div>
       </div>
 
@@ -521,7 +570,21 @@ export default function Files() {
       )}
 
       {/* File list */}
-      <div className="glass-card flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div
+        className={cn("glass-card flex min-h-0 flex-1 flex-col overflow-hidden relative", dragging && "ring-2 ring-blue-500/50")}
+        onDragEnter={handleDragEnter}
+        onDragLeave={handleDragLeave}
+        onDragOver={handleDragOver}
+        onDrop={handleDrop}
+      >
+        {dragging && (
+          <div className="absolute inset-0 z-30 flex items-center justify-center bg-slate-900/80 backdrop-blur-sm">
+            <div className="flex flex-col items-center gap-2 text-blue-400">
+              <Upload className="h-10 w-10" />
+              <p className="text-sm font-medium">Drop files here to upload</p>
+            </div>
+          </div>
+        )}
         <div className="flex items-center justify-between border-b border-white/5 px-3 py-2">
           <div className="flex items-center gap-2">
             {currentPath !== base && (

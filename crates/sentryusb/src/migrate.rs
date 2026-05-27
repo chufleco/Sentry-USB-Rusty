@@ -305,7 +305,6 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
       _arch=$(dpkg --print-architecture 2>/dev/null || true)
       case "$_arch" in
         armhf)  _suffix=linux-armv7 ;;
-        armel)  _suffix=linux-armv6 ;;
         amd64)  _suffix=linux-amd64 ;;
         arm64)
           # Sub-detect for aarch64: HWCAP atomics → a76, CPU part 0xD08 → a72,
@@ -322,7 +321,6 @@ if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
           _arch=$(uname -m 2>/dev/null || echo "")
           case "$_arch" in
             armv7l)  _suffix=linux-armv7 ;;
-            armv6l)  _suffix=linux-armv6 ;;
             x86_64)  _suffix=linux-amd64 ;;
             aarch64)
               if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then

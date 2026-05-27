@@ -69,8 +69,12 @@ ok "/sentryusb -> $(readlink /sentryusb)"
 # (sentryusb-pick-binary, installed below) symlinks the best one to
 # sentryusb-current at every service start.
 #
-# On armv7/armv6 there's no microarchitectural split — single variant.
-# Same picker handles all four cases via /proc/cpuinfo detection.
+# On armv7 there's no microarchitectural split — single variant.
+# Same picker handles both cases via /proc/cpuinfo detection.
+#
+# armv6 (Pi Zero W / Pi 1) is no longer supported: the original Pi Zero W
+# is too underpowered to run the daemon and was dropped from CI to keep
+# release artifact counts manageable.
 
 mkdir -p "$INSTALL_DIR"
 
@@ -82,7 +86,7 @@ if command -v dpkg >/dev/null 2>&1; then
     case "$DPKG_ARCH" in
         arm64)  ARCH_FAMILY="aarch64" ;;
         armhf)  ARCH_FAMILY="armv7" ;;
-        armel)  ARCH_FAMILY="armv6" ;;
+        armel)  error_exit "Unsupported architecture: armel (armv6 / Pi Zero W / Pi 1). SentryUSB requires Pi Zero 2 W or newer." ;;
         amd64)  ARCH_FAMILY="amd64" ;;
         *)      error_exit "Unsupported userspace architecture: $DPKG_ARCH" ;;
     esac
@@ -90,7 +94,7 @@ else
     case "$(uname -m)" in
         aarch64) ARCH_FAMILY="aarch64" ;;
         armv7l)  ARCH_FAMILY="armv7" ;;
-        armv6l)  ARCH_FAMILY="armv6" ;;
+        armv6l)  error_exit "Unsupported architecture: armv6l (Pi Zero W / Pi 1). SentryUSB requires Pi Zero 2 W or newer." ;;
         x86_64)  ARCH_FAMILY="amd64" ;;
         *)       error_exit "Unsupported architecture: $(uname -m)" ;;
     esac
@@ -100,7 +104,6 @@ fi
 case "$ARCH_FAMILY" in
     aarch64) SUFFIXES="linux-arm64-a53 linux-arm64-a72 linux-arm64-a76" ;;
     armv7)   SUFFIXES="linux-armv7" ;;
-    armv6)   SUFFIXES="linux-armv6" ;;
     amd64)   SUFFIXES="linux-amd64" ;;
 esac
 

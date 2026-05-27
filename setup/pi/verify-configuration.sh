@@ -14,10 +14,6 @@ function check_supported_hardware () {
   then
     return
   fi
-  if grep -q 'Raspberry Pi Zero W' /sys/firmware/devicetree/base/model
-  then
-    return
-  fi
   if grep -q 'Raspberry Pi Zero 2' /sys/firmware/devicetree/base/model
   then
     return
@@ -34,8 +30,16 @@ function check_supported_hardware () {
   then
     return
   fi
+  # Original Pi Zero W (armv6) was dropped in 2026 — get a clear message
+  # before the generic catch-all below.
+  if grep -q 'Raspberry Pi Zero W' /sys/firmware/devicetree/base/model
+  then
+    setup_progress "STOP: unsupported hardware: Raspberry Pi Zero W"
+    setup_progress "(SentryUSB requires Pi Zero 2 W or newer — Pi 3, Pi 4, Pi 5)"
+    exit 1
+  fi
   setup_progress "STOP: unsupported hardware: '$(cat /sys/firmware/devicetree/base/model)'"
-  setup_progress "(only Pi Zero W, Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
+  setup_progress "(only Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
   exit 1
 }
 

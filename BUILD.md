@@ -34,7 +34,7 @@ Two binaries ship with the project:
 cross build --release --target aarch64-unknown-linux-gnu -p sentryusb
 ```
 
-32-bit (Pi Zero W / armhf):
+32-bit (armhf — Pi 3 with 32-bit Pi OS):
 ```
 cross build --release --target armv7-unknown-linux-gnueabihf -p sentryusb
 ```
@@ -81,5 +81,8 @@ GitHub Releases are expected to host these artifacts (naming consumed by
 - `sentryusb-linux-arm64-a53` / `-a72` / `-a76` (per-CPU aarch64 variants)
 - `sentryusb-linux-arm64` (backward-compat alias = a72 build)
 - `sentryusb-linux-armv7`
-- `sentryusb-linux-armv6`
 - `sentryusb-tesla-telemetry-linux-*` (one per CPU variant)
+
+armv6 (Pi Zero W / Pi 1) is no longer built — the board is too underpowered
+to run the daemon comfortably, and dropping the matrix entry keeps the
+release artifact count manageable.

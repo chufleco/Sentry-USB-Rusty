@@ -1,3 +1,4 @@
+use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, post, put};
 use axum::Router;
 
@@ -53,7 +54,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/files/mv", post(crate::files::move_file))
         .route("/api/files/cp", post(crate::files::copy_file))
         .route("/api/files", delete(crate::files::delete_file))
-        .route("/api/files/upload", post(crate::files::upload_file))
+        .route("/api/files/upload", post(crate::files::upload_file)
+            .layer(DefaultBodyLimit::max(512 * 1024 * 1024)))
         .route("/api/files/download", get(crate::files::download_file))
         .route("/api/files/download-zip", get(crate::files::download_zip))
         .route("/api/files/download-zip-multi", post(crate::files::download_zip_multi))

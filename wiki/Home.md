@@ -6,6 +6,8 @@ them up — no SSH, no config files.
 
 ## Install in one line
 
+> **No prebuilt SD card image yet.** The install path is: flash stock **Raspberry Pi OS Lite (64-bit)**, SSH in, and run the one-liner below. A prebuilt image will come later — for now this is the only supported install route. Full step-by-step in [Getting Started](Getting-Started).
+
 On a Pi already running Pi OS:
 
 ```bash
@@ -36,6 +38,8 @@ Plus:
 |------|--------------|
 | [Getting Started](Getting-Started) | Install in 10 minutes |
 | [Setup Wizard Guide](Setup-Wizard-Guide) | Every wizard step explained |
+| [Drives](Drives) | Trip tracking — route, distance, FSD usage, per-drive telemetry |
+| [Tesla BLE Telemetry](Tesla-BLE-Telemetry) | What BLE pulls from the car and how it enriches drives |
 | [Archive Methods](Archive-Methods) | CIFS, rsync, rclone, NFS |
 | [Notifications](Notifications) | Push notifications to your phone |
 | [Privacy](Privacy) | What we send, when, and why — and how to opt out |

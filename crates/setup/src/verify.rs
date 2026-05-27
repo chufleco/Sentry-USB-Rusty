@@ -85,14 +85,21 @@ pub async fn verify_disk_space(env: &SetupEnv, emitter: &SetupEmitter) -> Result
 fn check_supported_hardware(env: &SetupEnv) -> Result<()> {
     // Not-a-Pi skips the check entirely — matches bash: non-Pi boards
     // (RockPi, Radxa) are handled by other setup paths and aren't our
-    // problem here. Pi 2 is NOT supported (no USB gadget hardware).
+    // problem here. Pi 2 has no USB gadget hardware; Pi Zero W (the
+    // original armv6 board) was dropped in 2026 — too underpowered to
+    // run the daemon comfortably, and the armv6 build was retired to
+    // keep release artifact counts manageable.
     match env.pi_model {
-        PiModel::Pi5 | PiModel::Pi4 | PiModel::Pi3 | PiModel::PiZero2 | PiModel::PiZeroW => {
+        PiModel::Pi5 | PiModel::Pi4 | PiModel::Pi3 | PiModel::PiZero2 => {
             Ok(())
         }
+        PiModel::PiZeroW => bail!(
+            "STOP: unsupported hardware: Raspberry Pi Zero W. \
+             SentryUSB requires Pi Zero 2 W or newer (Pi 3, Pi 4, Pi 5)."
+        ),
         PiModel::Pi2 => bail!(
             "STOP: unsupported hardware: Raspberry Pi 2. \
-             (only Pi Zero W, Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
+             (only Pi Zero 2 W, Pi 3, Pi 4, and Pi 5 have the necessary hardware to run SentryUSB)"
         ),
         PiModel::Other => {
             // Could be a RockPi / Radxa Zero / genuinely unknown board.
@@ -135,13 +142,24 @@ async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
     // binary is already on disk.
     if sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_err() {
         emitter.progress("Installing xfsprogs (this can take 30-60 seconds)...");
-        sentryusb_shell::run_with_timeout(
+        let install = || sentryusb_shell::run_with_timeout(
             Duration::from_secs(180),
             "apt-get",
             &["-y", "install", "xfsprogs"],
-        )
-        .await
-        .context("failed to install xfsprogs")?;
+        );
+        if install().await.is_err() {
+            // Stale apt cache on aged Pi OS images: the .deb versions
+            // referenced by the baked-in lists may no longer exist in
+            // the pool, so the first install hits a 404. This is the
+            // only apt install that runs before update_package_index(),
+            // so it's the only one that has to refresh on its own.
+            emitter.progress("Refreshing package index and retrying...");
+            let _ = sentryusb_shell::run_with_timeout(
+                Duration::from_secs(300),
+                "apt-get", &["update"],
+            ).await;
+            install().await.context("failed to install xfsprogs")?;
+        }
         emitter.progress("xfsprogs installed");
     }
 

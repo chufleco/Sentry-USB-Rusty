@@ -17,7 +17,13 @@ jobs:
     #   /lib/.../libc.so.6: version `GLIBC_2.39' not found
     # When 22.04 is eventually retired by GitHub, switch to a
     # cargo-zigbuild or container-based build for explicit ABI control.
-    runs-on: ubuntu-22.04
+    #
+    # aarch64 jobs run on `ubuntu-22.04-arm` (native arm64, ~10-15% faster
+    # link + no cross-toolchain to install). 32-bit ARM jobs stay on
+    # x86 `ubuntu-22.04` because (a) the libdbus / sources patching dance
+    # is already tested there, and (b) cross-compile aarch64→armhf has
+    # the same complexity as x86→armhf with no payoff.
+    runs-on: ${{ matrix.runs_on }}
     strategy:
       matrix:
         # aarch64 is split into three CPU-tuned variants so each Pi runs
@@ -30,35 +36,33 @@ jobs:
         # The cpu field is consumed via the RUSTFLAGS env in the build step.
         include:
           - name: ARM64 a53 (Pi 3 / Pi Zero 2 W / Allwinner H618)
+            runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a53
-            linker: aarch64-linux-gnu-gcc
-            gcc: gcc-aarch64-linux-gnu
+            linker: cc
+            gcc: ""
             artifact_suffix: linux-arm64-a53
           - name: ARM64 a72 (Pi 4 / Radxa ROCK 4C+)
+            runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a72
-            linker: aarch64-linux-gnu-gcc
-            gcc: gcc-aarch64-linux-gnu
+            linker: cc
+            gcc: ""
             artifact_suffix: linux-arm64-a72
           - name: ARM64 a76 (Pi 5)
+            runs_on: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
             cpu: cortex-a76
-            linker: aarch64-linux-gnu-gcc
-            gcc: gcc-aarch64-linux-gnu
+            linker: cc
+            gcc: ""
             artifact_suffix: linux-arm64-a76
           - name: ARMv7 (Pi 2/3/Zero2W 32-bit)
+            runs_on: ubuntu-22.04
             target: armv7-unknown-linux-gnueabihf
             cpu: cortex-a7
             linker: arm-linux-gnueabihf-gcc
             gcc: gcc-arm-linux-gnueabihf
             artifact_suffix: linux-armv7
-          - name: ARMv6 (Pi Zero W/1)
-            target: arm-unknown-linux-gnueabihf
-            cpu: ""
-            linker: arm-linux-gnueabihf-gcc
-            gcc: gcc-arm-linux-gnueabihf
-            artifact_suffix: linux-armv6
     steps:
       - uses: actions/checkout@v6
 
@@ -67,69 +71,68 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation tools
+      - name: Install build dependencies
         run: |
-          # libdbus-1-dev + pkg-config are needed by `bluer`/`btleplug`
-          # (used by crates/tesla_ble for bluez D-Bus access).
-          # Cross-compilation requires the TARGET arch's libdbus
-          # headers — host arch alone produces:
-          #   pkg-config has not been configured to support cross-compilation
+          # Two install paths depending on whether the host matches the
+          # target:
           #
-          # Enabling foreign architectures alone isn't enough: Ubuntu
-          # serves arm64/armhf binary packages from ports.ubuntu.com,
-          # NOT from the default security/archive mirrors. Patching
-          # the existing sources turned out to be fragile across
-          # runner images (legacy sources.list vs DEB822
-          # sources.list.d/ubuntu.sources, with or without backports
-          # pocket, etc.), so we wholesale-replace both files with
-          # arch-scoped entries we control completely.
+          #   1. aarch64-* targets on `ubuntu-22.04-arm` → NATIVE build.
+          #      Just install the basic build tools + libdbus host arch.
+          #      No foreign architectures, no cross-toolchain, no
+          #      sources patching.
           #
-          # armv6 piggybacks on the armhf package set (same EABI; the
-          # libdbus C headers are bit-identical between armhf and armel).
-          UBUNTU_CODENAME=$(lsb_release -cs)
-          echo "Ubuntu codename: $UBUNTU_CODENAME"
-          # Wipe any existing sources so a stale [arch=] line on the
-          # runner image doesn't smuggle in a 404-bound fetch.
-          sudo rm -f /etc/apt/sources.list.d/ubuntu.sources
-          sudo tee /etc/apt/sources.list >/dev/null <<EOF
+          #   2. armv7-* / arm-* targets on `ubuntu-22.04` (x86) →
+          #      CROSS-compile. The default Ubuntu sources are x86-only,
+          #      so we wholesale-rewrite sources.list to put amd64,i386
+          #      on archive.ubuntu.com and arm64,armhf on
+          #      ports.ubuntu.com (the only mirror that serves them).
+          #      Then enable foreign archs + install cross gcc + the
+          #      target-arch libdbus headers.
+          case "${{ matrix.target }}" in
+            aarch64-*)
+              # Native build path.
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq \
+                brotli mold pkg-config libdbus-1-dev
+              ;;
+            armv7-*|arm-*)
+              # Cross-compile path (x86 host → 32-bit ARM target).
+              UBUNTU_CODENAME=$(lsb_release -cs)
+              echo "Ubuntu codename: $UBUNTU_CODENAME"
+              # Wipe any existing sources so a stale [arch=] line on the
+              # runner image doesn't smuggle in a 404-bound fetch.
+              sudo rm -f /etc/apt/sources.list.d/ubuntu.sources
+              sudo tee /etc/apt/sources.list >/dev/null <<EOF
           deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME} main restricted universe multiverse
           deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-updates main restricted universe multiverse
           deb [arch=amd64,i386] http://archive.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-backports main restricted universe multiverse
           deb [arch=amd64,i386] http://security.ubuntu.com/ubuntu/ ${UBUNTU_CODENAME}-security main restricted universe multiverse
           EOF
-          sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<EOF
+              sudo tee /etc/apt/sources.list.d/ports.list >/dev/null <<EOF
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME} main restricted universe multiverse
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-updates main restricted universe multiverse
           deb [arch=arm64,armhf] http://ports.ubuntu.com/ubuntu-ports/ ${UBUNTU_CODENAME}-security main restricted universe multiverse
           EOF
-          echo "=== Resulting sources.list ==="
-          cat /etc/apt/sources.list
-          echo "=== Resulting ports.list ==="
-          cat /etc/apt/sources.list.d/ports.list
-          sudo dpkg --add-architecture arm64
-          sudo dpkg --add-architecture armhf
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq \
-            ${{ matrix.gcc }} brotli mold pkg-config \
-            libdbus-1-dev libdbus-1-dev:arm64 libdbus-1-dev:armhf
-
-      - name: Configure pkg-config for cross-compile
-        run: |
-          # pkg-config needs to be pointed at the target arch's .pc
-          # directory AND told that cross-compilation is OK
-          # (default refuses, on the theory that mixing host + target
-          # libs causes link-time disasters — which is exactly why we
-          # installed libdbus-1-dev:<arch> separately above).
-          case "${{ matrix.target }}" in
-            aarch64-*)
-              echo "PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig" >> "$GITHUB_ENV"
-              echo "PKG_CONFIG_SYSROOT_DIR=/" >> "$GITHUB_ENV"
-              ;;
-            armv7-*|arm-*)
-              echo "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig" >> "$GITHUB_ENV"
-              echo "PKG_CONFIG_SYSROOT_DIR=/" >> "$GITHUB_ENV"
+              sudo dpkg --add-architecture armhf
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq \
+                ${{ matrix.gcc }} brotli mold pkg-config \
+                libdbus-1-dev libdbus-1-dev:armhf
               ;;
           esac
+
+      - name: Configure pkg-config for cross-compile
+        # Only needed on cross builds — native aarch64 uses the system
+        # libdbus and pkg-config defaults work as-is.
+        if: startsWith(matrix.target, 'armv7-') || startsWith(matrix.target, 'arm-')
+        run: |
+          # pkg-config needs to be pointed at the target arch's .pc
+          # directory AND told that cross-compilation is OK (default
+          # refuses, on the theory that mixing host + target libs causes
+          # link-time disasters — which is exactly why we installed
+          # libdbus-1-dev:armhf separately above).
+          echo "PKG_CONFIG_PATH=/usr/lib/arm-linux-gnueabihf/pkgconfig" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_SYSROOT_DIR=/" >> "$GITHUB_ENV"
           echo "PKG_CONFIG_ALLOW_CROSS=1" >> "$GITHUB_ENV"
 
       - name: Cache cargo registry
@@ -146,7 +149,11 @@ jobs:
           # The cpu suffix is part of the key because aarch64-a53 /-a72 /-a76
           # all share the same target triple but produce distinct binaries
           # (different RUSTFLAGS), so they must NOT share a target/ dir.
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
+          # runner.arch is in the key because the aarch64 jobs run on
+          # ARM-native runners while armv7/armv6 stay on x86 cross — the
+          # cached build artifacts are host-arch-specific and must not
+          # be reused across hosts.
+          key: ${{ runner.os }}-${{ runner.arch }}-cargo-${{ matrix.target }}-${{ matrix.cpu }}-${{ hashFiles('**/Cargo.lock', 'web/src/**', 'web/public/**', 'web/package-lock.json', 'web/package.json', 'web/index.html', 'web/vite.config.*', 'web/tsconfig*.json') }}
 
       - name: Set up Node.js
         uses: actions/setup-node@v5
@@ -203,18 +210,15 @@ jobs:
       - name: Build release binaries (sentryusb + telemetry sampler)
         # RUSTFLAGS overrides the per-target rustflags in .cargo/config.toml
         # so each aarch64 matrix entry produces a binary tuned to its
-        # specific Cortex-A microarchitecture. armv6 has cpu="" → we skip
-        # the target-cpu override and inherit whatever rustc's default is
-        # (no per-CPU tuning for armv6; one binary covers Pi Zero W and Pi 1).
+        # specific Cortex-A microarchitecture.
         #
         # `mold -run` wraps the build so mold intercepts every linker
-        # invocation in the subprocess tree (no GCC `-fuse-ld=mold` flag
-        # needed — cross-compilers can't find `ld.mold` in their search
-        # paths anyway). Used only for the aarch64 jobs because mold
-        # 1.x on Ubuntu 22.04 doesn't support the 32-bit ARM
-        # `armelf_linux_eabi` emulation. armv7/armv6 keep GNU ld; the
-        # aarch64 trio dominates total CI wallclock so the bulk of the
-        # link-time win still lands.
+        # invocation in the subprocess tree. Used on aarch64 jobs
+        # (where the build is now native on ubuntu-22.04-arm) but
+        # skipped on armv7 because mold 1.x on Ubuntu 22.04 doesn't
+        # support the 32-bit ARM `armelf_linux_eabi` emulation. armv7
+        # keeps GNU ld; the aarch64 trio dominates total CI wall-clock
+        # so the bulk of the link-time win still lands.
         run: |
           if [ -n "${{ matrix.cpu }}" ]; then
               export RUSTFLAGS="-C target-cpu=${{ matrix.cpu }}"
@@ -231,7 +235,6 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: ${{ matrix.linker }}
           CARGO_TARGET_ARMV7_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
-          CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER: ${{ matrix.linker }}
 
       - name: Package binaries
         # Both artifacts use the same `artifact_suffix` so the in-app

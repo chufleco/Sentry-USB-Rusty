@@ -1,6 +1,6 @@
 # Setup Wizard Guide
 
-The Setup Wizard runs the first time you open `http://sentryusb.local`. It walks you through 10 steps. You can re-run it anytime from **Settings** → **Re-run Setup Wizard**.
+The Setup Wizard runs the first time you open `http://sentryusb.local`. It walks you through 11 steps. You can re-run it anytime from **Settings** → **Re-run Setup Wizard**.
 
 ## 1. Welcome
 
@@ -8,12 +8,21 @@ Confirms the device is reachable and shows any existing configuration detected f
 
 Click **Get Started**.
 
-## 2. Network
+## 2. Privacy
+
+Lists every outbound data flow Sentry USB will make and asks you to confirm an **Analytics opt-in** choice before the wizard moves on. Both buttons carry equal visual weight — pick whichever you actually want.
+
+- **Opted out (default)** — no device fingerprint ever leaves the Pi. Update checks still happen but carry no identifier.
+- **Opted in** — a one-way salted hash of your board's serial number is attached to update-check telemetry, so we can count unique installs without double-counting reinstalls.
+
+Either choice takes effect immediately and persists if you back out of the wizard. You can change it any time at **Settings → Privacy**. Full per-flow disclosure is on the [Privacy](Privacy) page.
+
+## 3. Network
 
 - **Device Hostname** — defaults to `sentryusb`. Leave it unless you have a reason to change. The Pi is reachable at `http://<hostname>.local`.
 - **WiFi Access Point** (optional) — broadcast a backup WiFi network from the Pi itself. Useful when you're away from home WiFi and want to reach the web UI from your phone.
 
-## 3. Storage
+## 4. Storage
 
 Pick how much of the SD card each "virtual USB drive" gets. The remainder is used for snapshots (saved and sentry clips). Defaults are sensible — most users only touch **Dashcam Size**.
 
@@ -23,9 +32,9 @@ Pick how much of the SD card each "virtual USB drive" gets. The remainder is use
 - **External Data Drive** (optional) — point Sentry USB at a USB or NVMe drive instead of the SD card. Best for heavy users. **The selected drive will be wiped.**
 - **Use ExFAT filesystem** — on by default. Leave it on unless you have a specific reason to use FAT32.
 
-> **EU users:** Tesla's RecentClips retention is 10 minutes in the EU (vs 1 hour in North America). You'll need to lower the **Snapshot Interval** to **480 seconds** (8 minutes) on the [Advanced](#9-advanced) step, otherwise recent clips can roll off before they get archived.
+> **EU users:** Tesla's RecentClips retention is 10 minutes in the EU (vs 1 hour in North America). You'll need to lower the **Snapshot Interval** to **480 seconds** (8 minutes) on the [Advanced](#10-advanced) step, otherwise recent clips can roll off before they get archived.
 
-## 4. Community
+## 5. Community
 
 Toggle two optional features:
 
@@ -34,7 +43,7 @@ Toggle two optional features:
 
 Both are stored on the cam drive — no extra partition needed.
 
-## 5. Archive
+## 6. Archive
 
 Pick where your clips get backed up.
 
@@ -48,7 +57,7 @@ Pick where your clips get backed up.
 
 See [Archive Methods](Archive-Methods) for setup details for each.
 
-## 6. Keep Awake
+## 7. Keep Awake
 
 Tesla's Sentry Mode shuts off after the car sleeps. Keep Awake holds the car awake so the Pi keeps getting power.
 
@@ -60,25 +69,25 @@ Tesla's Sentry Mode shuts off after the car sleeps. Keep Awake holds the car awa
 | **Webhook** | Your own service (e.g., Home Assistant) |
 | **None** | Use the car's built-in Sentry/Camp modes manually |
 
-## 7. Notifications
+## 8. Notifications
 
 Pick one or more push notification providers. Sentry USB will notify you about archive failures, full drives, BLE pairing issues, etc.
 
 See [Notifications](Notifications) for the full list of providers and how to get API keys for each.
 
-## 8. Security
+## 9. Security
 
 Set a **Web Username** and **Web Password** for the web UI.
 
 Leave both empty to disable web auth entirely — only do this if your network is fully trusted.
 
-## 9. Advanced
+## 10. Advanced
 
 - **Timezone** — pick yours from the list (used for log timestamps and notification times).
 - **Archive Delay (seconds)** — how long to wait after WiFi connects before archiving starts. Default 20 is fine.
 - **Snapshot Interval (seconds)** — how often the Pi looks for new saved clips to archive. Default works for most users. **EU users: set this to 480** (8 min) because Tesla rotates RecentClips faster in the EU. Rule of thumb: set ~2 minutes shorter than the car's RecentClips retention.
 - **Temperature Unit** — °C or °F for the temperature monitoring widget.
 
-## 10. Review
+## 11. Review
 
 Final summary of every choice. Click **Apply** to write the configuration and reboot. The Pi will come back up at the new hostname (`http://sentryusb.local` by default) in about a minute.

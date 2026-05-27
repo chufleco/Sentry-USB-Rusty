@@ -42,13 +42,16 @@ echo "dtoverlay=dwc2" >> "${ROOTFS_DIR}/boot/firmware/config.txt"
 #
 # On aarch64 images we stage three per-CPU-tuned variants (a53/a72/a76).
 # The runtime picker (installed below) symlinks the right one to
-# sentryusb-current at every service start. On armv6/armv7 images there's
-# a single variant, but the same picker handles all four cases.
+# sentryusb-current at every service start. On armv7 images there's
+# a single variant, but the same picker handles both cases.
+#
+# armv6 (armel) is no longer supported — the original Pi Zero W and Pi 1
+# don't have the headroom to run the daemon; image builds for those
+# boards aren't produced anymore.
 REPO="Sentry-Six/Sentry-USB-Rusty"
 case "$(dpkg --print-architecture 2>/dev/null || echo arm64)" in
     arm64|aarch64) SUFFIXES="linux-arm64-a53 linux-arm64-a72 linux-arm64-a76" ;;
     armhf)         SUFFIXES="linux-armv7" ;;
-    armel)         SUFFIXES="linux-armv6" ;;
     *)             SUFFIXES="linux-arm64-a72" ;;  # safe default
 esac
 

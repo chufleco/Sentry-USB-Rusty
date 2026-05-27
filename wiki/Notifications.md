@@ -8,7 +8,7 @@ Sentry USB can send you push notifications when:
 - The BLE keep-awake loses pairing
 - The Pi reboots or loses WiFi
 
-Configure providers in the [Setup Wizard](Setup-Wizard-Guide#7-notifications), or anytime later under **Settings** → **Notifications**.
+Configure providers in the [Setup Wizard](Setup-Wizard-Guide#8-notifications), or anytime later under **Settings** → **Notifications**.
 
 You can enable as many providers as you want at once.
 

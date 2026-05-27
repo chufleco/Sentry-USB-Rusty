@@ -41,7 +41,6 @@ echo "SentryUSB Config" > "$gadget_root/configs/$cfg.1/strings/$lang/configurati
 # A bare Raspberry Pi 4 or 5 can peak at at over 1 A during boot, but idles around 500 mA.
 # A Raspberry Pi 3 can peak at over 500 mA during boot, but idles around 300 mA.
 # A Raspberry Pi Zero 2 W can peak at over 300 mA during boot, but idles around 100 mA.
-# A Raspberry Pi Zero W can peak up to 220 mA during boot, but idles around 80 mA.
 if isPi5
 then
   echo 600 > "$gadget_root/configs/$cfg.1/MaxPower"

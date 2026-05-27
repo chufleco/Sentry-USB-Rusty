@@ -42,15 +42,16 @@ pub fn extract_gps_from_file(path: &str) -> Result<ExtractedGps> {
     let (mut points, mut gears, mut ap_states, mut speeds, mut accel_positions) =
         extract_from_mdat(&mut f, mdat_offset, mdat_size)?;
 
+    // Capture counts BEFORE dedup — raw_frame_count is the true number of
+    // SEI frames in the video, needed for correct t = index/FPS computation.
+    let raw_frame_count = gears.len() as u32;
+    let raw_park_count = gears.iter().filter(|&&g| g == GEAR_PARK).count() as u32;
+
     // Deduplicate consecutive identical GPS points
     dedup_consecutive(&mut points, &mut gears, &mut ap_states, &mut speeds, &mut accel_positions);
 
     // Compute gear runs
     let gear_runs = compute_gear_runs(&gears);
-
-    // Count raw park frames
-    let raw_park_count = gears.iter().filter(|&&g| g == GEAR_PARK).count() as u32;
-    let raw_frame_count = gears.len() as u32;
 
     Ok(ExtractedGps {
         points,
@@ -62,6 +63,20 @@ pub fn extract_gps_from_file(path: &str) -> Result<ExtractedGps> {
         raw_frame_count,
         gear_runs,
     })
+}
+
+/// Extract raw (non-deduplicated) GPS data from a Tesla dashcam MP4 file.
+///
+/// Returns the raw frame arrays with 1:1 index-to-frame correspondence.
+/// Use when frame-accurate timestamps matter (e.g. telemetry overlay).
+pub fn extract_gps_from_file_raw(path: &str) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>)> {
+    let mut f = File::open(path)
+        .with_context(|| format!("failed to open MP4 file: {}", path))?;
+    let (mdat_offset, mdat_size) = find_mdat_box(&mut f)?;
+    if mdat_size == 0 {
+        return Ok((Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new()));
+    }
+    extract_from_mdat(&mut f, mdat_offset, mdat_size)
 }
 
 /// Scan MP4 top-level boxes to find the mdat box.

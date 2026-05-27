@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use clap::{Parser, Subcommand};
+use tower_http::CompressionLevel;
 use tower_http::compression::{
     CompressionLayer,
     predicate::{NotForContentType, Predicate, SizeAbove},
@@ -317,10 +318,19 @@ async fn main() {
     // Content-Encoding header already set — tower-http detects that
     // and skips re-compressing, so no per-request CPU is wasted on
     // the bundle.
+    // Brotli quality 6 (not the default 11) on dynamic responses. Quality
+    // 11 is the compression algorithm's slowest setting — fine for the
+    // build-time pre-compressed assets (paid once, served forever) but
+    // wasteful per-request on a Pi Zero 2W where it can add 100-200 ms
+    // to a single big-JSON response. Quality 6 gets within ~5% of
+    // quality-11 size at ~15× the encode speed. Gzip and deflate use
+    // level 6 too, which is their normal default — no behavior change
+    // for those codecs.
     let compression = CompressionLayer::new()
         .br(true)
         .gzip(true)
         .deflate(true)
+        .quality(CompressionLevel::Precise(6))
         .compress_when(
         SizeAbove::new(1024)
             .and(NotForContentType::new("video/"))

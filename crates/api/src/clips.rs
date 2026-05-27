@@ -191,28 +191,38 @@ pub async fn get_clip_telemetry(
         return crate::json_error(StatusCode::FORBIDDEN, "path must be under TeslaCam");
     }
 
-    let gps = match sentryusb_drives::extract::extract_gps_from_file(cleaned_str.as_ref()) {
-        Ok(g) => g,
-        Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
-    };
+    // Use raw extraction (no dedup) — dedup destroys the frame-to-time
+    // mapping needed for accurate telemetry overlay. GPS SEI at ~10fps means
+    // ~595 frames per 60s clip, which is small enough to serve directly.
+    let (points, gear_states, ap_states, speeds, accel_positions) =
+        match sentryusb_drives::extract::extract_gps_from_file_raw(cleaned_str.as_ref()) {
+            Ok(raw) => raw,
+            Err(e) => return crate::json_error(StatusCode::NOT_FOUND, &format!("could not read file: {}", e)),
+        };
 
-    const FPS: f64 = 36.0;
-    let mut frames = Vec::with_capacity(gps.points.len());
+    let video_duration = mp4_duration_sec(cleaned_str.as_ref()).unwrap_or(0.0);
+    let num_points = points.len();
+    let mut frames = Vec::with_capacity(num_points);
     let mut has_gps = false;
     let mut has_autopilot = false;
-    for (i, pt) in gps.points.iter().enumerate() {
-        let ap = *gps.autopilot_states.get(i).unwrap_or(&sentryusb_drives::extract::AUTOPILOT_OFF);
-        let gear = *gps.gear_states.get(i).unwrap_or(&0);
-        let speed = *gps.speeds.get(i).unwrap_or(&0.0);
-        let accel = *gps.accel_positions.get(i).unwrap_or(&0.0);
+    for (i, pt) in points.iter().enumerate() {
+        let ap = *ap_states.get(i).unwrap_or(&sentryusb_drives::extract::AUTOPILOT_OFF);
+        let gear = *gear_states.get(i).unwrap_or(&0);
+        let speed = *speeds.get(i).unwrap_or(&0.0);
+        let accel = *accel_positions.get(i).unwrap_or(&0.0);
         if pt[0] != 0.0 || pt[1] != 0.0 {
             has_gps = true;
         }
         if ap != sentryusb_drives::extract::AUTOPILOT_OFF {
             has_autopilot = true;
         }
+        let t = if num_points > 1 && video_duration > 0.0 {
+            video_duration * (i as f64) / ((num_points - 1) as f64)
+        } else {
+            0.0
+        };
         frames.push(serde_json::json!({
-            "t": (i as f64) / FPS,
+            "t": t,
             "lat": pt[0],
             "lng": pt[1],
             "speed_mps": speed,
@@ -221,7 +231,7 @@ pub async fn get_clip_telemetry(
             "accel_pos": accel,
         }));
     }
-    let duration_sec = if frames.is_empty() { 0.0 } else { (frames.len() as f64) / FPS };
+    let duration_sec = if video_duration > 0.0 { video_duration } else { 0.0 };
 
     (StatusCode::OK, Json(serde_json::json!({
         "frames": frames,
@@ -229,6 +239,60 @@ pub async fn get_clip_telemetry(
         "has_gps": has_gps,
         "has_autopilot": has_autopilot,
     })))
+}
+
+fn mp4_duration_sec(path: &str) -> Option<f64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(path).ok()?;
+    let file_size = f.metadata().ok()?.len();
+    let mut pos: u64 = 0;
+    let mut buf8 = [0u8; 8];
+    while pos < file_size {
+        f.seek(SeekFrom::Start(pos)).ok()?;
+        f.read_exact(&mut buf8).ok()?;
+        let mut box_size = u32::from_be_bytes([buf8[0], buf8[1], buf8[2], buf8[3]]) as u64;
+        let box_type = [buf8[4], buf8[5], buf8[6], buf8[7]];
+        if box_size == 1 {
+            let mut ext = [0u8; 8];
+            f.read_exact(&mut ext).ok()?;
+            box_size = u64::from_be_bytes(ext);
+        } else if box_size == 0 {
+            box_size = file_size - pos;
+        }
+        if &box_type == b"moov" {
+            let moov_end = pos + box_size;
+            let mut mpos = pos + 8;
+            while mpos < moov_end {
+                f.seek(SeekFrom::Start(mpos)).ok()?;
+                let mut mhdr = [0u8; 8];
+                f.read_exact(&mut mhdr).ok()?;
+                let msz = u32::from_be_bytes([mhdr[0], mhdr[1], mhdr[2], mhdr[3]]) as u64;
+                if &mhdr[4..8] == b"mvhd" {
+                    let mut vf = [0u8; 4];
+                    f.read_exact(&mut vf).ok()?;
+                    let ver = vf[0];
+                    if ver == 0 {
+                        let mut skip = [0u8; 8];
+                        f.read_exact(&mut skip).ok()?;
+                        let mut b4 = [0u8; 4];
+                        f.read_exact(&mut b4).ok()?;
+                        let timescale = u32::from_be_bytes(b4) as f64;
+                        f.read_exact(&mut b4).ok()?;
+                        let duration = u32::from_be_bytes(b4) as f64;
+                        if timescale > 0.0 {
+                            return Some(duration / timescale);
+                        }
+                    }
+                }
+                if msz < 8 { break; }
+                mpos += msz;
+            }
+            return None;
+        }
+        if box_size < 8 { break; }
+        pos += box_size;
+    }
+    None
 }
 
 #[cfg(test)]
