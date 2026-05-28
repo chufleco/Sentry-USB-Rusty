@@ -281,6 +281,23 @@ chmod +x /root/bin/disable_gadget.sh
 
 ok "Gadget shims installed at /root/bin/{enable,disable}_gadget.sh"
 
+# ── Step 3d: /root/.bashrc remountfs_rw reminder ───────────────────
+# Prints the read-only/remountfs_rw tip on every `sudo -i`. The pi-gen
+# image build adds the same block; this branch covers install-pi.sh
+# users who never ran pi-gen.
+if ! grep -q SENTRYUSB_TIP1 /root/.bashrc 2>/dev/null; then
+    cat >> /root/.bashrc <<- 'EOC'
+	if [ -n "$PS1" ]; then
+		cat << SENTRYUSB_TIP1
+		The root partition is mounted read-only.
+		Run 'bin/remountfs_rw' to allow writing to it.
+
+		SENTRYUSB_TIP1
+	fi
+	EOC
+    ok "Added remountfs_rw reminder to /root/.bashrc"
+fi
+
 # ── Step 4: Sample Config ───────────────────────────────────────────
 
 if [ ! -f /root/sentryusb.conf ]; then

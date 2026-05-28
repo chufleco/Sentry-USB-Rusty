@@ -255,47 +255,5 @@ then
 fi
 
 
-# indicate we're waiting for the user to log in and finish setup
+# blink the LEDs to signal the install half is done; setup continues in the web wizard
 flash_rapidly
-
-# If there is a user with id 1000, assume it is the default user
-# the user will be logging in as.
-DEFUSER=$(grep ":1000:1000:" /etc/passwd | awk -F : '{print $1}')
-if [ -n "$DEFUSER" ]
-then
-  if [ ! -e "/home/$DEFUSER/.bashrc" ] || ! grep -q "SETUP_FINISHED" "/home/$DEFUSER/.bashrc"
-  then
-    cat <<- EOF >> "/home/$DEFUSER/.bashrc"
-		if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]
-		then
-		  echo "+--------------------------------------------+"
-		  echo "| To continue SentryUSB setup, run 'sudo -i' |"
-		  echo "+-------------------------------------------+"
-		fi
-	EOF
-    chown "$DEFUSER:$DEFUSER" "/home/$DEFUSER/.bashrc"
-  fi
-fi
-
-if ! grep -q "SETUP_FINISHED" /root/.bashrc
-then
-  cat <<- EOF >> /root/.bashrc
-	if [ ! -e /sentryusb/SENTRYUSB_SETUP_FINISHED ]
-	then
-	  echo "+------------------------------------------------------------------------+"
-	  echo "| To continue SentryUSB setup, edit the file                             |"
-	  echo "| /root/sentryusb.conf with your favorite editor, e.g.                  |"
-	  echo "| 'nano /root/sentryusb.conf' and fill in the required variables.        |"
-	  echo "| in the required variables. Instructions are in the file, and at        |"
-	  echo "| https://github.com/Sentry-Six/Sentry-USB-Rusty/blob/main-dev/doc/OneStepSetup.md  |"
-	  echo "| (though ignore the Raspberry Pi specific bits about flashing and       |"
-	  echo "| mounting the sd card on a PC)                                          |"
-	  echo "|                                                                        |"
-	  echo "| When done, save changes and run /etc/rc.local                          |"
-	  echo "+------------------------------------------------------------------------+"
-	fi
-	EOF
-fi
-
-# hack to print the above message without duplicating it here
-grep -A 12 SETUP_FINISHED .bashrc  | grep echo | while read line; do eval "$line"; done

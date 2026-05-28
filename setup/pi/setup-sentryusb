@@ -1805,8 +1805,8 @@ then
   cat >> /root/.bashrc <<- EOC
 	if [ -n "\$PS1" ]; then
 		cat << SENTRYUSB_TIP1
-		Run 'bin/setup-sentryusb upgrade' to update to the latest version of SentryUSB,
-		or run 'bin/remountfs_rw' to allow writing to the root partition.
+		The root partition is mounted read-only.
+		Run 'bin/remountfs_rw' to allow writing to it.
 
 		SENTRYUSB_TIP1
 	fi

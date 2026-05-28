@@ -207,6 +207,22 @@ RWEOF
     chmod +x "${ROOTFS_DIR}/root/bin/remountfs_rw"
 fi
 
+# ── /root/.bashrc reminder pointing at bin/remountfs_rw ──
+# Baked into the image so the tip prints on every `sudo -i` even before
+# setup-sentryusb has run. setup-sentryusb keeps an idempotent copy of
+# this block so upgrades to existing installs land it too.
+if ! grep -q SENTRYUSB_TIP1 "${ROOTFS_DIR}/root/.bashrc" 2>/dev/null; then
+    cat >> "${ROOTFS_DIR}/root/.bashrc" <<- 'EOC'
+	if [ -n "$PS1" ]; then
+		cat << SENTRYUSB_TIP1
+		The root partition is mounted read-only.
+		Run 'bin/remountfs_rw' to allow writing to it.
+
+		SENTRYUSB_TIP1
+	fi
+	EOC
+fi
+
 BLE_SERVICE="${ROOTFS_DIR}/lib/systemd/system/sentryusb-ble.service"
 if [ -f "files/sentryusb-ble.service" ]; then
     cp "files/sentryusb-ble.service" "${BLE_SERVICE}"
