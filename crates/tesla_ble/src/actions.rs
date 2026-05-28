@@ -1,20 +1,12 @@
-//! Push 6b: build the inner payload bytes for keep-awake actions.
+//! Inner payload bytes for keep-awake actions, used by `awake_start`'s
+//! nudge loop during archive cycles. All are signed messages (same
+//! AES-GCM pipeline as state queries):
 //!
-//! Used by `awake_start`'s nudge loop during archive cycles. Three
-//! command types cover everything the shell-script path uses:
-//!
-//! * `wake_vehicle`         → VEHICLE_SECURITY, RKE_ACTION_WAKE_VEHICLE (30).
-//!                            Cheap; the car responds even when asleep
-//!                            without needing the main computer up.
-//! * `set_sentry_mode`      → INFOTAINMENT, VehicleControlSetSentryModeAction.
-//!                            Used by SENTRY_CASE=1 (auto-arm away from home)
-//!                            and SENTRY_CASE=3 (periodic nudge keeps USB hot).
+//! * `wake_vehicle`          → VEHICLE_SECURITY, RKE_ACTION_WAKE_VEHICLE (30).
+//!                             Works even when the main computer is asleep.
+//! * `set_sentry_mode`       → INFOTAINMENT. Used by SENTRY_CASE=1
+//!                             (auto-arm away) and =3 (periodic nudge).
 //! * `charge_port_open/close` → INFOTAINMENT, ChargePortDoor{Open,Close}.
-//!                              Less common but in the keep-awake toolkit.
-//!
-//! These are all signed messages (same AES-GCM pipeline as state
-//! queries). The car authenticates them, executes the action, and
-//! returns an `ActionStatus` (or for VCSEC: a body controller status).
 
 use prost::Message;
 

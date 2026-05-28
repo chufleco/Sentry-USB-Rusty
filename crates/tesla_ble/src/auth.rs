@@ -1,12 +1,8 @@
-// aes-gcm 0.10 still ships `Nonce::from_slice` even though it's been
-// marked deprecated upstream while the crate migrates to generic-array
-// 1.x. The replacement (`Nonce::clone_from_slice`) makes a copy and
-// the alternative (constructing a GenericArray manually) is verbose;
-// silencing here keeps the crypto code readable. Revisit when we
-// bump aes-gcm to 0.11+ which exposes a non-deprecated builder.
+// aes-gcm 0.10 deprecates `Nonce::from_slice` during its generic-array
+// 1.x migration; the replacements are verbose. Revisit on aes-gcm 0.11+.
 #![allow(deprecated)]
 
-//! Push 2 of Phase 2: AES-128-GCM signing for authenticated commands.
+//! AES-128-GCM signing for authenticated commands.
 //!
 //! Once `session::request_session_info` has returned a vehicle pubkey,
 //! `crypto::derive_session_key` gives us the AES-128 session key for
@@ -77,31 +73,20 @@ mod tag {
 const SIG_TYPE_AES_GCM_PERSONALIZED: u8 = 5;
 const SIG_TYPE_AES_GCM_RESPONSE: u8 = 9;
 
-/// Compute the AAD that AES-GCM signs over: SHA-256 of the metadata
-/// TLV stream (no version-byte prefix, no other framing).
-///
-/// Confirmed by decrypting a captured tesla-control state-climate
-/// signed request — our session key + the captured nonce + the
-/// captured tag verified successfully only when AAD = SHA256(metadata).
-/// Plain raw metadata fails, SHA256(0x01 || metadata) fails, etc.
+/// AAD that AES-GCM signs over: SHA-256 of the metadata TLV stream, no
+/// prefix or framing. Verified against captured tesla-control traffic —
+/// raw metadata or SHA256(0x01 || metadata) don't verify.
 fn metadata_aad(metadata: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(metadata);
     h.finalize().into()
 }
 
-/// Build the canonical metadata TLV stream that gets used as both
-/// AES-GCM AAD and the basis for the car's signature reconstruction.
-///
-/// Tag order is fixed (per Tesla's reference implementation): bad
-/// reorder = bad signature, hard to debug.
-///
-/// FLAGS is ALWAYS included — even when zero. Tesla's reference
-/// implementation uses an `AddUint32` helper that writes a 4-byte
-/// big-endian value to the metadata regardless of whether the value
-/// is zero. We tested this directly: matching that behavior is
-/// required for the signature to verify on flags=0 messages, even
-/// though our current usage (state queries) always sets flags=2.
+/// Build the canonical metadata TLV stream used as the AES-GCM AAD and
+/// the basis for the car's signature reconstruction. Tag order is fixed
+/// (a reorder breaks the signature). FLAGS is always written, even when
+/// zero — Tesla's `AddUint32` always emits the 4-byte value, and the
+/// signature won't verify otherwise.
 fn build_metadata(
     domain: Domain,
     vin: &[u8],
@@ -213,10 +198,8 @@ pub fn sign(
         hex::encode(aad)
     );
 
-    // Random 12-byte nonce. AES-GCM only requires uniqueness per
-    // (key, message); the counter in metadata provides replay
-    // protection separately, so random nonce is safe + simpler than
-    // counter-derived schemes.
+    // Random 12-byte nonce. AES-GCM needs only per-(key,message)
+    // uniqueness, and replay protection comes from the metadata counter.
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
 
@@ -372,9 +355,8 @@ pub fn build_signed_routable_message(
 mod tests {
     use super::*;
 
-    /// Round-trip: build_metadata is deterministic for fixed inputs.
-    /// Catches a "we accidentally hash random bytes into the AAD"
-    /// regression that would make every command sig look different.
+    /// build_metadata is deterministic for fixed inputs — guards against
+    /// hashing random bytes into the AAD.
     #[test]
     fn metadata_is_deterministic() {
         let vin = b"1FAKEVIN000000001";
@@ -384,10 +366,9 @@ mod tests {
         assert_eq!(m1, m2);
     }
 
-    /// Metadata layout sanity: start with SIGNATURE_TYPE TLV, end with
-    /// the bare 0xFF terminator. If somebody refactors the tag order
-    /// or drops the terminator, this fails loudly here instead of as
-    /// a baffling "INVALID_SIGNATURE" from the car.
+    /// Metadata layout sanity: starts with SIGNATURE_TYPE TLV, ends with
+    /// the bare 0xFF terminator — catches a tag-order/terminator break
+    /// here instead of as an opaque car-side INVALID_SIGNATURE.
     #[test]
     fn metadata_starts_with_sig_type_ends_with_end_marker() {
         let vin = b"1FAKEVIN000000001";
@@ -455,14 +436,9 @@ mod tests {
         assert_eq!(decrypted, plaintext);
     }
 
-    /// Known-answer regression test for the full sign chain. Inputs
-    /// are deterministic synthetic values; outputs are pinned hex.
-    /// If anyone tweaks the metadata TLV layout, the AAD hash
-    /// composition, or the AES-GCM bookkeeping, the pinned bytes
-    /// won't match and the test fires. This is what catches
-    /// "accidentally re-added a FLAGS-when-zero TLV" or "switched
-    /// AAD back to raw metadata" regressions before they leave a
-    /// developer's machine.
+    /// Known-answer regression test for the full sign chain (pinned hex
+    /// from deterministic inputs). Fires if the metadata TLV layout, AAD
+    /// hashing, or AES-GCM bookkeeping changes.
     #[test]
     fn signed_known_answer() {
         use aes_gcm::aead::{Aead, KeyInit, Payload};
@@ -493,18 +469,14 @@ mod tests {
             .unwrap();
         let (ct, tag) = combined.split_at(combined.len() - 16);
 
-        // Pin the entire chain. These bytes are the deterministic
-        // output of (this build_metadata + metadata_aad + AES-128-GCM)
-        // applied to the inputs above. Recompute via the equivalent
-        // Python script in PR notes if you need to regenerate.
+        // Pinned output of build_metadata + metadata_aad + AES-128-GCM
+        // for the inputs above.
         assert_eq!(hex::encode(ct), "d057120dadce8156be5ac3");
         assert_eq!(hex::encode(tag), "10a6a4ec5eddfbe1a9dc0eb829df2e64");
     }
 
-    /// Mirror of `signed_known_answer` for the response decryption
-    /// path. Pins the full response metadata + AAD + AES-GCM chain so
-    /// any regression in build_response_metadata or decrypt_response
-    /// fires immediately. Inputs synthetic.
+    /// Response-path mirror of `signed_known_answer`: pins the response
+    /// metadata + AAD + AES-GCM chain.
     #[test]
     fn response_known_answer() {
         let key = SessionKey([0x42; 16]);

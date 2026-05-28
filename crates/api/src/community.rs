@@ -1,6 +1,6 @@
 //! Community wraps and lock chimes proxy to backend API.
 //!
-//! Mirrors `server/api/community_wraps.go`:
+//! Community wraps API:
 //! - Validates wrap/chime codes against `^[A-Za-z0-9]{3,10}$` before proxying.
 //! - Forwards `X-Passcode` (admin access) on every route that accepts it —
 //!   library, upload, download, admin, plus the chime variants.

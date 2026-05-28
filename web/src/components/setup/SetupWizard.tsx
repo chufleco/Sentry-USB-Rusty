@@ -407,9 +407,9 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
           setSetupMessage("Sentry USB has finished setting up. The device is now rebooting one last time...")
           if (pollRef.current) clearInterval(pollRef.current)
         } else if (data.setup_running && phase === "rebooting") {
-          // Server is back and setup is still going — restore live progress view.
-          // This recovers from transient blips (service restart, heavy I/O, etc.)
-          // that previously left the UI permanently stuck in "rebooting".
+          // Server is back and setup is still going — restore the live
+          // progress view. Recovers from transient blips (service restart,
+          // heavy I/O) that would otherwise leave the UI stuck in "rebooting".
           setPhase("running")
           setSetupMessage("Setup is running. The device will reboot several times during this process — this is normal.")
         } else if (!data.setup_running && phase === "running") {

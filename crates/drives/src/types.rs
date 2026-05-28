@@ -450,7 +450,7 @@ pub struct TimedRoute {
 }
 
 /// Per-clip scalar summary computed once from a Route's BLOB-backed
-/// parallel slices. Port of Go `drives.RouteAggregates`.
+/// parallel slices.
 ///
 /// Cached as columns on the `routes` table so the Drives-page summary
 /// endpoints never have to decode a Points/GearStates/AutopilotStates
@@ -610,7 +610,7 @@ mod tests {
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains(r#""gearStates":"AAEAAA==""#), "serialized: {}", s);
         assert!(s.contains(r#""autopilotStates":"AAAAAQ==""#), "serialized: {}", s);
-        // omitempty fields are dropped on export — matches Go output.
+        // omitempty fields are dropped on export.
         assert!(!s.contains("speeds"), "empty speeds should be omitted: {}", s);
         assert!(!s.contains("rawParkCount"), "zero park count should be omitted: {}", s);
     }

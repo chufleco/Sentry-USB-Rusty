@@ -101,7 +101,7 @@ impl NotifyConfig {
 
         // MOBILE_PUSH_DEVICE_ID and MOBILE_PUSH_SECRET are intentionally NOT
         // stored in sentryusb.conf — they live in the credentials JSON managed
-        // by the server (same as Go). envsetup.sh reads them from that file;
+        // by the server. envsetup.sh reads them from that file;
         // we do the same here when the conf values are absent.
         let (mobile_push_device_id, mobile_push_secret) = {
             let from_conf = (get("MOBILE_PUSH_DEVICE_ID"), get("MOBILE_PUSH_SECRET"));

@@ -94,9 +94,9 @@ pub fn mark_permanent_skip(store: &DriveStore, file: &str) -> Result<()> {
 }
 
 /// Clear `cloud_uploaded_at` for routes whose BLE telemetry rollup is
-/// populated locally but was uploaded before the BLE columns made it
-/// into the encrypted blob (Phase 1 cutover). The next sweep re-encrypts
-/// and re-uploads them. Returns the number of rows reset.
+/// populated locally but was uploaded before the BLE columns were added
+/// to the encrypted blob. The next sweep re-encrypts and re-uploads them.
+/// Returns the number of rows reset.
 ///
 /// `battery_pct_start` is the canonical signal because it's the most
 /// reliably populated BLE column (every clip whose 60s window crossed at

@@ -1,4 +1,4 @@
-//! Phase 1: SessionInfoRequest → SessionInfo handshake.
+//! SessionInfoRequest → SessionInfo handshake.
 //!
 //! Usage:
 //!   sudo ./session_info <VIN> <path-to-key.pem>

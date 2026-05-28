@@ -11,8 +11,8 @@ use serde::Deserialize;
 use crate::router::AppState;
 use sentryusb_drives::{DriveStore, aggregate_telemetry, grouper};
 
-/// Filename kept identical to Go (`server/api/keepawake.go`) so existing
-/// `awake_stop` deployments work without changes after this binary lands.
+/// Path must match what `awake_stop` expects so existing deployments
+/// keep working unchanged.
 const KEEP_AWAKE_WANTED_FLAG: &str = "/tmp/keep_awake_webui_wanted";
 
 fn keep_awake_owners() -> &'static Mutex<HashSet<String>> {
@@ -54,14 +54,13 @@ pub fn clear_keep_awake_wanted() {
 pub struct DriveState {
     pub store: Arc<DriveStore>,
     pub processor: Arc<sentryusb_drives::processor::Processor>,
-    /// Set while an external drive-data import (JSON upload) is running.
-    /// Blocks processing and reprocessing until the import completes, matching
-    /// Go's `dh.importing` flag (server/api/drives.go:283-287, 378-381).
+    /// Set while an external drive-data import (JSON upload) is running;
+    /// blocks processing and reprocessing until the import completes.
     pub importing: Arc<AtomicBool>,
 }
 
-/// True if archiveloop is currently archiving. Mirrors Go `IsArchiving`:
-/// /tmp/archive_status.json present, mtime within 120s, phase == "archiving".
+/// True if archiveloop is currently archiving: /tmp/archive_status.json
+/// present, mtime within 120s, phase == "archiving".
 pub fn is_archiving() -> bool {
     match read_archive_status() {
         Some(v) => v.get("phase").and_then(|p| p.as_str()) == Some("archiving"),
@@ -69,8 +68,8 @@ pub fn is_archiving() -> bool {
     }
 }
 
-/// Read and parse /tmp/archive_status.json, returning None if absent, stale, or invalid.
-/// Removes the file if its mtime is older than 120s (same as Go's IsArchiving).
+/// Read and parse /tmp/archive_status.json, returning None if absent,
+/// stale, or invalid. Removes the file if its mtime is older than 120s.
 fn read_archive_status() -> Option<serde_json::Value> {
     const STATUS: &str = "/tmp/archive_status.json";
     let meta = std::fs::metadata(STATUS).ok()?;
@@ -86,9 +85,8 @@ fn read_archive_status() -> Option<serde_json::Value> {
     serde_json::from_str(&data).ok()
 }
 
-/// Sources envsetup.sh + exports shared PID file so awake_start/awake_stop
-/// coordinate with archiveloop's own keep-awake management. Same preamble as
-/// Go `awakeShellPreamble` (server/api/drives.go:238-246).
+/// Sources envsetup.sh + exports the shared PID file so awake_start/awake_stop
+/// coordinate with archiveloop's own keep-awake management.
 pub(crate) const AWAKE_PREAMBLE: &str = r#"source /root/bin/envsetup.sh 2>/dev/null || true
 declare -F log > /dev/null 2>&1 || {
   function log { echo "$(date): $*" >> "${LOG_FILE:-/mutable/archiveloop.log}" 2>/dev/null || true; }
@@ -103,7 +101,7 @@ pub(crate) fn shell_quote(s: &str) -> String {
 }
 
 /// Launch awake_start in the background. `expires_at_unix` is passed through
-/// so nudge logs can show time remaining (Go drives.go:251-265).
+/// so nudge logs can show time remaining.
 pub(crate) fn start_keep_awake_with(reason: &str, expires_at_unix: Option<i64>) {
     let mut script = AWAKE_PREAMBLE.to_string();
     script.push_str(&format!("export KEEP_AWAKE_REASON={}\n", shell_quote(reason)));
@@ -344,8 +342,7 @@ pub async fn processing_status(
 /// backfill state so the iOS / web app can render a "Migrating drive
 /// data..." banner during a first-boot-after-upgrade. Safe to poll at
 /// 2-3s cadence; reads three atomics + a small mutex-guarded string,
-/// no SQLite contention. Mirrors Go `dh.migrationStatus`
-/// (server/api/drives.go:151+).
+/// no SQLite contention.
 ///
 /// Response shape:
 ///
@@ -390,7 +387,7 @@ pub async fn migration_status(
 ///
 /// Query: `post_archive=1` — allow running during archiveloop's post-archive
 /// hook; skip keep-awake (archiveloop manages its own) and bypass the
-/// IsArchiving guard. Mirrors Go drives.go:292-294,326-332.
+/// IsArchiving guard.
 pub async fn process_files(
     State(state): State<AppState>,
     Query(q): Query<ProcessQuery>,

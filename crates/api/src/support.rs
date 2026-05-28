@@ -1,6 +1,6 @@
 //! Support-ticket proxy to backend API.
 //!
-//! Mirrors `server/api/support.go`:
+//! Support API:
 //! - Forwards `X-Auth-Token` (per-ticket session token) and `X-Passcode`
 //!   (fingerprint-based admin access) from the incoming request.
 //! - Re-serializes JSON bodies to normalize broken Unicode escapes (\usb etc.

@@ -1,8 +1,8 @@
 //! Drive grouping, gear splitting, stats computation, FSD analytics.
 //!
-//! Ported from Go `server/drives/grouper.go`. Groups Tesla dashcam clips into
-//! logical drives based on timestamp gaps and gear state transitions, then
-//! computes distance, speed, and FSD/autopilot analytics per drive.
+//! Groups Tesla dashcam clips into logical drives by timestamp gaps and
+//! gear-state transitions, then computes distance, speed, and
+//! FSD/autopilot analytics per drive.
 
 use std::collections::HashMap;
 
@@ -1010,7 +1010,7 @@ fn build_summary(
         odometer_mi_driven: None,
         start_location: None,
         end_location: None,
-        // Default null source to "sei" so the JSON contract matches Go
+        // Default null source to "sei" for a stable JSON contract
         // (`hide_tessie_overlapping_sei` and the FSD analytics filter
         // both compare to the literal "sei" string).
         source: Some(
@@ -2018,7 +2018,7 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
 
 /// Filter out Tessie-imported drives whose `[start_time, end_time]` window
 /// overlaps any native SEI drive. Tessie drives that fall in SEI gaps are
-/// kept. Port of Go's `hideTessieOverlappingSEI` (server/api/drives.go).
+/// kept.
 ///
 /// Without this filter, the same physical trip can appear twice in the
 /// drive list — once as a high-fidelity SEI drive (date stored as the
@@ -2058,7 +2058,7 @@ pub fn hide_tessie_overlapping_sei(summaries: Vec<DriveSummary>) -> Vec<DriveSum
         let (Some(ts), Some(te)) = (parse_iso_seconds(&d.start_time), parse_iso_seconds(&d.end_time))
         else {
             // Unparseable timestamps — keep the drive rather than silently
-            // hiding it (matches Go's defensive behavior).
+            // hiding it (defensive).
             out.push(d);
             continue;
         };

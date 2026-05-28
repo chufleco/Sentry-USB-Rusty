@@ -1,5 +1,4 @@
-//! Push notification pairing + mobile app proxy — port of Go
-//! `server/api/notifications.go`.
+//! Push notification pairing + mobile app proxy.
 //!
 //! Owns the Pi's long-lived `(device_id, device_secret)` credentials used
 //! to authenticate against the Sentry Connect backend. Credentials live
@@ -44,7 +43,7 @@ const PAIRING_EXPIRY: Duration = Duration::from_secs(5 * 60);
 const MAX_ACTIVE_CODES: usize = 3;
 
 /// Default notification backend. Override with `SENTRY_NOTIFICATION_URL`
-/// (env var or `sentryusb.conf` entry) — matches Sentry-USB PR #31 / 771bca6.
+/// (env var or `sentryusb.conf` entry).
 const DEFAULT_NOTIFICATION_BASE_URL: &str = "https://notifications.sentry-six.com";
 
 fn notification_base_url() -> String {
@@ -61,8 +60,7 @@ fn notification_base_url() -> String {
     //    var won't be set on a normal install — without this fallback,
     //    the user's SENTRY_NOTIFICATION_URL is silently ignored and
     //    every pairing/test/list call hits notifications.sentry-six.com
-    //    regardless of what the conf says. Mirrors Go's configOrDefault
-    //    (server/api/apiconfig.go).
+    //    regardless of what the conf says.
     let config_path = sentryusb_config::find_config_path();
     if let Ok((active, _)) = sentryusb_config::parse_file(config_path) {
         if let Some(v) = active.get("SENTRY_NOTIFICATION_URL") {
@@ -108,7 +106,7 @@ fn get_or_create_credentials() -> Option<&'static NotificationCredentials> {
     }
 
     // Generate new credentials. 32 bytes → 64 hex chars for device_id;
-    // 64 bytes → 128 hex chars for device_secret. Matches Go's
+    // 64 bytes → 128 hex chars for device_secret. Generated
     // `generateSecureToken(32)` / `generateSecureToken(64)`.
     let device_id = random_hex(32);
     let device_secret = random_hex(64);
@@ -253,7 +251,7 @@ pub async fn generate_pairing_code(
     };
 
     // Mint the code under the lock, register with backend, then commit
-    // or roll back. Matches Go's ordering: the user only sees a code if
+    // or roll back. Ordering: the user only sees a code if
     // the backend has acknowledged it.
     let (code, expires_at) = {
         let mut codes = ACTIVE_CODES.lock().unwrap_or_else(|p| p.into_inner());
@@ -480,7 +478,7 @@ async fn proxy_response(resp: reqwest::Response) -> (StatusCode, Json<serde_json
 /// POST /api/notifications/test
 ///
 /// Sends a test notification to the mobile push backend only.
-/// Mirrors Go's sendTestNotification which exclusively targets the
+/// Exclusively targets the
 /// Sentry Connect relay — other providers are not exercised here.
 pub async fn send_test_notification(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let creds = match get_or_create_credentials() {

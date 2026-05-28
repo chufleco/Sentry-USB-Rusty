@@ -1,6 +1,6 @@
 //! Web-UI keep-awake manager.
 //!
-//! Mirrors `server/api/keepawake.go`: manual/auto modes, busy-queuing,
+//! Keep-awake API: manual/auto modes, busy-queuing,
 //! expiration watcher, and re-arm when archiveloop finishes (archiveloop's
 //! own `awake_stop` kills our nudge, so we relaunch when we notice busy→idle).
 

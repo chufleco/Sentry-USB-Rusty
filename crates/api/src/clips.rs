@@ -66,7 +66,7 @@ fn enumerate_event_dirs(base: &Path) -> Vec<String> {
 }
 
 /// Build the `[{ name, clips, hasMore }]` JSON the Viewer expects for one
-/// category. Ports the Go `getClips` loop (`Sentry-USB/server/api/system.go`):
+/// category:
 /// one code path for all three categories — each clip is a dated subfolder of
 /// `.mp4` files plus an optional `event.json`.
 fn list_clips_in(
@@ -166,7 +166,7 @@ pub async fn get_clip_telemetry(
     };
 
     // Lexical path cleaning + base-prefix check. Mirrors
-    // `clips_telemetry.go:39–45`: reject any path that escapes TESLACAM_DIR
+    // Reject any path that escapes TESLACAM_DIR
     // via `..`, absolute rewrites, or symlinks on components we normalize away.
     let cleaned = {
         let mut p = std::path::PathBuf::from("/");

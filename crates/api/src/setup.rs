@@ -257,7 +257,7 @@ pub async fn run_setup(State(s): State<AppState>) -> (StatusCode, Json<serde_jso
 ///
 /// Body: JSON map with keys matching sentryusb.conf entries:
 /// `ARCHIVE_SYSTEM` (cifs|rsync|rclone|nfs), plus protocol-specific fields.
-/// Mirrors `server/api/setup.go:testArchive` — an actual mount/connect probe,
+/// An actual mount/connect probe,
 /// not just a ping.
 pub async fn test_archive(
     State(s): State<AppState>,

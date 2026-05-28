@@ -1,4 +1,4 @@
-//! Archive-sync size guard — port of Go `server/drives/syncguard.go`.
+//! Archive-sync size guard.
 //!
 //! The guard prevents a corrupted local `drive-data.json` (disk hiccup,
 //! partial write, snapshot corruption) from silently overwriting the

@@ -93,7 +93,7 @@ fn get_max_power() -> u32 {
 }
 
 /// Machine-ID-derived serial: `SentryUSB-<hex sha256(machine-id)>`.
-/// Matches Go `enable_gadget.sh:36` so Tesla's cached pairing survives the
+/// Ensures Tesla's cached pairing survives the
 /// Go→Rust transition.
 fn get_machine_serial() -> String {
     let mid = fs::read_to_string("/etc/machine-id").unwrap_or_default();
@@ -124,9 +124,8 @@ pub fn enable() -> Result<()> {
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
 
-    // Unload legacy g_mass_storage so it doesn't hold the UDC. (Matches Go
-    // `enable_gadget.sh:8` — drop the single-function legacy gadget before
-    // assembling the composite one.)
+    // Unload legacy g_mass_storage so it doesn't hold the UDC — drop the
+    // single-function legacy gadget before assembling the composite one.
     let _ = std::process::Command::new("modprobe")
         .args(["-q", "-r", "g_mass_storage"])
         .status();
@@ -373,7 +372,7 @@ pub fn disable() -> Result<()> {
     // removed. The shell-script reference at `run/disable_gadget.sh:23-26` skips
     // lun.0 for exactly this reason.
     //
-    // Previously this iterated `0..=4`. The rmdir on lun.0 silently failed (the
+    // The rmdir on lun.0 silently fails (the
     // result was discarded), but that left lun.0 sitting under `mass_storage.0`,
     // which made the subsequent `rmdir mass_storage.0` fail, which made the
     // gadget-root rmdir fail, which left configfs pinning `libcomposite`. The

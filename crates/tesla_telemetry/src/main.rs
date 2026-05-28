@@ -41,10 +41,9 @@ use crate::usb_watch::CarState;
 /// Coordinated with `awake_start`'s owner string ("keep_awake").
 const OWNER: &str = "telemetry";
 
-/// Tick cadence in Active mode. `state drive` always runs on each
-/// tick (highest priority — carries shiftState + location + odometer).
-/// The slower sub-samplers (climate, charge, tires) only run when
-/// their per-command interval has elapsed; see `Schedule` below.
+/// Active-mode tick cadence. `state drive` runs every tick (highest
+/// priority — carries shiftState + location + odometer); slower
+/// sub-samplers run on their own intervals (see `Schedule`).
 const DRIVE_INTERVAL: Duration = Duration::from_secs(15);
 
 /// How often to refresh climate (cabin/exterior temp, HVAC) in
@@ -57,91 +56,58 @@ const CLIMATE_INTERVAL: Duration = Duration::from_secs(60);
 const CHARGE_INTERVAL: Duration = Duration::from_secs(60);
 const CHARGE_INITIAL_OFFSET: Duration = Duration::from_secs(30);
 
-/// How often to refresh tire pressure in Active mode. 5 min — TPMS
-/// almost never changes mid-drive, and the call has the smallest
-/// payload of the four, so even at 5-min cadence it costs almost
-/// nothing.
+/// Tire-pressure refresh in Active mode. 5 min — TPMS barely changes
+/// mid-drive.
 const TIRES_INTERVAL: Duration = Duration::from_secs(300);
 
-/// How often to refresh `state closures` in Active mode. 60s — same
-/// cadence as climate/charge. This is the sole source of
-/// `sentry_mode_state` for the quiet-mode gate, so it has to be at
-/// least as fresh as the cadence at which the phase machine reacts
-/// (every drive-poll, i.e. 15s). 60s is a fine compromise: the gate
-/// only cares about transitions, not millisecond accuracy, and a
-/// remote sentry toggle from the Tesla app reaches us within ~1 tick.
+/// `state closures` refresh in Active mode. 60s. Sole source of
+/// `sentry_mode_state` for the quiet-mode gate, which only cares about
+/// transitions — a remote sentry toggle reaches us within ~1 tick.
 const CLOSURES_INTERVAL: Duration = Duration::from_secs(60);
 
-// (LOCATION_INTERVAL was removed: a brief stint adding `state
-// location` as its own sub-sampler ended once a tester's
-// tesla-control wire capture showed Tesla returns location_name in
-// `state drive` responses but NOT in `state location` responses.
-// `sample_drive_ble` now extracts the address from the bundled
-// LocationState in the drive response, so location refreshes at
-// the drive cadence (15s) for free.)
+// No separate location sampler: Tesla returns location_name in `state
+// drive` responses but not in `state location`, so `sample_drive_ble`
+// pulls the address from the drive response at the 15s drive cadence.
 
-/// Sample cadence for sleep-safe `body-controller-state` calls in
-/// Quiet mode. 30s (down from 60s) halves the worst-case wakeup
-/// latency — important because the user_presence flip is what
-/// promotes us back to Active when someone gets in a parked car.
-/// body-controller-state doesn't wake the car, so polling this
-/// often is cheap from a battery-drain perspective.
+/// Quiet-mode cadence for sleep-safe `body-controller-state` calls.
+/// 30s keeps wakeup latency low (user_presence promotes us back to
+/// Active); these calls don't wake the car, so polling often is cheap.
 const QUIET_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Retry interval after a sub-sampler fails. Implements the
-/// "constantly pummel the endpoint with recons" pattern the Pi's
-/// bluez stack doesn't do natively — when the car's BLE side drops
-/// a connection (which it does aggressively to save battery), we
-/// want to hit it again within seconds, not wait the full normal
-/// interval. Catches the brief acceptance window before the car's
-/// connection table refills with other clients.
+/// Retry interval after a sub-sampler fails. The car drops BLE
+/// connections aggressively to save battery, so retry within seconds
+/// to catch its brief acceptance window before other clients refill
+/// its connection table.
 const FAST_RETRY_INTERVAL: Duration = Duration::from_secs(3);
 
-/// How many consecutive fast retries before backing off to the
-/// normal cadence. 3 × FAST_RETRY_INTERVAL = ~9s of aggressive
-/// retry per sub-sampler before giving up — enough to catch a real
-/// reconnection window without burning power on a truly dead link.
+/// Consecutive fast retries before backing off to normal cadence.
+/// ~9s of aggressive retry — enough to catch a reconnection window
+/// without burning power on a dead link.
 const MAX_FAST_RETRIES: u32 = 3;
 
-/// How often to do a `state climate` + `state charge` refresh while
-/// in Quiet mode but the car is provably awake (recent clip writes
-/// → Sentry recording or charging). The default Quiet flow only
-/// runs body-controller-state, which doesn't carry battery/temps/
-/// HVAC — so without this refresh, parked-with-Sentry would show
-/// frozen values for as long as the session lasts. 3 min is the
-/// sweet spot: fresh enough that the dashboard cards feel alive,
-/// rare enough that we add minimal BLE load (~2 calls every 3 min,
-/// vs Active mode's 4 calls every 15 s). Safe because the car is
-/// already awake — we're not adding any wake-up drain.
+/// `state climate` + `state charge` refresh while in Quiet mode but
+/// the car is provably awake (recent clip writes). body-controller-state
+/// alone doesn't carry battery/temps/HVAC, so without this the
+/// parked-with-Sentry dashboard would show frozen values. 3 min keeps
+/// the cards alive at minimal BLE load; safe since the car is awake.
 const PARKED_AWAKE_REFRESH_INTERVAL: Duration = Duration::from_secs(180);
 
-/// How often to poll `state tire-pressure` while in Quiet mode but
-/// the car is awake. Much rarer than the climate/charge refresh
-/// because TPMS readings genuinely don't change while parked —
-/// 30 min is enough to feed the TPMS dashboard card with periodic
-/// fresh data and to confirm the sensors are still reporting.
-/// Without this, TPMS would only ever update during/right after a
-/// drive (Active mode polls tires every 5 min), and users who
-/// rarely drive would see indefinitely stale numbers.
+/// `state tire-pressure` poll while parked-awake. 30 min — TPMS doesn't
+/// change while parked, but this keeps the card fresh for users who
+/// rarely drive (otherwise tires only update in Active mode).
 const PARKED_AWAKE_TPMS_INTERVAL: Duration = Duration::from_secs(1800);
 
-/// How many consecutive state polls must show shift_state = Park
-/// before we drop into the sleep-safe Quiet mode. 3 polls @ 15s =
-/// 45 s of confirmed Park before we stop hammering the car. Keeps
-/// us in Drive mode through a brief stop at a light, but bails out
-/// quickly enough to let the car sleep within minutes of parking.
+/// Consecutive Park polls before dropping to Quiet mode. 3 @ 15s = 45s
+/// — rides through a stop at a light but lets the car sleep soon after
+/// parking.
 const PARK_CONFIRMATIONS_BEFORE_QUIET: u32 = 3;
 
-// (Software version is intentionally not sampled. tesla-control's
-// `state software-update` only returns the *pending* OTA version
-// (often " "), never the currently-installed `car_version`. To
-// surface the running OS version on drives, the user can enter it
-// manually in settings — see fsd_versions.rs for the mapping table
-// the per-drive rollup uses.)
+// Software version isn't sampled: `state software-update` returns only
+// the pending OTA version, never the installed `car_version`. Users
+// enter the running version manually (see fsd_versions.rs).
 
-/// How long to sleep when we can't take the BLE radio (some other
-/// owner holds the lock). Short so we resume quickly when the
-/// keep-awake nudge releases.
+/// Backoff when another owner holds the BLE radio lock. Short so we
+/// resume quickly when the keep-awake nudge releases.
 const RADIO_CONTENDED_BACKOFF: Duration = Duration::from_secs(5);
 
 /// How long to sleep when BLE is disabled in settings. Doesn't need
@@ -149,34 +115,21 @@ const RADIO_CONTENDED_BACKOFF: Duration = Duration::from_secs(5);
 const DISABLED_POLL: Duration = Duration::from_secs(60);
 
 /// Per-command "next due" timestamps for the Active-mode scheduler.
-///
-/// Each tick, the scheduler walks the four poll types in priority
-/// order and runs any that are due. `state drive` always runs first
-/// when due — it carries shiftState + locationName + odometer and
-/// must stay fresh. The slower polls (climate, charge, tires) only
-/// run when their per-command interval has elapsed and only after
-/// drive has gotten its turn this tick.
-///
-/// Stagger: charge starts 30s offset from climate so the two
-/// big-payload calls don't stack on the same tick. The offset is
-/// preserved automatically as long as both don't go overdue
-/// simultaneously (which only happens after a long Quiet period —
-/// acceptable, the next cycle restores the stagger naturally).
+/// Each tick walks the poll types in priority order and runs any due;
+/// `state drive` goes first (shiftState + locationName + odometer).
+/// charge is staggered 30s off climate so the two big-payload calls
+/// don't stack on one tick.
 struct Schedule {
     next_drive: Instant,
     next_climate: Instant,
     next_charge: Instant,
     next_tires: Instant,
-    /// `state closures` — only field we read from it is
-    /// sentry_mode_state, which the quiet-mode gate needs every
-    /// poll cycle. Same cadence as climate/charge so the gate's
-    /// inputs are roughly co-fresh.
+    /// `state closures` — read only for sentry_mode_state, which the
+    /// quiet-mode gate needs each cycle.
     next_closures: Instant,
-    /// Consecutive failure counters — used by the fast-retry
-    /// pattern. On a successful sub-sample they reset to 0; on
-    /// failure they increment and drive a 3s retry until
-    /// MAX_FAST_RETRIES is hit, at which point we back off to the
-    /// normal cadence to avoid hammering a permanently-dead link.
+    /// Consecutive-failure counters for the fast-retry pattern: reset on
+    /// success, increment on failure to drive 3s retries until
+    /// MAX_FAST_RETRIES, then back off to normal cadence.
     drive_failures: u32,
     climate_failures: u32,
     charge_failures: u32,
@@ -187,12 +140,9 @@ struct Schedule {
 impl Schedule {
     fn new(now: Instant) -> Self {
         Self {
-            // Drive + climate + tires + closures fire immediately on
-            // first tick — get a baseline snapshot, including the
-            // sentry_mode + (after the 30s charge offset) charging_state
-            // signals the quiet-mode gate depends on. Location is
-            // bundled into drive responses so it refreshes for free
-            // on the drive cadence.
+            // Fire immediately on the first tick for a baseline snapshot
+            // (incl. the sentry_mode + charging_state the quiet-mode gate
+            // needs). charge waits 30s to stagger off climate.
             next_drive: now,
             next_climate: now,
             next_charge: now + CHARGE_INITIAL_OFFSET,
@@ -211,12 +161,8 @@ impl Schedule {
     fn tires_due(&self, now: Instant) -> bool { now >= self.next_tires }
     fn closures_due(&self, now: Instant) -> bool { now >= self.next_closures }
 
-    /// Compute the next-due instant for a sub-sampler that just ran.
-    /// On success: normal interval. On failure within MAX_FAST_RETRIES:
-    /// short retry interval (~3s) to catch the car's brief
-    /// post-disconnect acceptance window. After too many fast retries
-    /// in a row: fall back to the normal interval so we don't burn
-    /// battery on a permanently-failing link.
+    /// Next-due instant for a sub-sampler that just ran: normal interval
+    /// on success, ~3s retry within MAX_FAST_RETRIES, else normal.
     fn next_after(now: Instant, success: bool, failures: u32, normal: Duration) -> Instant {
         if success {
             now + normal
@@ -292,83 +238,51 @@ async fn main() -> Result<()> {
     )
     .await;
 
-    // Brief startup wait for the system clock to come up — either via
-    // RTC (immediate) or NTP (seconds, if WiFi is reachable). Just
-    // long enough to dodge the very first cold-boot tick; the
-    // BLE-based clock sync (see clock_sync.rs) handles everything
-    // else once the first state response lands. Was 5 min when we
-    // depended entirely on NTP; now 30s is plenty because the car
-    // itself becomes our backup time source via BLE.
+    // Brief startup wait for the clock (RTC or NTP) to dodge the first
+    // cold-boot tick. 30s is enough because BLE clock sync (clock_sync.rs)
+    // takes over once the first state response lands.
     wait_for_clock_sync(Duration::from_secs(30)).await;
 
     let conn = db::open()?;
 
-    // Background diagnostic logger — writes one line per minute to
-    // /mutable/sentryusb-ble.log so the operator can scroll back
-    // through "what was the car state at 3pm while I was away"
-    // from the Logs → Bluetooth UI tab. Fully independent of the
-    // sampler's main loop; opens its own read-only DB handle each
-    // tick. Lives as long as the process does.
+    // Background diagnostic logger — one line/min to
+    // /mutable/sentryusb-ble.log for the Logs → Bluetooth UI tab.
+    // Independent of the main loop; own read-only DB handle.
     diag_log::spawn(sentryusb_drives::DEFAULT_DB_PATH.into());
 
-    // IPC bridge for external BLE actions (currently just
-    // sentryusb-ble-action invoked by run/awake_start). Lets
-    // keep-awake nudges piggyback on our already-warm
-    // PersistentSession instead of having to stop us first to grab
-    // the radio. Channel is bounded but small — keep-awake actions
-    // arrive ~once per archive cycle, never concurrently.
+    // IPC bridge for external BLE actions (sentryusb-ble-action from
+    // run/awake_start), letting keep-awake nudges reuse our warm
+    // PersistentSession instead of stopping us to grab the radio.
     let (action_tx, mut action_rx) = mpsc::channel::<action_socket::ActionRequest>(8);
     action_socket::spawn(action_tx);
 
     let mut held_radio = false;
-    // Counts consecutive state polls showing shift_state = Park.
-    // When it crosses PARK_CONFIRMATIONS_BEFORE_QUIET, the next tick
-    // drops to body-controller-only polling (sleep-safe). Reset by
-    // any non-Park shift observation OR by a user_presence flip
-    // back to PRESENT during Quiet mode.
+    // Consecutive Park polls; crossing PARK_CONFIRMATIONS_BEFORE_QUIET
+    // drops to sleep-safe body-controller polling. Reset by any non-Park
+    // shift or a user_presence flip back to PRESENT.
     let mut parked_polls: u32 = 0;
-    // Last user_presence reading from body-controller-state. Used
-    // to detect "driver got back in" while in Quiet mode so the
-    // sampler can promote to Active on the next tick rather than
-    // waiting for an external trigger.
+    // Last user_presence from body-controller-state; detects "driver got
+    // back in" to promote Quiet → Active on the next tick.
     let mut last_user_presence: Option<bool> = None;
-    // Per-command scheduler for Active mode. Persists across ticks
-    // so per-poll cadences stay stable. Initialized so the first
-    // Active tick fires drive + climate + tires immediately (for a
-    // fresh start-of-drive snapshot), with charge deferred 30s so
-    // it doesn't stack with climate.
+    // Per-command Active-mode scheduler; persists across ticks. First
+    // tick fires drive + climate + tires immediately, charge +30s.
     let mut schedule = Schedule::new(Instant::now());
-    // Last time we did a parked-awake state refresh (climate +
-    // charge while in Quiet mode but the car is recording dashcam
-    // clips). Lets battery/temps stay reasonably fresh during
-    // Sentry sessions and charging without dropping the radio-lock
-    // dance the deep-sleep Quiet path relies on.
+    // Last parked-awake refresh (climate + charge while Quiet but
+    // recording), keeping battery/temps fresh during Sentry/charging.
     let mut last_parked_awake_refresh: Option<Instant> = None;
-    // Separate (much rarer) timer for TPMS — TPMS readings don't
-    // change while parked, so we poll them every 30 min in Quiet
-    // rather than every 3 min like climate/charge. Bundled into
-    // the same tick's Sample row when both timers happen to fire
-    // together.
+    // Separate, rarer TPMS timer (30 min) — TPMS doesn't change while
+    // parked. Bundled into the same Sample row when both fire together.
     let mut last_parked_awake_tpms_refresh: Option<Instant> = None;
-    // Long-lived BLE session for state queries. Lazy-spawned in
-    // tick() on the first state-poll cycle after BLE telemetry is
-    // enabled; reused for the rest of the process's lifetime so we
-    // avoid re-scanning + re-handshaking on every cycle. Dropped
-    // and recreated if VIN changes mid-run.
+    // Long-lived BLE session, lazy-spawned in tick() and reused to avoid
+    // re-scan + re-handshake each cycle. Recreated if the VIN changes.
     let mut ble_session: Option<sample_ble::SessionHandle> = None;
-    // Last-known charging_state from a successful `state charge` poll.
-    // Drives the quiet-mode gate: while the car is actively charging
-    // (Starting / Charging / Calibrating), the car is keeping itself
-    // awake, so quiet-mode body-controller polling would just leave
-    // battery_pct stale. `None` = we've never had a successful charge
-    // poll → conservative default: treat as actively-charging so we
-    // stay Active until we have proof otherwise.
+    // Last charging_state from a successful `state charge` poll. Drives
+    // the quiet-mode gate: active charging keeps the car awake, so
+    // quieting would leave battery_pct stale. `None` → assume charging
+    // (stay Active until proven otherwise).
     let mut last_charging_state: Option<sample::ChargingState> = None;
-    // Same idea for sentry mode — read from `state closures`. Any
-    // non-Off value means the car is awake for sentry purposes;
-    // dropping to quiet would freeze the live-data panel during an
-    // active session. `None` → treat as on for the conservative
-    // default.
+    // Same gate for sentry mode (from `state closures`): any non-Off
+    // value keeps the car awake. `None` → assume on.
     let mut last_sentry_mode: Option<sample::SentryMode> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
@@ -404,22 +318,9 @@ async fn main() -> Result<()> {
             _ = sigusr1.recv() => {
                 info!("SIGUSR1 received — forcing a full state poll on next tick (all sub-samplers due immediately)");
                 let now = Instant::now();
-                // Build a fresh schedule, then override every next_*
-                // field so ALL sub-samplers fire on the very next
-                // tick — no CHARGE_INITIAL_OFFSET, no FAST_RETRY
-                // gating, no per-type pacing. The user explicitly
-                // asked for a fresh full read; honor that by polling
-                // drive + climate + charge + closures + tires all
-                // in one cycle.
-                //
-                // (Schedule::new normally staggers `next_charge` by
-                // CHARGE_INITIAL_OFFSET = 30s to avoid hammering the
-                // car with everything at once on a fresh daemon
-                // startup. That's the right call for startup but the
-                // wrong call here — when the user clicks "Poll now"
-                // and waits 8s to see results, a 30s charge delay
-                // would leave the battery field stale and look
-                // broken even though everything else updated.)
+                // Force every sub-sampler due now — no charge stagger, no
+                // fast-retry gating. "Poll now" should return a full fresh
+                // read in one cycle, not a battery field stale by 30s.
                 schedule = Schedule::new(now);
                 schedule.next_drive = now;
                 schedule.next_climate = now;
@@ -428,22 +329,15 @@ async fn main() -> Result<()> {
                 schedule.next_tires = now;
                 last_parked_awake_refresh = None;
                 last_parked_awake_tpms_refresh = None;
-                // Reset parked_polls so the phase machine flips to
-                // Active even if we'd been in parked-confirmed
-                // Quiet — otherwise the force-poll would only fire
-                // a body_controller call. The next Park observation
-                // will tick the counter back up.
+                // Reset parked_polls so the phase flips to Active even
+                // from parked-confirmed Quiet (else we'd only fire a
+                // body_controller call). Next Park observation re-ticks it.
                 parked_polls = 0;
-                // Loop continues immediately — next tick runs at
-                // the top of the loop without sleeping.
             }
             Some(req) = action_rx.recv() => {
-                // IPC: an external process (e.g. sentryusb-ble-action
-                // from run/awake_start) wants us to do a one-shot BLE
-                // action through our existing PersistentSession.
-                // Serializes naturally with the rest of the select —
-                // any in-flight tick completes first, then we handle
-                // this, then the next tick fires.
+                // IPC: an external process (sentryusb-ble-action) wants a
+                // one-shot action through our PersistentSession. Serializes
+                // naturally with the select.
                 handle_action_request(
                     req,
                     &mut held_radio,
@@ -468,28 +362,18 @@ async fn main() -> Result<()> {
     }
 }
 
-/// One iteration of the main loop. Returns the duration to sleep
-/// before the next iteration.
+/// One main-loop iteration; returns how long to sleep before the next.
 ///
 /// Two phases, decided each tick:
+///   * **Active** — clip writes happening and shift_state not
+///     confirmed-Park. Full `state` polls, radio held continuously.
+///   * **Quiet** — car asleep OR Park for PARK_CONFIRMATIONS_BEFORE_QUIET
+///     polls. Sleep-safe body-controller-state polls; radio released
+///     between deep-asleep polls (for iOS GATT) but held during
+///     parked-with-Sentry (cadence too fast to cycle GATT).
 ///
-///   * **Active** — clip writes are happening AND shift_state isn't
-///     confirmed-Park. Full `state` polls every AWAKE_INTERVAL, radio
-///     held continuously. Each successful poll updates `parked_polls`
-///     based on the observed shift.
-///   * **Quiet** — either no clip writes (car asleep) OR shift_state
-///     has been Park for `PARK_CONFIRMATIONS_BEFORE_QUIET` polls
-///     (car parked-with-Sentry-recording). Body-controller-state
-///     polls every QUIET_INTERVAL — sleep-safe, doesn't pin the car
-///     awake. Radio is released between deep-asleep polls (so iOS
-///     GATT can run) but held while in parked-with-Sentry (poll
-///     cadence is too fast to cycle the GATT daemon cleanly).
-///
-/// Transitions:
-///   * Active → Quiet: parked_polls reaches the confirmation count.
-///   * Quiet → Active: body-controller user_presence flips
-///     NOT_PRESENT → PRESENT (driver got back in). The next tick
-///     immediately does a state poll.
+/// Active → Quiet when parked_polls hits the count; Quiet → Active when
+/// user_presence flips NOT_PRESENT → PRESENT.
 async fn tick(
     conn: &Connection,
     held_radio: &mut bool,
@@ -510,11 +394,9 @@ async fn tick(
         }
     };
 
-    // Lazy-spawn (or recreate-on-VIN-change) the persistent BLE
-    // session. Cheap when the session already exists — just a VIN
-    // string compare. The first call does the heavy lifting (key
-    // load + scan + GATT connect + handshake) inside the first
-    // sample_*_ble call below.
+    // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
+    // Cheap when it exists (a VIN compare); the first call does the
+    // key-load + scan + connect + handshake.
     if let Err(e) = sample_ble::ensure_session_for(ble_session, &cfg.vin, Some(&cfg.adapter)) {
         warn!("could not start PersistentSession (will retry next tick): {e:#}");
         return Duration::from_secs(5);
@@ -549,37 +431,26 @@ async fn tick(
     let car_truly_asleep = observation == CarState::Asleep;
     let parked_confirmed = *parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET;
 
-    // Conservative defaults: if we've never had a successful charge or
-    // closures poll, treat the car as actively-charging / sentry-on so
-    // the gate keeps us in Active mode. Pro: never wrongly quiets down
-    // during a charge session we haven't observed yet. Con: cold-start
-    // does a brief Active burst (~30-60s) before the first charge +
-    // closures polls land and confirm the car can actually sleep,
-    // which may wake the car once per daemon restart.
+    // Conservative defaults: with no successful charge/closures poll yet,
+    // assume charging / sentry-on to stay Active. Costs a brief Active
+    // burst (~30-60s) at cold start before the first polls confirm the
+    // car can sleep.
     let actively_charging = last_charging_state
         .map(|s| s.is_active_charging())
         .unwrap_or(true);
     let sentry_on = last_sentry_mode.map(|s| s.is_on()).unwrap_or(true);
 
-    // Two paths to quiet-mode polling:
-    //   * car_truly_asleep — no clip writes for the AWAKE_WITHIN window.
-    //     Body-controller is the only sleep-safe option here.
-    //   * parked_confirmed — shift_state=Park for 3+ consecutive polls.
-    //     The car COULD sleep, but only if nothing else is keeping
-    //     it awake.
-    // Either path requires that the car isn't actively pulling power
-    // for a charge or running sentry monitoring — both keep the car
-    // awake on their own, and quiet-mode polling would just leave
-    // battery_pct / sentry_mode_state stale on the dashboard.
+    // Two paths to quiet mode: car_truly_asleep (no recent clip writes)
+    // or parked_confirmed (Park 3+ polls). Both also require the car
+    // isn't charging or running sentry — those keep it awake, and
+    // quieting would leave battery_pct / sentry_mode_state stale.
     let want_quiet = car_truly_asleep || parked_confirmed;
     let in_quiet_mode = want_quiet && !actively_charging && !sentry_on;
 
     if in_quiet_mode {
-        // Sleep-safe path. Acquire the radio for the brief BC call,
-        // then release if the car is truly asleep (so iOS GATT comes
-        // back). When in parked-confirmed (Sentry recording), keep
-        // the radio held — 1-min poll cadence means cycling GATT
-        // would burn ~10% of the time in stop/start churn.
+        // Sleep-safe path: acquire the radio for the brief BC call, then
+        // release if truly asleep (so iOS GATT returns). Keep it held in
+        // parked-confirmed — cycling GATT at the poll cadence is wasteful.
         let acquired = if *held_radio {
             true
         } else {
@@ -590,12 +461,10 @@ async fn tick(
                     true
                 }
                 Ok(false) => {
-                    // Bumped to info — this is one of the main
-                    // reasons quiet-mode samples go missing (archiveloop's
-                    // keep_awake holds the radio during archive cycles).
-                    // Surfacing it in the diagnostics panel lets the
-                    // user tell "sampler is broken" from "sampler is
-                    // politely waiting its turn".
+                    // info-level: a held radio (e.g. archiveloop's
+                    // keep_awake during archive cycles) is a common reason
+                    // quiet samples go missing — surface it as "waiting",
+                    // not "broken".
                     info!(
                         "radio held by {:?} during quiet poll, skipping",
                         lock::current_owner()
@@ -624,11 +493,9 @@ async fn tick(
                 }
             };
 
-            // Driver-got-back-in detection: user_presence flipped
-            // from NOT_PRESENT to PRESENT (was outside the car,
-            // now inside). Promote to Active immediately — the
-            // short returned Duration triggers a state poll on the
-            // next tick instead of waiting another full QUIET_INTERVAL.
+            // Driver-got-back-in: user_presence NOT_PRESENT → PRESENT.
+            // Promote to Active immediately (short Duration → state poll
+            // next tick instead of a full QUIET_INTERVAL).
             if *last_user_presence == Some(false) && presence_now == Some(true) {
                 info!("user_presence flipped PRESENT — resuming full state polls");
                 *parked_polls = 0;
@@ -763,15 +630,9 @@ async fn tick(
                             }
                             Err(e) => warn!("parked-awake closures refresh failed: {e}"),
                         }
-                        // (Location not refreshed here: the dedicated
-                        // location poll was a dead end — Tesla only
-                        // returns location_name in `state drive`
-                        // responses, not standalone `state location`.
-                        // Parked-awake mode doesn't call drive
-                        // either, so the address stays at whatever
-                        // the last drive poll captured. That's
-                        // fine for the parked case — by definition
-                        // we're not moving.)
+                        // Location not refreshed: Tesla only returns
+                        // location_name in `state drive`, which Quiet
+                        // doesn't call. Fine — parked means not moving.
                         *last_parked_awake_refresh = Some(Instant::now());
                     }
 
@@ -809,13 +670,9 @@ async fn tick(
         }
         QUIET_INTERVAL
     } else {
-        // Active mode — scheduler-driven multi-poll. Each tick
-        // composes one or more sub-samplers to run sequentially
-        // based on what's overdue. `state drive` always runs first
-        // when due (it carries shiftState + location + odometer —
-        // the freshest-required signals); climate/charge/tires
-        // run on slower per-command cadences and only inserted
-        // after drive has had its turn.
+        // Active mode — scheduler-driven multi-poll. Each tick runs the
+        // overdue sub-samplers in priority order, `state drive` first
+        // (shiftState + location + odometer); the rest on slower cadences.
         if !*held_radio {
             match lock::try_acquire(OWNER) {
                 Ok(true) => {
@@ -838,20 +695,16 @@ async fn tick(
         }
 
         let tick_now = Instant::now();
-        // Detect "first tick after a long Quiet period" — the
-        // schedule's next_drive will be very stale (Quiet doesn't
-        // call mark_drive). Reset the schedule so climate/charge
-        // get their 30s stagger back, and so all four sub-samplers
-        // fire on this first tick for a fresh snapshot.
+        // First tick after a long Quiet period: next_drive is very stale
+        // (Quiet never calls mark_drive). Reset so the stagger returns
+        // and all sub-samplers fire now for a fresh snapshot.
         if tick_now.duration_since(schedule.next_drive)
             > Duration::from_secs(2 * DRIVE_INTERVAL.as_secs())
         {
             *schedule = Schedule::new(tick_now);
         }
-        // Single Sample built up across whatever sub-samplers ran
-        // this tick. Fields stay None for any sub-sampler that
-        // didn't run or that failed — the schema and the
-        // aggregator both handle per-field NULLs gracefully.
+        // One Sample built across the sub-samplers that ran this tick;
+        // unran/failed fields stay None (schema + aggregator handle NULLs).
         let mut sample = Sample {
             ts: sample::now_secs(),
             source: "state".into(),
@@ -860,9 +713,7 @@ async fn tick(
         let mut shift_state_observed: Option<sample::ShiftState> = None;
         let mut any_call_ran = false;
 
-        // ── 1. DRIVE (priority — runs first when due) ──
-        // Carries: shiftState (drive detection), locationName,
-        // odometer. The "must stay fresh" signals.
+        // ── 1. DRIVE (priority) ── shiftState, locationName, odometer.
         if schedule.drive_due(tick_now) {
             let success = match sample_ble::sample_drive_ble(session).await {
                 Ok(d) => {
@@ -908,10 +759,9 @@ async fn tick(
                 Ok(c) => {
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
-                    // Refresh the gate input. Successful poll → last
-                    // known value advances; failure → keep previous
-                    // (don't downgrade to None and force a conservative
-                    // Active burst on a single transient failure).
+                    // Refresh the gate input on success; keep the previous
+                    // value on failure (don't force an Active burst on one
+                    // transient miss).
                     if let Some(cs) = c.charging_state {
                         *last_charging_state = Some(cs);
                     }
@@ -926,11 +776,9 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 4. CLOSURES (every 60s) ──
-        // Only field we consume is sentry_mode — fed into the
-        // quiet-mode gate. Door / window / charge-port state is
-        // available from the same response and could be surfaced
-        // in the UI later without an additional BLE call.
+        // ── 4. CLOSURES (every 60s) ── consumed only for sentry_mode
+        // (the quiet-mode gate); door/window/port state is in the same
+        // response if the UI ever needs it.
         if schedule.closures_due(tick_now) {
             let success = match sample_ble::sample_closures_ble(session).await {
                 Ok(c) => {
@@ -975,11 +823,9 @@ async fn tick(
             Some(s) if s.is_park() => {
                 *parked_polls = parked_polls.saturating_add(1);
                 if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
-                    // Whether we actually drop to quiet on the next
-                    // tick depends on the new charging/sentry gate.
-                    // Log both the threshold-hit AND the gate outcome
-                    // so journalctl tells the operator why polling
-                    // did or didn't slow down.
+                    // Whether we drop to Quiet next tick depends on the
+                    // charging/sentry gate — log the outcome so the
+                    // journal shows why polling did/didn't slow down.
                     if actively_charging || sentry_on {
                         info!(
                             "{} consecutive Park observations — but staying Active \
@@ -998,9 +844,8 @@ async fn tick(
                 }
             }
             Some(sample::ShiftState::Unknown) => {
-                // SDK returned an unrecognized shift code — leave
-                // counter alone (better to stay Active than drop to
-                // Quiet on a parsing miss).
+                // Unrecognized shift code — leave the counter alone
+                // (stay Active rather than quiet on a parse miss).
             }
             Some(_) => {
                 // Drive / Reverse / Neutral — actively moving,
@@ -1013,47 +858,33 @@ async fn tick(
             }
         }
 
-        // Clear stale user_presence — next time we drop to Quiet,
-        // we want a fresh baseline before triggering the "got back
-        // in" transition.
+        // Clear user_presence so the next Quiet entry starts from a
+        // fresh baseline before the "got back in" check.
         *last_user_presence = None;
 
-        // Persist whatever this tick collected. Even a single
-        // drive-only poll lands a row with location/odometer
-        // populated — the live-output panel and aggregator both
-        // handle the sparse-row case.
+        // Persist whatever this tick collected; sparse rows (e.g.
+        // drive-only) are handled downstream.
         if any_call_ran {
             persist(conn, sample);
         }
 
-        // Sleep until the next scheduled sub-sampler is due. Drive
-        // is normally the soonest (15s), but if a slow call this
-        // tick blew through the budget, we'll wake up sooner.
+        // Sleep until the next sub-sampler is due (usually drive, 15s).
         let next = schedule.next_due();
         let after = Instant::now();
         if next > after {
             next.duration_since(after)
         } else {
-            // Already overdue — next tick immediately (cheap, the
-            // tick itself enforces the actual cadence).
+            // Already overdue — tick again immediately.
             Duration::from_millis(100)
         }
     }
 }
 
-/// Block until the system clock looks plausibly correct, or `timeout`
-/// elapses. "Plausible" = year >= 2025 (anything later than the time
-/// this code was written) OR systemd-timesyncd has set its
-/// "synchronized" marker file. Either condition is sufficient — RTC
-/// users will satisfy the first check immediately on boot.
-///
-/// Why this matters: without an RTC battery, the Pi's clock can be
-/// years off after a cold boot until WiFi reaches an NTP server.
-/// Samples written with bad timestamps are unrecoverable — they fall
-/// outside any real drive window when the aggregator runs later.
-/// So we just don't sample until the clock is sane. Best-effort:
-/// times out after 5 min so we don't block forever in pathological
-/// no-WiFi setups.
+/// Block until the clock looks correct (year >= 2025 or timesyncd's
+/// synced marker), or `timeout` elapses. Without an RTC battery the Pi
+/// boots with a years-off clock until NTP catches up, and samples with
+/// bad timestamps fall outside any drive window and are unrecoverable —
+/// so don't sample until the clock is sane.
 async fn wait_for_clock_sync(timeout: Duration) {
     if clock_is_sane() {
         debug!("clock looks sane on startup; no wait needed");
@@ -1136,52 +967,24 @@ fn persist(conn: &Connection, sample: Sample) {
     }
 }
 
-/// No-op kept for call-site stability while we transition away
-/// from "telemetry exclusively owns hci0".
+/// No-op, kept for call-site stability.
 ///
-/// History: this function used to `systemctl stop sentryusb-ble`
-/// before every Active-mode poll cycle, claiming exclusive hci0
-/// access for our central-role traffic. Then release_radio() would
-/// `systemctl start sentryusb-ble` to hand it back. In Active +
-/// Quiet alternation the cycle is ~30-60s, so sentryusb-ble was
-/// being stopped and started every 30-60s for hours — and the
-/// iOS SentryUSB app saw the GATT server vanish + come back every
-/// time.
-///
-/// The reasoning was defensive. In practice, BLE since 4.0 supports
-/// LE multi-role: one HCI controller can simultaneously act as a
-/// central (us connecting to Tesla) AND a peripheral (sentryusb-ble
-/// advertising for the iOS app), AND host multiple concurrent LE
-/// connections. All the chips we ship on (BCM4345C0, Realtek
-/// RTL8761B/BU, CSR8510) support this. bluez also supports multiple
-/// D-Bus clients fine.
-///
-/// So they should just coexist. This function is now a no-op; the
-/// radio LOCK (between our Rust processes — telemetry, ble-action,
-/// pair) still coordinates serial access where it matters, but
-/// sentryusb-ble runs continuously and the iOS app stays connected.
-///
-/// Pair flow (crates/api/src/system.rs) still stops sentryusb-ble
-/// briefly during pairing — that path uses tesla-control which DOES
-/// want exclusive bluez access for the add-key-request handshake.
-/// That's narrow and time-bounded, not continuous like Active mode.
+/// This used to `systemctl stop sentryusb-ble` before each Active poll
+/// to claim exclusive hci0, cycling the iOS GATT server every 30-60s.
+/// Unnecessary: BLE LE multi-role lets one controller act as central
+/// (us → Tesla) and peripheral (sentryusb-ble → iOS app) at once, and
+/// all shipped chips support it. The inter-process radio lock still
+/// serializes our Rust processes; sentryusb-ble now runs continuously.
+/// (The pair flow in api/system.rs still stops it briefly — tesla-control
+/// wants exclusive bluez access for the add-key handshake.)
 async fn stop_ios_gatt() {
-    debug!(
-        "stop_ios_gatt: no-op (sentryusb-ble + telemetry coexist via BLE multi-role; \
-         see fn doc for history)"
-    );
+    debug!("stop_ios_gatt: no-op (sentryusb-ble + telemetry coexist via BLE multi-role)");
 }
 
-/// Service one IPC action request from `sentryusb-ble-action`. Does
-/// the same radio + iOS-daemon prep as a normal Active-mode tick:
-/// acquires the BLE radio lock if we don't already hold it, stops
-/// the iOS GATT daemon for exclusive hci0, then dispatches the
-/// action through the long-lived PersistentSession.
-///
-/// We deliberately do NOT release the radio after a successful
-/// action — the very next tick will probably want it anyway, and
-/// thrashing the iOS daemon down/up on every keep-awake nudge
-/// would defeat the whole point of routing this through us.
+/// Service one IPC action request from `sentryusb-ble-action`: acquire
+/// the radio lock if needed, then dispatch through the PersistentSession.
+/// Doesn't release the radio afterward — the next tick likely wants it,
+/// and thrashing would defeat the point of routing actions through us.
 async fn handle_action_request(
     req: action_socket::ActionRequest,
     held_radio: &mut bool,
@@ -1190,10 +993,8 @@ async fn handle_action_request(
     let verb = req.verb.clone();
     info!("action_socket: IPC request received — verb={}", verb);
 
-    // Load config: respects the same enable/VIN gate as the rest of
-    // the daemon. If BLE is off in settings, refuse the action so
-    // ble-action can fall back (or just propagate the error to
-    // awake_start, which probably shouldn't have called us anyway).
+    // Same enable/VIN gate as the rest of the daemon — refuse the action
+    // if BLE is off so ble-action can fall back.
     let cfg = match crate::config::BleConfig::load() {
         Ok(c) => c,
         Err(e) => {
@@ -1239,12 +1040,8 @@ async fn handle_action_request(
         return;
     }
 
-    // Acquire the radio + stop iOS GATT if not already held. Same
-    // logic the Active-mode tick uses; copy-pasted here rather
-    // than refactored out because the surrounding context (which
-    // failure cases are recoverable, when to return early) is
-    // different enough that a shared helper would obscure more
-    // than it would deduplicate.
+    // Acquire the radio if not already held (same as the Active tick;
+    // not shared because the early-return handling differs).
     if !*held_radio {
         match lock::try_acquire(OWNER) {
             Ok(true) => {
@@ -1290,37 +1087,13 @@ async fn handle_action_request(
     let _ = req.reply.send(result.map(|_| ()));
 }
 
-/// Restart the iOS GATT daemon and clear our radio-lock entry.
-/// Called on radio release transitions and SIGTERM.
-///
-/// Ordering matters here: the lock file release happens FIRST and
-/// synchronously, because that's the bit other processes
-/// (keep_awake, archiveloop) need before they can take the radio.
-/// The systemctl-start shell-out happens second under a tight
-/// 5-second cap — systemctl can occasionally block much longer
-/// (dependency resolution, bluez settling, etc.), and on the
-/// SIGTERM path we'd rather skip the iOS-daemon restart than risk
-/// systemd SIGKILL'ing us mid-shutdown. The next sampler instance's
-/// own teardown logic (or systemd's restart policy) will eventually
-/// bring sentryusb-ble back up either way.
+/// Release our radio-lock entry. Called on radio-release transitions
+/// and SIGTERM.
 async fn release_radio() {
-    // Just release the lock — that's the synchronization
-    // semantic between OUR Rust processes (telemetry, ble-action,
-    // pair). sentryusb-ble doesn't check this lock and isn't
-    // affected by it.
-    //
-    // We used to ALSO `systemctl start sentryusb-ble` here to undo
-    // the corresponding stop in stop_ios_gatt(). Now that
-    // stop_ios_gatt() is a no-op (sentryusb-ble runs continuously
-    // and coexists via BLE multi-role), there's nothing to start —
-    // the iOS daemon is already running.
-    //
-    // Bonus: the previous `systemctl start` had a 5s timeout that
-    // routinely fired ("systemctl start sentryusb-ble didn't
-    // complete within 5s — skipping") because sentryusb-ble.service
-    // has an ExecStartPre that waits up to 30s for org.bluez to
-    // settle. Removing the call entirely eliminates that whole
-    // warning class.
+    // Just release the lock — the sync semantic between our Rust
+    // processes (telemetry, ble-action, pair). sentryusb-ble doesn't
+    // check it, and there's nothing to restart now that stop_ios_gatt
+    // is a no-op and sentryusb-ble runs continuously.
     if let Err(e) = lock::release(OWNER) {
         warn!("failed to release radio lock: {e}");
     }

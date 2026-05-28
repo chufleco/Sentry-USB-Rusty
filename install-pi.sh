@@ -221,13 +221,12 @@ ok "sentryusb.service installed and enabled"
 
 info "Installing SentryUSB BLE daemon..."
 BLE_REPO_URL="https://raw.githubusercontent.com/${REPO}/main/server/ble"
-# Install at /root/bin/ — this matches both the vendored service unit's
-# hardcoded ExecStart path AND what pi-gen 00-run.sh installs, so the same
-# binary is reachable whether the user came in via image-flash or
-# install-pi.sh. Previously we installed to /opt/sentryusb/ble/ and
-# post-patched the service unit with sed — which could silently fail on
-# older sed or SELinux-restricted systems, leaving the service pointing at
-# a path with no file. The only safe thing is to not transform.
+# Install at /root/bin/ — matches both the vendored service unit's
+# hardcoded ExecStart path AND what pi-gen 00-run.sh installs, so the
+# binary is reachable whether the user came via image-flash or
+# install-pi.sh. Don't install elsewhere + sed-patch the unit: that can
+# silently fail on older sed / SELinux, leaving the service pointing at
+# a missing path.
 BLE_INSTALL_PATH="/root/bin/sentryusb-ble.py"
 mkdir -p /root/bin
 

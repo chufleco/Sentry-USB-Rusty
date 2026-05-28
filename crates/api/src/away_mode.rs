@@ -1,11 +1,11 @@
 //! Away Mode: WiFi AP control with timed expiration.
 //!
-//! Mirrors `server/api/awaymode.go`. Key behaviors restored:
+//! Away Mode API. Key behaviors:
 //!  - RTC detection at startup (Pi 5 has /dev/rtc0); response includes `has_rtc`.
 //!  - Persistent 30s countdown so Pis without an RTC recover accurately across
 //!    reboots via `remaining_sec` in the flag file.
 //!  - RestoreFromFile: on startup, resume the active session if time remains.
-//!  - Response shape matches Go: {state, has_rtc, ap_ssid, ap_ip, expires_at,
+//!  - Response shape: {state, has_rtc, ap_ssid, ap_ip, expires_at,
 //!    enabled_at, remaining_sec}.
 //!  - AP connection profile name is `SENTRYUSB_AP` (Go's convention).
 

@@ -1,11 +1,7 @@
-// Push 6a cut the sampler over to `sample_ble.rs` (in-process Rust
-// via PersistentSession). The shell-out functions in this module are
-// no longer called — they stay only because Result types
-// (DriveResult / ClimateResult / ChargeResult / TiresResult / Sample)
-// are still re-used by the new path, and ripping the file out before
-// Push 6c would force a bigger atomic change. `#[allow(dead_code)]`
-// silences the "never used" warnings on the helpers that aren't
-// re-exported.
+// The shell-out sampling functions here are superseded by the in-process
+// path in `sample_ble.rs` and are no longer called; this module is kept
+// only for the shared result types (DriveResult, ClimateResult, Sample,
+// etc.) that sample_ble.rs reuses.
 #![allow(dead_code)]
 
 //! Shells out to `tesla-control` and parses the JSON output into
@@ -33,40 +29,25 @@ use tracing::{info, warn};
 
 const TESLA_CONTROL: &str = "/root/bin/tesla-control";
 const KEY_FILE: &str = "/root/.ble/key_private.pem";
-/// Persistent session cache. The vehicle-command library saves the
-/// BLE handshake state here after a successful connect; subsequent
-/// invocations skip the handshake round-trip and connect ~1-5s
-/// faster. Per the upstream docs, a stale cache is auto-detected
-/// and re-handshaken with zero penalty — pure upside.
-///
-/// Lives on `/backingfiles/` (the writable data partition) because
-/// `/root` is normally mounted read-only on the Pi image. Same
-/// partition as the SQLite DB, so writes are cheap.
+/// Persistent session cache: tesla-control saves BLE handshake state
+/// here so later invocations skip the handshake (~1-5s faster); a stale
+/// cache is auto-detected and re-handshaken. On `/backingfiles/` because
+/// `/root` is read-only on the Pi image.
 const SESSION_CACHE: &str = "/backingfiles/tesla-session-cache.json";
-/// Outer wall-clock budget for a single tesla-control invocation.
-/// Sized to comfortably cover the inner `-connect-timeout 40s` +
-/// `-command-timeout 10s` budget we pass to tesla-control plus a
-/// small buffer for SDK retry rounds. Was 20s, which false-failed
-/// slow-but-real responses (charge calls regularly take 14+s when
-/// the BLE link is congested).
+/// Outer wall-clock budget for one tesla-control invocation, covering
+/// its inner connect (40s) + command (10s) budgets plus SDK retries.
+/// Congested-link charge calls regularly take 14+s.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-/// Per-call BLE connect budget passed to tesla-control. Default is
-/// 20s, but the vehicle-command Go library has an internal retry
-/// loop that needs room to re-handshake when the car's BLE stack
-/// is busy. 40s lets it retry once or twice before giving up.
+/// Per-call BLE connect budget for tesla-control. 40s (vs the 20s
+/// default) gives its retry loop room to re-handshake on a busy link.
 const CONNECT_TIMEOUT: &str = "40s";
-/// Per-call BLE command budget once the connection is established.
-/// Default is 5s, which is too tight for the bigger payloads
-/// (climate, charge). 10s comfortably covers the longest payload
-/// we observed during testing.
+/// Per-call BLE command budget once connected. 10s (vs the 5s default)
+/// covers the bigger climate/charge payloads.
 const CMD_TIMEOUT: &str = "10s";
 
-/// Tesla shift state. Decoded from `state drive`'s `shiftState`
-/// field which is either a string ("P"/"R"/"N"/"D") or a protobuf
-/// int (P=1, R=2, N=3, D=4). The sampler's phase machine uses this
-/// to decide whether the car is parked-and-recording (drop to
-/// sleep-safe body-controller polling) vs actually being driven
-/// (full state polls every 15s).
+/// Tesla shift state from `state drive`'s `shiftState` (string
+/// "P"/"R"/"N"/"D" or protobuf int P=1..D=4). The phase machine uses it
+/// to pick parked-and-recording (sleep-safe polling) vs driving.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftState {
     Park,
@@ -85,14 +66,10 @@ impl ShiftState {
     }
 }
 
-/// Tesla `ChargeState.charging_state` (`CarServer.ChargeState.ChargingState`
-/// oneof). Mapped to a flat enum so the phase machine in `main.rs` can
-/// pattern-match without dragging in proto types.
-///
-/// Used by the quiet-mode gate: `Starting` / `Charging` / `Calibrating`
-/// mean the car is keeping itself awake for charging, so we stay in
-/// Active polling regardless of shift state. Everything else (including
-/// `Unknown` per design) is a candidate for the quiet path.
+/// Tesla `ChargeState.charging_state` oneof, flattened so the phase
+/// machine can match without proto types. Quiet-mode gate: Starting /
+/// Charging / Calibrating keep the car awake (stay Active); everything
+/// else (incl. Unknown) is a quiet-path candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChargingState {
     Unknown,
@@ -106,11 +83,9 @@ pub enum ChargingState {
 }
 
 impl ChargingState {
-    /// "Actively pulling power (or about to)" — the three states that
-    /// keep the car awake on its own. Sampler stays in Active mode
-    /// while this is true, even when shift_state has been Park for a
-    /// while; quiet mode would just leave battery % stale during a
-    /// charge session.
+    /// The three states that keep the car awake on its own; the sampler
+    /// stays Active while true even if shift_state is Park (quieting
+    /// would leave battery % stale mid-charge).
     pub fn is_active_charging(self) -> bool {
         matches!(
             self,

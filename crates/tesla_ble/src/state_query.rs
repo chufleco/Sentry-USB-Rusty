@@ -1,5 +1,5 @@
-//! Push 3a: hand-built `car_server.Action` inner payloads for state
-//! queries (climate, charge, drive, location, etc.).
+//! Hand-built `car_server.Action` inner payloads for state queries
+//! (climate, charge, drive, location, etc.).
 //!
 //! tesla-control sends these as Infotainment-domain signed commands.
 //! The proto structure is just three nested length-delimited message

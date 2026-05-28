@@ -208,7 +208,7 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
 
     // ── Core files ────────────────────────────────────────────────────────
     //
-    // Matches Go `checkCoreFiles` (server/api/healthcheck.go:74-109). Scripts
+    // Core-file presence check. Scripts
     // marked `exec` must be executable; missing-or-not-executable is a fail/warn
     // because archiveloop invokes these by path.
     let mut core = Vec::new();
@@ -247,7 +247,7 @@ pub async fn health_check(State(_s): State<AppState>) -> (StatusCode, Json<serde
 
     // ── Configuration ─────────────────────────────────────────────────────
     //
-    // Matches Go `checkConfig` (healthcheck.go:112-162): config file presence,
+    // Config check: config file presence,
     // setup-finished marker, fstab entries for backingfiles/mutable/cam_disk.
     let mut cfg = Vec::new();
     let config_path = sentryusb_config::find_config_path();

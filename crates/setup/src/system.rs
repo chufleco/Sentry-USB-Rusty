@@ -172,9 +172,9 @@ pub async fn configure_ssh(emitter: &SetupEmitter) -> Result<bool> {
     Ok(true)
 }
 
-/// Configure Samba shares if enabled. Port of `configure-samba.sh`.
+/// Configure Samba shares if enabled.
 ///
-/// Critical bits the first port missed:
+/// Critical bits:
 ///   * tmpfs entries for /var/run/samba + /var/cache/samba (without them
 ///     smbd can't write PID/cache on a read-only root).
 ///   * /var/lib/samba → /mutable/varlib/samba symlink (so bond databases
@@ -351,10 +351,8 @@ fn sed_delete_line_matching<F: Fn(&str) -> bool>(path: &str, pred: F) -> Result<
     Ok(())
 }
 
-/// Install the archive loop systemd service.
-///
-/// Uses the bash archiveloop script for now. This will be ported to a Rust
-/// subcommand in a future release.
+/// Install the archive loop systemd service (runs the bash archiveloop
+/// script).
 pub fn install_archive_service() -> Result<()> {
     let service = r#"[Unit]
 Description=SentryUSB archiveloop service
@@ -574,7 +572,7 @@ pub async fn configure_rtc(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     configure_rtc_ds3231(env, emitter).await
 }
 
-/// Pi 5 built-in RTC — port of `configure-rtc.sh`.
+/// Pi 5 built-in RTC.
 async fn configure_rtc_pi5(env: &SetupEnv, emitter: &SetupEmitter) -> Result<bool> {
     let config_path = match &env.piconfig_path {
         Some(p) => p.clone(),

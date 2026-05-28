@@ -1,5 +1,4 @@
-//! JSON import/export for `drive-data.json` — port of Go
-//! `server/drives/import.go` + `export.go`.
+//! JSON import/export for `drive-data.json`.
 //!
 //! * Import uses a streaming serde visitor that deserializes and inserts
 //!   one Route at a time, dropping it before the next is read. Peak Rust
@@ -24,7 +23,7 @@ use crate::types::{GearRun, GpsPoint, Route};
 
 /// Minimum existing-route count before the shrink guard applies. Below
 /// this, allow any import — tiny DBs don't need corruption protection
-/// because there's little to lose. Matches Go's import-side guard.
+/// because there's little to lose.
 const SYNCGUARD_MIN_ROUTES: usize = 1000;
 
 /// Minimum fraction of the existing route count that an import must

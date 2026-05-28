@@ -1,6 +1,6 @@
 //! Config backup and restore.
 //!
-//! Ported from `server/api/backup.go`. A backup is a JSON envelope containing
+//! A backup is a JSON envelope containing
 //! the `sentryusb.conf` contents plus the user preferences, SSH keys, rclone
 //! config, Tesla BLE pairing keys, and notification-device credentials — the
 //! stuff the user doesn't want to re-set up after an SD-card reflash. Change
@@ -24,7 +24,7 @@ const ARCHIVE_BACKUP_DIR: &str = "/mnt/archive/backups";
 const LAST_HASH_FILE: &str = "/mutable/backups/.last_hash";
 const BACKUP_VERSION: u32 = 1;
 
-// Paths matching Go's `createBackupData` (backup.go:72-99).
+// Paths included in a backup.
 //
 // The Rust wizard generates ed25519 keys (smaller, faster, modern) at
 // /root/.ssh/id_ed25519 — the Go-era code generated RSA at
@@ -151,7 +151,7 @@ async fn build_backup_data_async() -> Result<BackupData, String> {
 
 /// Hex SHA-256 of all backup-relevant data with time-varying fields excluded
 /// so the hash is stable across identical snapshots. Preferences are sorted
-/// by key so hashing order is deterministic. Mirrors Go `computeBackupHash`.
+/// by key so hashing order is deterministic.
 fn compute_backup_hash(data: &BackupData) -> String {
     use ring::digest::{Context, SHA256};
     let mut ctx = Context::new(&SHA256);
@@ -300,7 +300,7 @@ fn list_backups_in_dir(dir: &str, location: &str) -> Vec<BackupEntry> {
 
 #[derive(Deserialize, Default)]
 pub struct BackupQuery {
-    /// `force=1` skips hash-based change detection. Matches Go.
+    /// `force=1` skips hash-based change detection.
     #[serde(default)]
     pub force: Option<String>,
 }
@@ -394,7 +394,7 @@ pub async fn create_backup(
 /// GET /api/system/backups
 ///
 /// Merges local and archive listings, deduping by date (archive wins over
-/// local when both exist). Matches Go `listBackups`.
+/// local when both exist).
 pub async fn list_backups(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
     let mut all: Vec<BackupEntry> = Vec::new();
     all.extend(list_backups_in_dir(LOCAL_BACKUP_DIR, "ssd"));
@@ -478,7 +478,7 @@ fn write_with_mode(path: &str, contents: &str, _mode: u32) -> std::io::Result<()
 ///
 /// Body: the JSON envelope produced by `create_backup`. Writes all bundled
 /// credential files back to their standard locations with correct modes.
-/// Matches Go `restoreBackup` (backup.go:432-523).
+/// Restore a backup envelope into config + DB.
 pub async fn restore_backup(
     State(_s): State<AppState>,
     body: String,

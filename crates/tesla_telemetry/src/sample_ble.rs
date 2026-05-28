@@ -1,15 +1,10 @@
-//! Push 6a: in-process Tesla BLE sampler.
+//! In-process Tesla BLE sampler.
 //!
-//! Drop-in replacement for the shell-out paths in `sample.rs`. Same
-//! result types (DriveResult, ClimateResult, etc.) — only the
-//! transport changes. main.rs holds one `PersistentSession` for the
-//! sampler's lifetime and threads it through every call here, so a
-//! warm query lands in ~250-350 ms instead of the ~1.5-2 s the
-//! shell-out path takes (per-call scan + connect + handshake +
-//! tesla-control exec).
-//!
-//! The `body_controller` path stays unauthenticated (no SessionInfo
-//! required) and works against a sleeping car — same as before.
+//! Same result types as the shell-out paths in `sample.rs` (DriveResult,
+//! ClimateResult, etc.), but over a `PersistentSession` held by main.rs,
+//! so a warm query lands in ~250-350 ms vs the ~1.5-2 s shell-out path.
+//! The `body_controller` path stays unauthenticated and works against a
+//! sleeping car.
 
 use std::time::Instant;
 
@@ -89,24 +84,16 @@ fn map_sentry_mode(sm: &car_server::closures_state::SentryModeState) -> SentryMo
         Some(Type::Aware(_)) => SentryMode::Aware,
         Some(Type::Panic(_)) => SentryMode::Panic,
         Some(Type::Quiet(_)) => SentryMode::Quiet,
-        // Empty oneof — treat as Off, but callers should also be
-        // checking whether the parent field was even present (it's
-        // an optional sub-message). map_*_optional below handles both.
+        // Empty oneof — treat as Off; callers also check whether the
+        // parent optional sub-message was present.
         None => SentryMode::Off,
     }
 }
 
-/// `state drive` over BLE. Carries three signals:
-///   * shift_state (phase-machine input)
-///   * odometer (mile counter)
-///   * location_name (reverse-geocoded address)
-///
-/// All three live in Tesla's `state drive` response — odometer + shift
-/// in the DriveState sub-message, location_name in a bundled
-/// LocationState sub-message. Tesla returns location_name ONLY in
-/// drive responses (not in standalone `state location` queries which
-/// return raw GPS coords without the name), so this is the path
-/// that keeps the displayed address fresh.
+/// `state drive` over BLE: shift_state, odometer, and location_name.
+/// Tesla returns location_name only in drive responses (bundled
+/// LocationState), not in standalone `state location`, so this keeps
+/// the displayed address fresh.
 pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult> {
     let started = Instant::now();
     let (drive, location) = session.get_drive_with_location().await?;
@@ -120,10 +107,8 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
             let car_server::drive_state::OptionalOdometerInHundredthsOfAMile::OdometerInHundredthsOfAMile(h) = o;
             (*h as f64) / 100.0
         });
-    // Extract location_name from the bundled LocationState (Tesla
-    // includes this in every drive response when it has a fresh
-    // reverse-geocoded name to give us). May be None when the car
-    // is parked-and-unchanged — that's expected.
+    // location_name from the bundled LocationState; None when parked-
+    // and-unchanged, which is expected.
     let location_name = location.and_then(|l| {
         l.optional_location_name.as_ref().map(|v| {
             let car_server::location_state::OptionalLocationName::LocationName(n) = v;
@@ -214,12 +199,9 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
                 *n as f64
             })
         });
-    // charging_state is a non-optional sub-message; the inner oneof
-    // can still be empty (mapped to Unknown by map_charging_state).
-    // We hand the phase machine an Option so it can tell "field
-    // populated with Unknown" apart from "we never extracted one" —
-    // both currently behave identically (conservative: stay Active),
-    // but keeping the distinction makes future logic changes safer.
+    // Hand the phase machine an Option so "populated with Unknown" stays
+    // distinct from "never extracted", even though both currently behave
+    // the same (stay Active).
     let charging_state = charge.charging_state.as_ref().map(map_charging_state);
     let meta = build_meta(charge.timestamp.as_ref(), started);
 
@@ -230,32 +212,23 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     })
 }
 
-// sample_location_ble was removed: standalone `state location`
-// queries return GPS coords but NOT location_name (Tesla only
-// emits the reverse-geocoded name in the LocationState bundled
-// into `state drive` responses, confirmed via wire capture).
-// sample_drive_ble now extracts the address directly. Keeping this
-// note so the next person who thinks "I'll add a location poll"
-// doesn't repeat the dead-end. If we want GPS coords later,
-// session.get_location() still works — just don't expect a name.
+// No location sampler: standalone `state location` returns GPS coords
+// but not location_name (Tesla only emits the name in `state drive`),
+// so sample_drive_ble extracts the address instead. session.get_location()
+// still works for raw coords if needed.
 
-/// `state closures` over BLE. Only field we currently care about is
-/// `sentry_mode_state`, which the phase machine uses to decide
-/// whether dropping to quiet polling is safe. Doors / windows /
-/// charge-port states are available from the same response and could
-/// be surfaced in the UI in the future without an additional poll.
+/// `state closures` over BLE. Used only for `sentry_mode_state` (the
+/// quiet-mode gate); door/window/port state is in the same response if
+/// the UI ever needs it.
 pub async fn sample_closures_ble(session: &PersistentSession) -> Result<ClosuresResult> {
     let started = Instant::now();
     let closures = session.get_closures().await?;
     let elapsed = started.elapsed().as_millis();
     info!("state-poll: closures=ok({}ms) via in-process BLE", elapsed);
 
-    // Tesla only populates `sentry_mode_state` on cars that support
-    // sentry mode — older / fleet vehicles return the parent message
-    // without this sub-field. Treating "absent" as None (rather than
-    // Off) lets the phase machine's conservative default (stay
-    // Active until we have proof) handle both "feature unsupported"
-    // and "first poll hasn't landed yet" the same way.
+    // Absent on cars that don't support sentry mode; None (not Off) lets
+    // the conservative default handle "unsupported" and "no poll yet"
+    // alike.
     let sentry_mode = closures.sentry_mode_state.as_ref().map(map_sentry_mode);
     let meta = build_meta(closures.timestamp.as_ref(), started);
 
@@ -297,12 +270,10 @@ pub async fn sample_tires_ble(session: &PersistentSession) -> Result<TiresResult
     })
 }
 
-/// `body-controller-state` over BLE. Stays unauthenticated — works
-/// against a sleeping car without waking it. Now routed through the
-/// PersistentSession's held GATT connection instead of opening its
-/// own throwaway connection, which used to fight the persistent
-/// session for bluez and caused framing-desync errors + multi-second
-/// outliers on the body-controller poll itself.
+/// `body-controller-state` over BLE. Unauthenticated — works against a
+/// sleeping car without waking it. Routed through the PersistentSession's
+/// held connection so it doesn't fight for bluez (which caused
+/// framing-desync errors and multi-second outliers).
 pub async fn sample_body_controller_ble(
     session: &PersistentSession,
 ) -> Result<BodyControllerSample> {

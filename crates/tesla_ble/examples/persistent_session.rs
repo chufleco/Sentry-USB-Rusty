@@ -1,5 +1,5 @@
-//! Push 4 verification: run a persistent BLE session that holds the
-//! GATT connection across many state queries.
+//! Run a persistent BLE session that holds the GATT connection across
+//! many state queries.
 //!
 //! What this proves:
 //!   * First query incurs the scan + handshake cost (~1-3s).

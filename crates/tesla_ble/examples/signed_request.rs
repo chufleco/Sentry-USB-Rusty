@@ -1,5 +1,5 @@
-//! Phase 2 Push 2 verification: send a signed VCSEC InformationRequest
-//! and observe what the car returns.
+//! Send a signed VCSEC InformationRequest and observe what the car
+//! returns.
 //!
 //! What this proves:
 //!   * Our metadata TLV layout matches what the car reconstructs on

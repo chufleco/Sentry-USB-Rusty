@@ -1,11 +1,9 @@
-//! Push 5 verification: persistent session + typed response decoding.
+//! Persistent session + typed response decoding.
 //!
 //! Runs one round of climate / charge / drive / tire-pressure queries
-//! through the in-process Rust path and prints decoded field values.
-//! Proves the end-to-end chain works: scan → connect → handshake →
-//! signed query → encrypted response → decrypt → proto decode →
-//! typed fields. This is what the telemetry sampler will call in
-//! Push 6 instead of shelling out to tesla-control.
+//! through the in-process Rust path and prints decoded field values —
+//! exercises the full chain: scan → connect → handshake → signed query
+//! → encrypted response → decrypt → proto decode → typed fields.
 
 use std::path::PathBuf;
 

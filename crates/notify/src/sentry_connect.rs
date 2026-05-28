@@ -1,7 +1,7 @@
 //! Sentry Connect mobile app push notifications.
 //!
 //! The server lives at `https://notifications.sentry-six.com` — override
-//! via `SENTRY_NOTIFICATION_URL` (matches PR #31 on the Go side).
+//! via `SENTRY_NOTIFICATION_URL`.
 //!
 //! For archive_start notifications with an `ARCHIVE_TOTAL_COUNT`, the
 //! payload also carries a `live_activity` block so the iOS app can
@@ -43,8 +43,7 @@ pub struct SendContext<'a> {
 ///    path and every push hits `notifications.sentry-six.com` regardless
 ///    of what the conf says — which silently breaks third-party relays
 ///    (e.g. the Android SentryConnect app's Firebase Cloud Functions).
-///    Mirrors `notification_base_url()` in `api/src/notifications.rs`
-///    and Go's `configOrDefault` (`server/api/apiconfig.go`).
+///    Mirrors `notification_base_url()` in `api/src/notifications.rs`.
 /// 3. Hardcoded default `https://notifications.sentry-six.com`.
 fn default_push_server() -> String {
     if let Ok(v) = std::env::var("SENTRY_NOTIFICATION_URL") {

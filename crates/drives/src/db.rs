@@ -1,12 +1,9 @@
-//! Drive data store backed by SQLite — port of Go `server/drives/store.go`.
+//! Drive data store backed by SQLite.
 //!
-//! Public API matches the Go `Store` so `crates/api/src/drives_handler.rs`
-//! and `crates/drives/src/processor.rs` don't need behavioral changes.
-//!
-//! Thread-safety: SQLite with WAL handles its own internal locking, but
-//! we still keep a `Mutex<Connection>` to serialize writes on the Pi's
-//! single-writer setup. The atomic counters give readers a fast-path for
-//! `/api/drives/status` polling without taking the lock.
+//! Thread-safety: WAL handles SQLite's internal locking, but a
+//! `Mutex<Connection>` still serializes writes for the Pi's single-writer
+//! setup. Atomic counters give `/api/drives/status` polling a lock-free
+//! fast path.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -300,7 +297,7 @@ impl DriveStore {
     /// route for `file` already exists it is upserted in place.
     ///
     /// Computes aggregate columns inline so the summary endpoints can
-    /// serve BLOB-free rows — matches Go's `Store.AddRoute` semantics
+    /// serve BLOB-free rows
     /// exactly (single source of truth in `aggregate.rs`).
     #[allow(clippy::too_many_arguments)]
     pub fn add_route(
@@ -1787,7 +1784,7 @@ fn sync_to_path(src: &str, dst: &str, cache_path: &str) -> Result<()> {
 
 /// Convert backslashes to forward slashes so Windows-shaped paths
 /// collide with their POSIX equivalents in `processed_files` and
-/// `routes`. Matches Go's `normalizePath`.
+/// `routes`.
 pub fn normalize_path(p: &str) -> String {
     p.replace('\\', "/")
 }

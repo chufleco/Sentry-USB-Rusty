@@ -1,6 +1,6 @@
 //! Notification center: history and type settings.
 //!
-//! Mirrors `server/api/notification_center.go`:
+//! Notification center API:
 //! - History events carry id, unix-ts, type, title, message, providers,
 //!   per-provider results.
 //! - Newest-first ordering, max 500 entries.
@@ -260,7 +260,7 @@ pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
         "drives" => s.drives,
         "rtc_battery" => s.rtc_battery,
         "music_sync" => s.music_sync,
-        // Unknown types default to allowed — matches Go's fall-through.
+        // Unknown types default to allowed.
         _ => true,
     }
 }

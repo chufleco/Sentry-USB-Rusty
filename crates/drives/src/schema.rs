@@ -1,4 +1,4 @@
-//! SQLite schema + migrations — port of Go `server/drives/schema.go`.
+//! SQLite schema + migrations.
 //!
 //! Migration semantics must match Go so a DB written by the Go binary
 //! opens cleanly under Rust (and vice versa): same table shapes, same

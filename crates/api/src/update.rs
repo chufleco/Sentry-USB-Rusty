@@ -13,7 +13,7 @@ use crate::status::get_sbc_model;
 
 /// Cache file written by `check_for_update`, read by `get_update_status` so
 /// the Settings page can render last-check results on load without forcing
-/// a network round-trip. Path matches Go's `getUpdateStatus`.
+/// a network round-trip.
 const UPDATE_CHECK_CACHE: &str = "/tmp/sentryusb-update-check.json";
 
 static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -23,7 +23,6 @@ const TELEMETRY_SALT: &str = "SENTRYUSB_2026_PROD";
 
 /// SHA-256 hash of a stable hardware identifier + salt. Uses the SBC serial
 /// number (survives reflash) with fallback to machine-id. Cached.
-/// Mirrors Go `getFingerprint` (server/api/update.go:42-82).
 pub(crate) fn get_fingerprint() -> &'static str {
     static CACHED: OnceLock<String> = OnceLock::new();
     CACHED.get_or_init(|| {
@@ -615,7 +614,7 @@ pub async fn get_version(State(_s): State<AppState>) -> (StatusCode, Json<serde_
 }
 
 /// Parse semver string like "v1.2.3" or "v1.2.3-beta.1" → (major, minor, patch, prerelease).
-/// Matches Go `parseSemver` exactly so the two implementations agree on edge cases.
+/// Parses a semver tag, handling prerelease and edge cases.
 pub(crate) fn parse_semver(v: &str) -> Option<(u32, u32, u32, String)> {
     let v = v.trim().trim_start_matches('v');
     let (base, pre) = match v.find('-') {
@@ -695,8 +694,7 @@ pub async fn check_for_update(
     let can_update = !current.is_empty() && current != "dev";
 
     // Include prereleases if requested via query param OR if the user's
-    // update_channel preference is set to "prerelease". Mirrors Go's
-    // checkForUpdate (server/api/update.go:501-506).
+    // update_channel preference is set to "prerelease".
     let mut include_prerelease = params.get("include_prerelease").map(String::as_str) == Some("true");
     if !include_prerelease {
         let prefs = crate::preferences::load_prefs();
@@ -709,7 +707,7 @@ pub async fn check_for_update(
         Ok(rs) => rs,
         Err(msg) => {
             // Fire a basic telemetry heartbeat so the support server still sees
-            // the device when GitHub is unreachable, matching Go's defer block.
+            // the device when GitHub is unreachable.
             let cur_clone = current.clone();
             tokio::spawn(async move { send_telemetry(&cur_clone, false, "").await });
 
@@ -726,7 +724,6 @@ pub async fn check_for_update(
 
     let (latest_stable, latest_prerelease) = find_latest_releases(&releases);
 
-    // current_version + checked_at top-level matches Go's response.
     let mut result = serde_json::json!({
         "current_version": current,
         "checked_at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
@@ -736,7 +733,7 @@ pub async fn check_for_update(
 
     // Detect whether the user is currently on a prerelease so we can offer
     // the latest stable as a downgrade option when no forward upgrade is
-    // available. Mirrors Go's onPrerelease check at update.go:537-538.
+    // available.
     let on_prerelease = parse_semver(&current)
         .map(|(_, _, _, pre)| !pre.is_empty())
         .unwrap_or(false);
@@ -759,8 +756,7 @@ pub async fn check_for_update(
 
         // If user is on a prerelease and the latest stable isn't flagged as
         // a newer version (e.g. prerelease has a higher base version), offer
-        // the stable release as a revert/downgrade option. Mirrors Go's
-        // dbb89a6 (server/api/update.go:556-562).
+        // the stable release as a revert/downgrade option.
         if on_prerelease && can_update && !stable_available {
             result["revert_stable"] = serde_json::json!({
                 "version": stable.tag_name,
@@ -785,7 +781,7 @@ pub async fn check_for_update(
     }
 
     // Cache the result so the Settings page load can render last-check info
-    // without re-hitting GitHub. Mirrors Go's writeFile at update.go:578.
+    // without re-hitting GitHub.
     if let Ok(data) = serde_json::to_vec(&result) {
         let _ = std::fs::write(UPDATE_CHECK_CACHE, data);
     }
@@ -1000,8 +996,7 @@ pub fn spawn_install_beacon() {
 ///
 /// Returns the cached result of the last `check_for_update` call so the
 /// Settings page can render last-known release info without forcing a
-/// fresh GitHub round-trip on every page load. Mirrors Go's
-/// `getUpdateStatus` (server/api/update.go:594).
+/// fresh GitHub round-trip on every page load.
 ///
 /// Live install progress is delivered via the `update_status` WebSocket
 /// channel (see `run_update`), not this endpoint.

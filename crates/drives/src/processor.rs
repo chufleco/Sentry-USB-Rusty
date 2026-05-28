@@ -99,7 +99,7 @@ impl Processor {
 
     /// Reprocess all clip files. Just clears `processed_files`; routes
     /// are upserted in place by `add_route`, so there's no need to wipe
-    /// them first (matches Go's `ClearProcessedForReprocess` behavior).
+    /// them first.
     pub async fn reprocess_all(&self) -> Result<()> {
         if self.running.swap(true, Ordering::SeqCst) {
             anyhow::bail!("processing already in progress");
@@ -232,7 +232,7 @@ impl Processor {
                 }
             }
 
-            // 10 ms throttle — matches Go processor.go so we don't peg a
+            // 10 ms throttle so we don't peg a
             // Pi 4 while the car is still recording clips behind us.
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }

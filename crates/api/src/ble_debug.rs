@@ -392,14 +392,10 @@ async fn write_journal(out: &mut String, lines: usize) {
 // ---------------------------------------------------------------------------
 // Bundle endpoint — `GET /api/logs/bluetooth/bundle`
 //
-// Same conceptual content as the on-screen dashboard, plus all the
-// SSH-only stuff a support session usually needs: full (unfiltered)
-// journal for the sampler service, current-boot bluetooth-stack
-// journal, dmesg BLE lines, hciconfig output, rfkill state, sysfs LE
-// connection parameters (so we can confirm the supervision-timeout
-// tune actually took), pairing-key fingerprint, and the entire
-// per-minute history file. Returned as one downloadable text blob so
-// a tester just clicks "Download" and pastes the file back.
+// The on-screen dashboard content plus the SSH-only data a support
+// session needs (full journal, bluetooth-stack journal, dmesg, hciconfig,
+// rfkill, sysfs LE params, pairing fingerprint, full history), as one
+// downloadable text blob.
 // ---------------------------------------------------------------------------
 
 /// GET /api/logs/bluetooth/bundle — comprehensive single-file BLE
@@ -652,11 +648,10 @@ async fn write_rfkill(out: &mut String) {
     }
 }
 
-/// Confirm the BLE keypair exists + when it was generated. Doesn't
-/// log the key material itself — just file metadata and a SHA-1
-/// fingerprint of the public key, which is enough to tell whether
-/// the user has re-paired since the issue started OR is missing the
-/// key entirely.
+/// Confirm the BLE keypair exists and when it was generated — file
+/// metadata plus a SHA-256 fingerprint of the public key (never the key
+/// material), enough to tell whether the user re-paired or is missing
+/// the key.
 fn write_pairing_state(out: &mut String) {
     let priv_path = "/root/.ble/key_private.pem";
     let pub_path = "/root/.ble/key_public.pem";
@@ -991,17 +986,10 @@ fn write_live_session_status(out: &mut String) {
     );
 }
 
-/// Walk /sys/kernel/debug/bluetooth/hci*/<HANDLE>/ for any
-/// per-connection files the kernel exposes. On bluez 5.82 +
-/// recent kernels these directories EXIST but are empty by design
-/// (the kernel doesn't populate per-conn debugfs anymore), so this
-/// section is mostly a "future-proofing nothing found" — if a
-/// tester is on an older bluez/kernel where the files do exist,
-/// we'll dump them; otherwise we say so explicitly.
-///
-/// NOTE: the previous version of this function looked under
-/// `hci*/conn/<handle>/` which is the WRONG path on every bluez
-/// release we checked. Actual path is `hci*/<handle>/`. Fixed.
+/// Walk `/sys/kernel/debug/bluetooth/hci*/<HANDLE>/` for per-connection
+/// files. On bluez 5.82 + recent kernels these dirs exist but are empty
+/// by design, so usually nothing is found; older stacks that populate
+/// them get dumped.
 fn write_per_connection_debugfs(out: &mut String) {
     let mut any_adapter = false;
     let mut any_handle = false;

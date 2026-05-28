@@ -1,4 +1,4 @@
-//! v1 → v2 aggregate backfill — port of Go `server/drives/backfill.go`.
+//! v1 → v2 aggregate backfill.
 //!
 //! Walks every route row whose aggregate columns are still NULL (the
 //! pre-v2 state) and populates them from the stored BLOBs via
@@ -35,8 +35,7 @@ pub struct BackfillStats {
 //
 // Lets the API expose `GET /api/drives/migration-status` so the iOS / web
 // app can show "Migrating drive data..." UI during a first-boot-after-
-// upgrade backfill instead of a stale spinner. Mirrors Go's
-// `dh.store.MigrationStatus()` shape (server/api/drives.go:151+).
+// upgrade backfill instead of a stale spinner.
 //
 // Global atomics (one DriveStore per process) make this trivially safe
 // to read concurrently without holding the SQLite mutex.

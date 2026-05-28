@@ -1,4 +1,4 @@
-//! Per-clip aggregate computation — port of Go `server/drives/aggregate.go`.
+//! Per-clip aggregate computation.
 //!
 //! `compute_route_aggregates` is the **single source of truth** for per-clip
 //! scalars: AddRoute calls it on insert, the one-shot v2 backfill calls it

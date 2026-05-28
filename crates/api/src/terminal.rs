@@ -1,6 +1,6 @@
 //! PTY over WebSocket for web terminal.
 //!
-//! Matches the Go `server/api/terminal.go` contract:
+//! Terminal API contract:
 //!  1. Client sends `{"type":"auth","username":"...","password":"..."}` as first message.
 //!  2. Server validates credentials against /etc/shadow via Perl `crypt(3)`.
 //!  3. On success, spawns `su -l <user>` with a PTY and bridges I/O over the WebSocket.
@@ -309,7 +309,7 @@ async fn handle_terminal_ws(socket: WebSocket, addr: SocketAddr) {
 }
 
 // Perl script reads password from stdin, verifies against /etc/shadow via crypt(3).
-// Username passed as $ARGV[0]. Matches Go implementation byte-for-byte.
+// Username passed as $ARGV[0].
 const VERIFY_PASSWORD_SCRIPT: &str = r#"use strict;
 use warnings;
 my $username = $ARGV[0];

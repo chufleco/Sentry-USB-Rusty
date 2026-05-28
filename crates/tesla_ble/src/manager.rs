@@ -1,47 +1,31 @@
-//! Push 4: persistent BLE session manager.
+//! Persistent BLE session manager.
 //!
-//! The current per-call pattern (scan → connect → handshake → command
-//! → disconnect) opens a fresh GATT connection for every query. That
-//! works but means we never hold a Tesla BLE connection slot —
-//! every cycle we re-compete for one of the car's ~3 slots against
-//! phone keys + the iOS app. Connection failures during a busy
-//! moment ("paired phone walked up while we were sampling") look
-//! to the sampler like generic BLE flakiness.
-//!
-//! `PersistentSession` flips that: one long-lived background tokio
-//! task owns the `Connection` + per-domain session keys across many
-//! commands. Once we have the slot, we keep it until the link
-//! genuinely dies. Phone keys can connect and disconnect freely
-//! against the remaining slots without disrupting us, and our
-//! per-query overhead drops from ~1.5-2s (scan + handshake + cmd)
-//! to ~200-500ms (just the cmd).
+//! The per-call pattern (scan → connect → handshake → command →
+//! disconnect) opens a fresh GATT connection per query, so it never
+//! holds one of the car's ~3 BLE slots and re-competes against the
+//! phone keys and iOS app every cycle. `PersistentSession` keeps one
+//! long-lived connection plus per-domain session keys across many
+//! commands, cutting per-query cost from ~1.5-2s to ~200-500ms.
 //!
 //! ## Usage
 //!
 //! ```ignore
-//! let session = PersistentSession::start(keypair, vin).await;
+//! let session = PersistentSession::start(keypair, vin, adapter);
 //! loop {
-//!     let climate = session.query(
-//!         Domain::Infotainment,
-//!         VehicleDataState::Climate,
-//!     ).await?;
-//!     // ... parse, persist
+//!     let climate = session
+//!         .query(Domain::Infotainment, VehicleDataState::Climate)
+//!         .await?;
 //!     tokio::time::sleep(Duration::from_secs(15)).await;
 //! }
 //! ```
 //!
-//! ## Recovery behavior
+//! ## Recovery
 //!
-//! * Transport error (BLE link drop / GATT timeout) → drop connection,
-//!   next query triggers a fresh scan + reconnect. Reconnect backs
-//!   off on repeated failures but each new `query()` call resets the
-//!   schedule so a long idle followed by a sudden burst connects
-//!   immediately.
-//! * Counter/epoch fault from car (the car has seen this counter
-//!   before, or the epoch rolled over) → drop the affected domain's
-//!   session state, next query re-handshakes just that domain. The
-//!   underlying GATT connection stays up.
-//! * Other faults → returned to caller, no state changes.
+//! * Transport error (link drop / GATT timeout) → drop the connection;
+//!   the next query rescans and reconnects, backing off on repeats.
+//! * Counter/epoch fault → drop that domain's session state; the next
+//!   query re-handshakes just that domain, connection stays up.
+//! * Other faults → returned to the caller.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
@@ -116,9 +100,8 @@ enum Command {
         inner: Vec<u8>,
         reply: oneshot::Sender<Result<Vec<u8>>>,
     },
-    /// Unauthenticated body-controller-state query. Runs through the
-    /// held GATT connection (not a new one) so it doesn't fight the
-    /// authenticated queries for bluez or kick the persistent slot.
+    /// Unauthenticated body-controller query, run over the held
+    /// connection so it doesn't open a competing one or disturb the slot.
     BodyController {
         reply: oneshot::Sender<Result<crate::proto::vcsec::VehicleStatus>>,
     },
@@ -129,26 +112,21 @@ enum Command {
 struct DomainSession {
     key: SessionKey,
     epoch: Vec<u8>,
-    /// Most recent counter the car has seen from us. The next
-    /// outgoing command uses `counter + 1`.
+    /// Most recent counter the car has seen from us; the next command
+    /// uses `counter + 1`.
     counter: u32,
-    /// Car's `clock_time` from the last SessionInfo, paired with the
-    /// local `Instant` at which we received it. Estimated current
-    /// car clock = `clock_time_at_handshake + (Instant::now() -
-    /// handshake_local_time)`. Without the local-elapsed term we
-    /// keep stamping commands with `expires_at` derived from a
-    /// frozen clock that stops advancing, and the car eventually
-    /// rejects them as TIME_EXPIRED (fault 17) the moment the real
-    /// clock passes our stale `expires_at`.
+    /// Car `clock_time` from the last SessionInfo, paired with the
+    /// local `Instant` it arrived. Estimated car clock = clock_time +
+    /// local elapsed. Without the elapsed term, `expires_at` is derived
+    /// from a frozen clock and the car eventually rejects commands as
+    /// TIME_EXPIRED (fault 17).
     clock_time_at_handshake: u32,
     handshake_local_time: Instant,
 }
 
 impl DomainSession {
-    /// Best-effort estimate of the car's current clock_time, derived
-    /// from our last cached value + local elapsed seconds. Local + car
-    /// clocks drift slowly enough that this is fine for the
-    /// `expires_at` calculation across a session lifetime.
+    /// Estimate the car's current clock_time from the cached value plus
+    /// local elapsed seconds. Drift is slow enough for `expires_at`.
     fn estimated_car_clock(&self) -> u32 {
         let elapsed = self.handshake_local_time.elapsed().as_secs() as u32;
         self.clock_time_at_handshake.saturating_add(elapsed)
@@ -159,9 +137,8 @@ impl DomainSession {
 struct SessionState {
     keypair: KeyPair,
     vin: String,
-    /// Configured `BLE_ADAPTER` from sentryusb.conf — None means
-    /// "let btleplug pick the first one." Mirrors the config field
-    /// the api crate reads.
+    /// Configured `BLE_ADAPTER` from sentryusb.conf; None lets btleplug
+    /// pick the first adapter.
     adapter_name: Option<String>,
     conn: Option<Connection>,
     domains: HashMap<Domain, DomainSession>,
@@ -169,105 +146,66 @@ struct SessionState {
     backoff: Duration,
     /// When the manager started or last reconnected — for logging.
     connected_at: Option<Instant>,
-    /// Successful queries served since the current connection was
-    /// established. Reset to 0 on every reconnect. Used by the
-    /// periodic status log so operators can see at a glance that
-    /// the slot is being held (counter climbs steadily) vs being
-    /// re-grabbed (counter resets often).
+    /// Successful queries since the current connection; reset on
+    /// reconnect. Lets the status log show the slot is held (climbing)
+    /// vs re-grabbed (resetting).
     queries_since_connect: u32,
-    /// Monotonic timestamp of the most recent query (signed or
-    /// body-controller) that fully succeeded. Read by the disconnect
-    /// diagnostic so a tester's log shows whether the link was
-    /// healthy right up to the drop ("last_ok=1s ago") or had been
-    /// silently degrading ("last_ok=45s ago"). Reset on each
-    /// successful connect.
+    /// When the last query fully succeeded; reset on connect. The
+    /// disconnect diagnostic uses it to show whether the link was
+    /// healthy up to the drop (last_ok=1s) or already degrading
+    /// (last_ok=45s).
     last_successful_query_at: Option<Instant>,
-    /// Total connection drops detected by `handle_transport_error_if_any`
-    /// since the daemon started. Helps testers see at a glance how
-    /// flappy their BLE link is over a drive — every drop logs the
-    /// running total so a journalctl tail tells the whole story.
+    /// Total connection drops since daemon start, logged on each drop
+    /// so a journal tail shows how flappy the link is.
     lifetime_drops: u32,
-    /// Sliding window of the most recent successful-query latencies
-    /// (in milliseconds). Fed into a p50/p95/p99 summary emitted
-    /// alongside the periodic "held for X" status line — surfaces
-    /// link degradation BEFORE it manifests as a drop (e.g. p95
-    /// climbing from 350ms to 1200ms over a few minutes is an early
-    /// warning of a slot fight). Capped at SAMPLES_FOR_PERCENTILES
-    /// entries; older values fall off the front.
+    /// Sliding window of recent successful-query latencies (ms) for the
+    /// p50/p95/p99 summary. Rising percentiles flag link degradation
+    /// before a drop. Capped at SAMPLES_FOR_PERCENTILES.
     recent_latencies_ms: VecDeque<u128>,
-    /// RSSI observed when scanning for this connection's peer right
-    /// before connect. Modern bluez (5.x+) doesn't expose live RSSI
-    /// for active LE connections via any standard userspace API —
-    /// not debugfs, not D-Bus, not hcitool, not bluetoothctl. The
-    /// scan-time value is the only RSSI we can capture without
-    /// custom HCI socket code. Correlates well with connection
-    /// quality at the moment of connect (= when most slot races
-    /// happen) which is the failure mode we care most about.
+    /// RSSI from the pre-connect scan. bluez exposes no live RSSI for
+    /// active LE connections, so this scan-time value is the best proxy
+    /// for link quality at connect — when most slot races happen.
     last_scan_rssi: Option<i16>,
-    /// Peer MAC address of the most recently-opened connection.
-    /// Captured before `Connection::open` consumes the peripheral.
-    /// Written to the live status file so the bundle's "current
-    /// connection" section can show who we're talking to.
+    /// Peer MAC of the most recent connection, captured before
+    /// `Connection::open` consumes the peripheral; written to the
+    /// status file.
     last_peer_mac: Option<String>,
-    /// Cumulative count of "buffer started with a too-large length
-    /// prefix, we cleared and continued" events across this daemon's
-    /// lifetime (i.e. summed across reconnects). Surfaced in the
-    /// live status file + periodic status log + persistent disconnect
-    /// log so a bundle shows whether the recovery path is firing in
-    /// the wild — a low count over many hours means Tesla is sending
-    /// us clean frames; a steadily-climbing count means our buffer is
-    /// regularly being polluted (stale notifications, unsolicited
-    /// broadcasts whose framing doesn't match BROADCAST_FRAME_PREFIX,
-    /// chunked-response stragglers) and is a leading indicator we
-    /// should investigate what's filling it. Each entry corresponds
-    /// to ONE successful in-round_trip recovery — the query that
-    /// triggered it still succeeded.
+    /// Cumulative count of in-round_trip framing-desync recoveries
+    /// (oversized length prefix cleared and retried) across reconnects.
+    /// A climbing count means the read buffer is regularly polluted
+    /// (stale notifications, unmatched broadcasts, chunked stragglers).
+    /// Each event still produced a successful query.
     framing_desync_recoveries: u32,
 }
 
-/// How many successful queries to keep timing samples for. Picks the
-/// p50/p95/p99 window. 100 ≈ 5-10 min of normal Active-mode poll
-/// volume — enough to be statistically meaningful, small enough to
-/// react within minutes to a real degradation.
+/// Timing-sample window for the percentiles. 100 ≈ 5-10 min of
+/// Active-mode polling — meaningful, but reacts within minutes.
 const SAMPLES_FOR_PERCENTILES: usize = 100;
 
-/// Persistent disconnect log path. Each transport-error drop appends
-/// one structured line here so the bundle download includes a
-/// long-term drop history even after journald rotates. Written
-/// best-effort — if the path isn't writable (e.g. /mutable not
-/// mounted yet on early boot) we silently skip.
+/// Persistent disconnect log. Each drop appends one line so the bundle
+/// retains drop history after journald rotates. Best-effort: skipped
+/// if the path isn't writable (e.g. /mutable not mounted at boot).
 const DISCONNECT_LOG_PATH: &str = "/mutable/sentryusb-ble-disconnects.log";
 
-/// Truncate the disconnect log once it grows past this. Keeps the
-/// most-recent half — exact same pattern as the per-minute diag log.
-/// 256 KB ≈ 2,500 disconnect lines, which is more history than a
-/// reasonable tester will ever accumulate.
+/// Truncate the disconnect log past this size, keeping the most-recent
+/// half. 256 KB ≈ 2,500 lines.
 const DISCONNECT_LOG_ROTATE_AT_BYTES: u64 = 256 * 1024;
 
-/// Live BLE-session status file path. Atomically rewritten on every
-/// connect / disconnect with the current connection state, so the
-/// api crate's bundle handler (different process) can show "is the
-/// sampler connected RIGHT NOW, since when, to which MAC, with what
-/// scan-time RSSI" without parsing journalctl. Cross-process IPC
-/// via shared file works fine here — bytes written each event are
-/// ~200 and the api side just reads it.
+/// Live status file, atomically rewritten on each connect/disconnect
+/// so the api crate (a separate process) can report the current
+/// connection state — since when, peer MAC, scan RSSI — without
+/// parsing journalctl.
 const STATUS_FILE_PATH: &str = "/mutable/sentryusb-ble-status.txt";
 
-/// Log a connection-status summary every this many successful
-/// queries. At Active-mode 15s cycles that's roughly every 6 minutes
-/// — enough to confirm in journalctl that the slot is held without
-/// flooding the log.
+/// Emit a connection-status summary every N successful queries
+/// (~6 min at 15s cycles).
 const STATUS_LOG_EVERY_N_QUERIES: u32 = 25;
 
 impl PersistentSession {
-    /// Spawn the background session task and return a handle.
-    /// Doesn't itself trigger a connection — the first `query()`
-    /// call kicks that off.
-    ///
-    /// `adapter_name` accepts a string like `"hci1"` to force a
-    /// specific BLE adapter (matches the `BLE_ADAPTER` config in
-    /// sentryusb.conf). `None` or an empty string lets btleplug
-    /// pick the first one it finds.
+    /// Spawn the background session task and return a handle. The first
+    /// `query()` triggers the actual connection. `adapter_name` forces
+    /// a specific adapter (e.g. "hci1", matching `BLE_ADAPTER`);
+    /// None/empty lets btleplug choose.
     pub fn start(
         keypair: KeyPair,
         vin: String,
@@ -317,18 +255,16 @@ impl PersistentSession {
         rx.await.context("session task dropped the reply channel")?
     }
 
-    /// Best-effort stop. Closes the connection and ends the
-    /// background task. After calling this, `query()` returns an
-    /// error.
+    /// Best-effort stop: closes the connection and ends the task.
+    /// `query()` errors afterward.
     pub async fn shutdown(&self) {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
     }
 
     /// Issue a generic signed request with caller-supplied inner
-    /// payload bytes. Used by keep-awake actions
-    /// (`actions::wake_vehicle`, `set_sentry_mode`, etc.) that need
-    /// the AES-GCM signing pipeline but produce different inner
-    /// protobufs than the state queries.
+    /// payload bytes. Used by keep-awake actions that need the AES-GCM
+    /// signing pipeline but produce different inner protobufs than the
+    /// state queries.
     pub async fn send_signed(
         &self,
         domain: Domain,
@@ -355,11 +291,10 @@ impl PersistentSession {
         self.send_signed(action.domain, action.inner).await
     }
 
-    /// Unauthenticated body-controller-state query. Runs through
-    /// the held GATT connection — no new scan + connect, no
-    /// competition with the authenticated state queries that share
-    /// the same persistent session. Used by the telemetry sampler's
-    /// Quiet-mode poll (sleep-safe; doesn't wake the car).
+    /// Unauthenticated body-controller query over the held connection
+    /// (no new scan/connect, no competition with the authenticated
+    /// queries). Used by the sampler's Quiet-mode poll — sleep-safe,
+    /// doesn't wake the car.
     pub async fn body_controller_state(
         &self,
     ) -> Result<crate::proto::vcsec::VehicleStatus> {
@@ -371,12 +306,8 @@ impl PersistentSession {
         rx.await.context("session task dropped the reply channel")?
     }
 
-    // -------------------------------------------------------------
-    // Typed convenience wrappers. Each does a raw `query()` to the
-    // Infotainment domain + decodes the response into the relevant
-    // car_server sub-message. Sampler code can use these directly
-    // without learning about proto bytes.
-    // -------------------------------------------------------------
+    // Typed wrappers: each does a raw Infotainment `query()` and
+    // decodes the response into the relevant car_server sub-message.
 
     /// `state climate`. Interior/exterior temps, HVAC, defroster, etc.
     pub async fn get_climate(&self) -> Result<crate::proto::car_server::ClimateState> {
@@ -402,24 +333,12 @@ impl PersistentSession {
         crate::responses::parse_drive(&bytes)
     }
 
-    /// `state drive` — same wire call as `get_drive` but returns the
-    /// FULL `VehicleData` (specifically, both `drive_state` AND
-    /// `location_state`) rather than just drive_state.
-    ///
-    /// Why both: Tesla's `state drive` responses bundle a snapshot of
-    /// LocationState alongside DriveState, with the
-    /// reverse-geocoded `location_name` field populated. Standalone
-    /// `state location` queries return raw GPS coords but NOT
-    /// location_name — Tesla appears to only emit the human-readable
-    /// address as a side effect of drive-state retrieval. Confirmed
-    /// empirically with a tester's `tesla-control state drive` capture
-    /// showing `locationState: { locationName: "..." }` while
-    /// `tesla-control state location` for the same vehicle returned
-    /// only lat/lon/heading.
-    ///
-    /// Use this instead of `get_drive` when you also want the address.
-    /// Same BLE round-trip cost — Tesla returns LocationState whether
-    /// we ask for it or not.
+    /// Same wire call as `get_drive` but returns full `VehicleData`
+    /// (both `drive_state` and `location_state`). Tesla only populates
+    /// the reverse-geocoded `location_name` in the LocationState
+    /// bundled with `state drive`; standalone `state location` returns
+    /// raw coords without it. Same round-trip cost. Use this when you
+    /// need the address.
     pub async fn get_drive_with_location(
         &self,
     ) -> Result<(
@@ -436,12 +355,8 @@ impl PersistentSession {
         Ok((drive, vd.location_state))
     }
 
-    /// `state location`. GPS coords (when authorized).
-    ///
-    /// NOTE: This does NOT return `location_name` — that field is only
-    /// populated in the LocationState bundled into `state drive`
-    /// responses. Use `get_drive_with_location` if you need the
-    /// address. Kept around for future GPS-coordinate usage.
+    /// `state location`. GPS coords only — `location_name` is not
+    /// populated here (see `get_drive_with_location`).
     pub async fn get_location(&self) -> Result<crate::proto::car_server::LocationState> {
         let bytes = self
             .query(Domain::Infotainment, VehicleDataState::Location)
@@ -471,9 +386,8 @@ async fn run_session_task(
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
-        // Time every command from receive to result so the latency
-        // window in SessionState reflects user-visible round-trip
-        // (includes any SessionInfo refresh retry, scan, reconnect).
+        // Time each command end-to-end so the latency window reflects
+        // the full round-trip (refresh retry, scan, reconnect included).
         let started = Instant::now();
         match cmd {
             Command::Query {
@@ -517,24 +431,18 @@ async fn run_session_task(
             }
             Command::Shutdown => break,
         }
-        // Drain any framing-desync recoveries that fired during this
-        // command into the session-lifetime counter. Done outside the
-        // match so it covers all three query paths in one place and
-        // catches recoveries whether the query ultimately succeeded
-        // or failed (a failed query that recovered N times before
-        // hitting MAX_DESYNCS is still useful telemetry). Folded into
-        // SessionState (not Connection) so the count survives
-        // reconnects — testers care about cumulative pollution
-        // across a session, not per-connection.
+        // Fold any framing-desync recoveries from this command into the
+        // session-lifetime counter. Outside the match so it covers all
+        // three query paths and counts recoveries even on a failed
+        // query. Kept on SessionState so it survives reconnects.
         if let Some(conn) = state.conn.as_mut() {
             let n = conn.take_framing_desync_recoveries();
             if n > 0 {
                 state.framing_desync_recoveries =
                     state.framing_desync_recoveries.saturating_add(n);
-                // Refresh the status file on every nonzero drain so
-                // testers reading /mutable/sentryusb-ble-status.txt
-                // (or the bundle) see the latest count without
-                // waiting for the next connect/disconnect transition.
+                // Refresh the status file on each nonzero drain so
+                // readers see the latest count without waiting for the
+                // next connect/disconnect.
                 write_status_file(&state, ConnectionEvent::Connected);
             }
         }
@@ -544,32 +452,19 @@ async fn run_session_task(
     }
 }
 
-/// Outer wrapper that handles SessionInfo-refresh responses. The car
-/// sometimes replies to a signed command with a fresh SessionInfo
-/// payload instead of an encrypted response, signaling "your session
-/// state is stale, here's the new state, please retry." Tesla's
-/// reference client does the same refresh-and-retry dance.
-///
-/// We do at most one retry per query — if even with refreshed state
-/// the retry still hits the same "needs refresh" outcome, something
-/// deeper is wrong and we surface the error instead of looping
-/// forever.
+/// Handles SessionInfo-refresh replies: the car may answer a signed
+/// command with a fresh SessionInfo ("your session is stale, retry")
+/// instead of an encrypted response. At most one refresh retry per
+/// query before the error is surfaced.
 async fn signed_request_with_refresh_retry(
     state: &mut SessionState,
     domain: Domain,
     inner: Vec<u8>,
 ) -> Result<Vec<u8>> {
-    // Note: success-bookkeeping (note_successful_query) is now done
-    // by the caller in run_session_task so the latency timer covers
-    // the full retry envelope, not just the final attempt.
-    //
-    // Retry budget: at most one SessionInfo refresh and at most one
-    // OPERATIONSTATUS_WAIT retry per query. The budgets are
-    // independent so a WAIT followed by a refresh (or vice-versa)
-    // still gets a final plaintext attempt. If either path repeats,
-    // we bail and let the schedule's fast-retry handle the next
-    // tick — better than holding up subsequent queries with an
-    // unbounded loop.
+    // Retry budget: at most one SessionInfo refresh and one
+    // OPERATIONSTATUS_WAIT per query, tracked independently so
+    // WAIT-then-refresh still gets a final attempt. On repeat, bail and
+    // let the schedule's next tick retry rather than loop here.
     const WAIT_RETRY_DELAY: Duration = Duration::from_millis(400);
     let mut refresh_retries_left = 1u32;
     let mut wait_retries_left = 1u32;
@@ -615,22 +510,18 @@ async fn signed_request_with_refresh_retry(
 
 /// Normal outcomes from a signed query.
 enum QueryOutcome {
-    /// Decrypted response payload — pass it through to the caller.
+    /// Decrypted response payload.
     Plaintext(Vec<u8>),
-    /// Car returned a fresh SessionInfo asking us to update our
-    /// cached state and retry. Caller must call `apply_session_refresh`
-    /// and re-issue the query.
+    /// Car returned a fresh SessionInfo; caller applies it and retries.
     SessionRefresh(SessionInfo),
-    /// Car returned a status-only reply with operation_status=WAIT
-    /// (no payload, no fault). Transient — caller should retry after
-    /// a short delay. No session state change required.
+    /// Status-only reply with operation_status=WAIT (no payload, no
+    /// fault). Transient — retry after a short delay.
     OperationWait,
 }
 
-/// Apply a car-provided SessionInfo refresh: derive a new session
-/// key, replace the cached domain state, reset the local handshake
-/// clock so `estimated_car_clock` tracks the new baseline. Cheap —
-/// no GATT traffic, just ECDH + a HashMap insert.
+/// Apply a car-provided SessionInfo refresh: derive a new session key,
+/// replace cached domain state, reset the handshake clock. No GATT
+/// traffic — just ECDH + a HashMap insert.
 fn apply_session_refresh(
     state: &mut SessionState,
     domain: Domain,
@@ -672,16 +563,13 @@ async fn try_signed_request_once(
         .get_mut(&domain)
         .context("domain session not present after ensure_domain_session (bug)")?;
 
-    // Capture send time for the stale-window check on SessionInfo
-    // refreshes (see below). We record at TX time, not response time,
-    // so the elapsed measurement reflects the round-trip latency
-    // since our signed message left this process.
+    // TX time for the SessionInfo stale-window check below — measured
+    // from when our message left, so it reflects round-trip latency.
     let request_sent_at = Instant::now();
 
-    // Counter rollover guard. Match tesla-control's signer.go:170-173
-    // behavior: refuse to send rather than wrap to 0. The car enforces
-    // strict counter monotonicity within an epoch, so wrapping would
-    // be rejected as a replay forever — re-handshake is the only fix.
+    // Counter rollover guard: refuse to send rather than wrap to 0. The
+    // car enforces strict per-epoch monotonicity, so a wrap is rejected
+    // as a replay forever; only a re-handshake recovers.
     if ds.counter == u32::MAX {
         bail!(
             "counter rollover: domain {:?} counter hit u32::MAX. \
@@ -708,36 +596,14 @@ async fn try_signed_request_once(
 
     let envelope = auth::build_signed_routable_message(&parts, domain, QUERY_FLAGS);
 
-    // Advance the counter HERE — BEFORE we send to the wire. Match
-    // tesla-control's behavior (signer.go::Encrypt: `s.counter++`
-    // happens before encryptWithCounter is called).
-    //
-    // Why this matters: Tesla advances its expected counter as soon
-    // as it RECEIVES our message, NOT when we receive the response.
-    // If the response is lost (write succeeded but the response
-    // notification got dropped, or we timed out waiting for it),
-    // Tesla's counter is at N but our local counter is still at N-1.
-    //
-    // Old (buggy) behavior: we only set `ds.counter = counter` on
-    // round_trip success. A failed round_trip leaves ds.counter
-    // pointing at the previous value, so the next query computes
-    // `counter = ds.counter + 1` = the SAME counter we just used.
-    // Tesla sees that as a replay and rejects with
-    // INVALID_TOKEN_OR_COUNTER. The fault triggers a SessionInfo
-    // refresh, the refresh resets our counter, and we move on —
-    // but at the cost of TWO extra BLE round-trips per failure.
-    //
-    // That's the cause of the 748-refresh storm we saw on the
-    // original 10h bundle. The framing-desync inline recovery
-    // (`0b9a2ff`) hides most of these now, but any non-desync
-    // failure (write fail, timeout, transient disconnect) still
-    // triggers the same cascade. With the counter advanced
-    // pre-send, the next query uses a clean counter+1 and Tesla
-    // accepts it without a refresh round-trip.
-    //
-    // Cost: we waste a counter value on every send that fails to
-    // reach Tesla. With 2^32 counter values per epoch, this is
-    // entirely negligible.
+    // Advance the counter BEFORE sending. The car advances its expected
+    // counter when it RECEIVES the message, not when we get the
+    // response. If we advanced only on success, a lost response would
+    // leave our counter behind the car's, and the next query would
+    // reuse a counter the car already saw — rejected as a replay
+    // (INVALID_TOKEN_OR_COUNTER), forcing an extra refresh round-trip.
+    // Wasting a counter value on a failed send is negligible (2^32 per
+    // epoch).
     ds.counter = counter;
 
     debug!(
@@ -746,29 +612,19 @@ async fn try_signed_request_once(
         inner.len(),
         counter
     );
-    // Validator: must decode as a RoutableMessage. Catches the
-    // framing-desync pattern we saw on bluez 5.82 post-reconnect —
-    // late notifications would land mid-frame and produce a payload
-    // with a valid length prefix but garbage protobuf content.
-    // Discarding at the transport layer means manager.rs only ever
-    // sees frames that survive a proto-level smoke test.
+    // round_trip validator: require the frame to decode as a
+    // RoutableMessage. Discards mid-frame garbage from late
+    // notifications (seen on bluez 5.82 post-reconnect) at the
+    // transport layer.
     let resp_bytes = conn
         .round_trip(&envelope, QUERY_TIMEOUT, |b| {
             RoutableMessage::decode(b).is_ok()
         })
         .await?;
 
-    // (Counter was advanced pre-send above. See the long comment
-    // near the TX path explaining why — matches tesla-control's
-    // signer.go::Encrypt behavior and prevents the SessionInfo
-    // refresh storm we hit when round_trip fails mid-flight.)
-
-    // The transport validator filters most garbage frames, but a
-    // belt-and-suspenders decode here catches anything that slipped
-    // through. Include the head bytes in the error context so a
-    // tester's bundle shows what shape we couldn't parse —
-    // previously this error fired with no diagnostic data and we
-    // had no way to characterize the bytes.
+    // The transport validator filters most garbage frames; this decode
+    // catches stragglers. Include the head bytes in the error so a
+    // bundle shows the unparseable shape.
     let rm = match RoutableMessage::decode(resp_bytes.as_slice()) {
         Ok(rm) => rm,
         Err(e) => {
@@ -799,31 +655,18 @@ async fn try_signed_request_once(
         .map(|s| s.operation_status)
         .unwrap_or(0);
 
-    // Check for a SessionInfo refresh first — the car uses this as
-    // the standard "your session is stale, here's fresh info" reply.
-    // It's not an error; it's an instruction to refresh and retry.
-    //
-    // Apply the same defenses we do for the initial handshake:
-    //   1. Reject if the SessionInfo was sent too long ago (stale
-    //      cache attack — replaying a SessionInfo from a previous
-    //      session would roll our counter backward and reopen a
-    //      replay window).
-    //   2. Reject if it explicitly says our key isn't on the
-    //      whitelist (avoid attempting to use the resulting session
-    //      key for encrypted commands that will all fail).
-    //   3. Verify the HMAC tag if present.
+    // SessionInfo refresh: the car's standard "your session is stale,
+    // here's fresh info" reply — an instruction to refresh and retry,
+    // not an error. Defenses: reject if too old (a stale-cache replay
+    // could roll our counter backward) or if our key isn't whitelisted.
     if let Some(routable_message::Payload::SessionInfo(info_bytes)) = &rm.payload {
         let parsed = SessionInfo::decode(info_bytes.as_slice())
             .context("decoding refreshed SessionInfo from car")?;
 
-        // Stale-window check: tesla-control discards SessionInfo
-        // arriving > maxLatency (5s default) after the request.
-        // Implemented here as "elapsed since we sent the message
-        // in this round_trip" — if Tesla took more than 10s to send
-        // us a refresh, the response is suspect and we'd rather
-        // re-handshake fresh than apply potentially stale data.
-        // We use a slightly more generous bound than tesla-control's
-        // 5s because our QUERY_TIMEOUT is 15s.
+        // Stale-window check: reject a refresh that arrived > 10s after
+        // the request — likely stale data; prefer a fresh handshake.
+        // (More generous than tesla-control's 5s since QUERY_TIMEOUT is
+        // 15s.)
         let elapsed = request_sent_at.elapsed();
         if elapsed > Duration::from_secs(10) {
             bail!(
@@ -835,9 +678,8 @@ async fn try_signed_request_once(
             );
         }
 
-        // KEY_NOT_ON_WHITELIST check inline so a mid-session pair
-        // revocation surfaces clearly instead of cascading into
-        // encrypted-query decrypt failures.
+        // Surface a mid-session pair revocation here so it doesn't
+        // cascade into encrypted-query decrypt failures.
         if parsed.status
             == crate::proto::signatures::SessionInfoStatus::KeyNotOnWhitelist as i32
         {
@@ -851,17 +693,15 @@ async fn try_signed_request_once(
             );
         }
 
-        // (HMAC verification of the refresh dropped — same reason as
-        // ensure_domain_session: our compute didn't match real Tesla
-        // output, and the threat model doesn't justify keeping it.)
+        // (Refresh HMAC verification intentionally omitted — see
+        // ensure_domain_session.)
 
         return Ok(QueryOutcome::SessionRefresh(parsed));
     }
 
     if fault != 0 {
-        // Counter/epoch faults are recoverable by re-handshaking the
-        // domain. Drop our cached session state so the next query
-        // re-runs the SessionInfoRequest exchange.
+        // Counter/epoch faults recover by re-handshaking: drop the
+        // cached session so the next query re-runs SessionInfoRequest.
         const FAULT_INVALID_SIGNATURE: u32 = 5;
         const FAULT_INVALID_TOKEN_OR_COUNTER: u32 = 6;
         const FAULT_INCORRECT_EPOCH: u32 = 15;
@@ -883,21 +723,10 @@ async fn try_signed_request_once(
         bail!("car responded with fault code {}", fault);
     }
 
-    // Status-only reply (no encrypted payload, no fault, but
-    // operation_status != OK). Tesla sends these as "your request
-    // was received but I can't answer right now — retry shortly".
-    // Observed shape on the wire is field 12 = MessageStatus
-    // { operation_status: 1 (WAIT) }, field 50 = request_uuid,
-    // no sub_sig_data, no payload. Treating these as decode errors
-    // (the old behavior) created a one-sample data gap per
-    // occurrence and a noisy WARN with a full hex dump.
-    //
-    // Distinguish:
-    //   * WAIT (1)  — transient, retryable in the same session
-    //   * ERROR (2) — Tesla explicitly rejected; not retryable here
-    // The retry policy lives one layer up in
-    // signed_request_with_refresh_retry so the caller doesn't see
-    // a transient WAIT as a failure at all.
+    // Status-only reply (no payload, no fault, operation_status != OK):
+    // "received, can't answer right now — retry shortly". WAIT (1) is
+    // transient and retryable; ERROR (2) is an explicit rejection. The
+    // retry policy lives in signed_request_with_refresh_retry.
     if rm.sub_sig_data.is_none() && fault == 0 && op_status != 0 {
         const OPERATIONSTATUS_WAIT: i32 = 1;
         const OPERATIONSTATUS_ERROR: i32 = 2;
@@ -917,9 +746,7 @@ async fn try_signed_request_once(
                 hex::encode(&rm.request_uuid),
             );
         }
-        // Unknown non-OK status — keep a sanitized log without the
-        // full hex dump (the per-byte content was only useful for
-        // diagnosing the original "no sub_sig_data" mystery).
+        // Unknown non-OK status.
         bail!(
             "car returned unknown operation_status={} for {:?} \
              (no encrypted payload). request_uuid={}",
@@ -991,13 +818,10 @@ async fn try_signed_request_once(
     ) {
         Ok(p) => p,
         Err(e) => {
-            // Decrypt failure with valid-looking sig_data almost
-            // always means our cached session state diverged from
-            // the car's view (e.g. an interleaving client bumped
-            // the car's counter or rolled the epoch). Drop the
-            // domain state so the wrapper retries with a fresh
-            // handshake and surface the original error so the
-            // caller knows what happened.
+            // Decrypt failure with valid-looking sig data usually means
+            // our cached session diverged from the car's (an
+            // interleaving client bumped the counter or rolled the
+            // epoch). Drop the domain state so the wrapper re-handshakes.
             warn!(
                 "PersistentSession: decrypt failed for {:?} — \
                  dropping domain state for re-handshake on retry",
@@ -1012,18 +836,14 @@ async fn try_signed_request_once(
     Ok(QueryOutcome::Plaintext(plaintext))
 }
 
-/// Drops the held connection if `result` looks like a transport
-/// failure (link dropped, BLE write to a closed handle, etc.). Next
-/// command triggers a fresh scan + connect. Protocol-level faults
-/// (INVALID_SIGNATURE, etc.) are handled separately inside the
-/// query/body_controller handlers and don't drop the connection.
+/// Drop the held connection if `result` looks like a transport failure
+/// (link dropped, BLE write to a closed handle). The next command
+/// reconnects. Protocol faults (INVALID_SIGNATURE, etc.) are handled in
+/// the query handlers and don't drop the connection.
 ///
-/// On every drop, emits a single structured log line summarizing the
-/// connection's lifetime + freshness of last successful query +
-/// running drop count. Testers paste their journalctl tail and we
-/// can immediately distinguish slot contention (held=20m, last_ok=1s,
-/// many drops) from a degraded link (held=20m, last_ok=45s, occasional
-/// drops) from a flapping radio (held=10s repeatedly).
+/// Each drop logs one structured line (lifetime, last-ok freshness,
+/// drop count) so a journal tail distinguishes slot contention from a
+/// degraded link from a flapping radio.
 async fn handle_transport_error_if_any<T>(
     state: &mut SessionState,
     result: &Result<T>,
@@ -1068,19 +888,11 @@ async fn handle_transport_error_if_any<T>(
                 state.framing_desync_recoveries,
                 e,
             );
-            // Capture the kernel's view of what just happened.
-            // Especially valuable for short-held drops (held=0, link
-            // died before our first write): dmesg will usually show
-            // the HCI disconnect-complete event with a numeric reason
-            // — 0x05 (authentication failure), 0x13 (remote user
-            // terminated), 0x3D / 0x3E (conn failed to establish),
-            // 0x22 (LMP/LL response timeout). Bounded + best-effort:
-            // if dmesg isn't readable or takes too long we just skip.
-            // Only fire on the recent-drop pattern (held < 5s) where
-            // the kernel's reason is most diagnostic — established
-            // links that drop after minutes/hours usually have
-            // obvious reasons (supervision timeout, range) that
-            // don't need this extra capture.
+            // Only for short-held drops (held < 5s): grab the kernel's
+            // view, which usually has the HCI disconnect reason (0x05
+            // auth failure, 0x13 remote terminated, 0x22 LL timeout,
+            // 0x3D/0x3E conn failed). Long-held drops have obvious
+            // causes (supervision timeout, range) and don't need it.
             if held_secs < 5 {
                 if let Some(snippet) = capture_recent_bluetooth_dmesg().await {
                     warn!(
@@ -1113,25 +925,18 @@ async fn handle_transport_error_if_any<T>(
             state.domains.clear();
             state.connected_at = None;
             state.queries_since_connect = 0;
-            // Update the cross-process status file so the bundle
-            // shows "currently disconnected" + how long it's been.
-            // Note: we leave last_scan_rssi / last_peer_mac populated
-            // so the bundle can show the values for the connection
-            // we just lost.
+            // Leave last_scan_rssi / last_peer_mac populated so the
+            // status file can still show the connection we just lost.
             write_status_file(state, ConnectionEvent::Disconnected);
-            // Intentionally NOT resetting last_successful_query_at —
-            // the value across the drop is useful for the next
-            // diagnostic line ("reconnected after Xs gap since last
-            // working query").
+            // Keep last_successful_query_at across the drop — the next
+            // reconnect diagnostic reports the gap since the last query.
         }
     }
 }
 
-/// Append one row to the persistent disconnect log. CSV-ish format —
-/// timestamp first (RFC 3339 UTC for grep-friendliness), then
-/// space-separated `k=v` pairs. The bundle download includes the
-/// whole file so a tester pasting their bundle gives us the full
-/// drop history across days, not just whatever's left in journald.
+/// Append one row to the persistent disconnect log: RFC 3339 UTC
+/// timestamp then space-separated `k=v` pairs. The bundle includes the
+/// whole file, so drop history survives journald rotation.
 fn append_disconnect_log(
     held_secs: u64,
     queries: u32,
@@ -1155,9 +960,7 @@ fn append_disconnect_log(
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    // RFC 3339 without an external dep — UTC, second precision.
-    // Format: "2026-05-25T18:01:39Z". Imperfect for sub-second
-    // resolution but easy to grep and we don't need ms here.
+    // RFC 3339 UTC, second precision.
     let ts = format_unix_iso8601(now_secs);
 
     // Replace tabs/newlines in the reason string so each disconnect
@@ -1183,9 +986,8 @@ fn append_disconnect_log(
         .and_then(|mut f| f.write_all(line.as_bytes()));
 
     if let Err(e) = result {
-        // Don't propagate — the journalctl line above already has
-        // the same info. Just record at debug so we don't spam
-        // operators on first boot before /mutable is ready.
+        // Don't propagate — the journal line above has the same info.
+        // Debug-level so it doesn't spam before /mutable is ready.
         debug!(
             "could not append to {} (best-effort): {}",
             DISCONNECT_LOG_PATH, e
@@ -1193,9 +995,7 @@ fn append_disconnect_log(
     }
 }
 
-/// Keep most-recent half when the disconnect log exceeds the cap.
-/// Same pattern as the diag log — operational data, no need for an
-/// archive past the most recent few hundred drops.
+/// Keep the most-recent half when the disconnect log exceeds the cap.
 fn rotate_disconnect_log_if_needed() {
     let meta = match std::fs::metadata(DISCONNECT_LOG_PATH) {
         Ok(m) => m,
@@ -1218,9 +1018,8 @@ fn rotate_disconnect_log_if_needed() {
     let _ = std::fs::write(DISCONNECT_LOG_PATH, &raw[start..]);
 }
 
-/// Tiny RFC-3339-ish formatter for the disconnect-log timestamp.
-/// We don't pull chrono into this crate just for one log line —
-/// hand-roll the format "YYYY-MM-DDTHH:MM:SSZ" from a unix epoch.
+/// Format a unix epoch as RFC 3339 UTC ("YYYY-MM-DDTHH:MM:SSZ"), so
+/// this crate doesn't pull in chrono for one log line.
 fn format_unix_iso8601(secs: u64) -> String {
     // Compute civil calendar from days-since-1970 using Howard Hinnant's
     // algorithm (well-known, public domain).
@@ -1245,11 +1044,9 @@ fn format_unix_iso8601(secs: u64) -> String {
     )
 }
 
-/// Run a body-controller-state query through the held connection.
-/// Mirrors `crate::body_controller::query` but uses the persistent
-/// session's connection so we don't open a competing one and
-/// trigger the bluez races that the per-call body-controller path
-/// kept hitting.
+/// Run a body-controller-state query over the held connection, so it
+/// doesn't open a competing one and hit the bluez races the per-call
+/// path kept triggering.
 async fn handle_body_controller(
     state: &mut SessionState,
 ) -> Result<crate::proto::vcsec::VehicleStatus> {
@@ -1258,8 +1055,7 @@ async fn handle_body_controller(
         .conn
         .as_mut()
         .context("ensure_connected returned without a connection")?;
-    // Note: success-bookkeeping done by caller (see run_session_task)
-    // so latency timer covers the full command.
+    // Success-bookkeeping is done by the caller (run_session_task).
     crate::body_controller::query(conn).await
 }
 
@@ -1286,10 +1082,8 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
         }
     };
 
-    // Capture RSSI + MAC BEFORE Connection::open consumes the
-    // peripheral. The address() call is cheap (no I/O) and gives us
-    // the BLE MAC the bundle handler needs to identify the peer in
-    // the live-status file.
+    // Capture RSSI + MAC before Connection::open consumes the
+    // peripheral; address() is cheap and the status file needs the MAC.
     let scan_rssi = scan_result.rssi;
     let peer_mac = scan_result.peripheral.address().to_string();
 
@@ -1308,9 +1102,8 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.queries_since_connect = 0;
     state.last_scan_rssi = scan_rssi;
     state.last_peer_mac = Some(peer_mac);
-    // Drop the previous connection's latency history — a new link
-    // negotiates fresh BLE params and the old distribution isn't
-    // representative. Percentiles will repopulate within ~25 queries.
+    // Drop the old latency history — a new link negotiates fresh BLE
+    // params, so the old distribution isn't representative.
     state.recent_latencies_ms.clear();
     info!(
         "PersistentSession: connected (held until link drops) — peer={} scan_rssi={}",
@@ -1331,15 +1124,9 @@ enum ConnectionEvent {
     Disconnected,
 }
 
-/// Atomically replace /mutable/sentryusb-ble-status.txt with one
-/// line describing the current session state. Best-effort — if
-/// /mutable isn't mounted (early boot, read-only rootfs) the bundle
-/// will just show "<missing>" for that section.
-///
-/// Format is plain text k=v so the bundle can include it verbatim
-/// and humans can grep it. Single line so it's atomic on POSIX
-/// (write of <PIPE_BUF bytes is atomic — well under any conceivable
-/// per-line size here).
+/// Rewrite the status file with one `k=v` line describing the current
+/// session state. Single line keeps the write atomic. Best-effort — if
+/// /mutable isn't mounted the file just won't exist.
 fn write_status_file(state: &SessionState, event: ConnectionEvent) {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now_secs = SystemTime::now()
@@ -1365,20 +1152,13 @@ fn write_status_file(state: &SessionState, event: ConnectionEvent) {
     let _ = std::fs::write(STATUS_FILE_PATH, line);
 }
 
-/// Increment the per-connection query counter and, every
-/// `STATUS_LOG_EVERY_N_QUERIES`, emit a status line summarizing how
-/// long the current connection has been held + how many queries it
-/// has served + p50/p95/p99 latency over the last
-/// `SAMPLES_FOR_PERCENTILES` queries. Operators can grep this to
-/// confirm the persistent slot is being held vs being re-grabbed
-/// each cycle, AND to spot early degradation (p95 climbing while
-/// queries still succeed is a leading indicator of a slot fight).
+/// Bump the per-connection query counter and record latency. Every
+/// `STATUS_LOG_EVERY_N_QUERIES`, log how long the connection has been
+/// held, queries served, and p50/p95/p99 latency — so the slot being
+/// held vs re-grabbed (and rising latency) is visible in the journal.
 fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
     state.queries_since_connect = state.queries_since_connect.saturating_add(1);
-    // Record the success time so the disconnect diagnostic can show
-    // "last_ok=Xs ago" — distinguishes a clean drop (link was fine
-    // until it suddenly wasn't) from a degraded link (queries were
-    // already missing before the drop).
+    // Record success time for the disconnect diagnostic's "last_ok=Xs".
     state.last_successful_query_at = Some(Instant::now());
 
     // Push into the sliding latency window, evict oldest if full.
@@ -1408,10 +1188,8 @@ fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
     }
 }
 
-/// Compute approximate percentiles by sorting a copy of the latency
-/// window. O(n log n) but n=100 — runs <100µs even on a Pi Zero, and
-/// only fires every 25 queries. Returns (0, 0, 0) for empty input
-/// (cold start before any successful query).
+/// Approximate p50/p95/p99 by sorting a copy of the latency window
+/// (n=100, fires every 25 queries). Returns (0,0,0) when empty.
 fn compute_percentiles(samples: &VecDeque<u128>) -> (u128, u128, u128) {
     if samples.is_empty() {
         return (0, 0, 0);
@@ -1440,10 +1218,8 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
     let info = match session::request_session_info(conn, &state.keypair, domain).await {
         Ok(info) => info,
         Err(session::SessionError::KeyNotPaired) => {
-            // Surface the user-actionable error verbatim. Don't drop
-            // the connection — re-handshaking won't help, the user
-            // has to re-pair on the car. The next query will hit
-            // this same error and bail again, which is fine.
+            // Don't drop the connection — re-handshaking won't help;
+            // the user must re-pair on the car.
             bail!(
                 "BLE pair not registered with car (domain {:?}): the car returned \
                  SESSION_INFO_STATUS_KEY_NOT_ON_WHITELIST. Re-pair from the \
@@ -1462,18 +1238,13 @@ async fn ensure_domain_session(state: &mut SessionState, domain: Domain) -> Resu
     let key = derive_session_key(&state.keypair.secret, &info.parsed.public_key)
         .context("deriving session key")?;
 
-    // (We previously verified the SessionInfo HMAC tag from
-    // sub_sig_data.session_info_tag here. Dropped — our HMAC compute
-    // didn't match what real Tesla firmware emits even though the
-    // algorithm matched tesla-control's reference code byte-for-byte
-    // in a synthetic test, AND tesla-control's own dispatcher treats
-    // an HMAC failure as a warning rather than a hard reject. For our
-    // single-user-paired-to-one-car threat model the active-MITM
-    // attack the HMAC defends against is essentially zero — and the
-    // session key derivation is provably correct (ECDH+SHA-1, drive=ok
-    // round-trips real Tesla responses in production). Worth revisiting
-    // if a real attack vector emerges or if we find the wire-format
-    // discrepancy.)
+    // SessionInfo HMAC-tag verification intentionally omitted: our
+    // compute didn't match real Tesla firmware despite matching
+    // tesla-control's reference byte-for-byte, and tesla-control itself
+    // treats an HMAC mismatch as a warning. For a single-user/single-car
+    // threat model the MITM risk is negligible, and the session-key
+    // derivation is proven correct by working round-trips. Revisit if
+    // the wire-format discrepancy is found.
 
     state.domains.insert(
         domain,
@@ -1522,24 +1293,13 @@ fn is_transport_error(e: &anyhow::Error) -> bool {
         || msg.contains("Peripheral")
 }
 
-/// Snapshot recent kernel Bluetooth-related lines (HCI events,
-/// connection complete/disconnect, supervision timeout, auth failure,
-/// etc.) so a disconnect that fires before any query succeeds — the
-/// "held=0s queries=0" pattern — comes with the kernel's view of why.
-///
-/// Returns Some(text) on success, None if dmesg isn't readable or
-/// times out. Bounded shell-out (2s wall clock) so a hung dmesg can't
-/// stall the session task. Filters down to the last ~25 BLE-relevant
-/// lines so the journal doesn't explode if dmesg has a long history.
-///
-/// Why this matters: btleplug surfaces "Failed to initiate write" as
-/// an opaque string, but the underlying HCI disconnect reason is in
-/// dmesg. Common reasons we expect to see:
-///   * "disconnect reason 0x05" — Authentication Failure (bad pair)
-///   * "disconnect reason 0x13" — Remote User Terminated Connection
-///   * "disconnect reason 0x22" — LMP/LL Response Timeout
-///   * "disconnect reason 0x3D/0x3E" — Conn Failed to be Established
-///   * "link supervision timeout" — RF / range / interference
+/// Snapshot recent kernel Bluetooth lines so a drop that fires before
+/// any query (the "held=0s" pattern) comes with the kernel's reason —
+/// btleplug only surfaces an opaque "Failed to initiate write", but
+/// dmesg has the HCI disconnect reason (0x05 auth failure, 0x13 remote
+/// terminated, 0x22 LL timeout, 0x3D/0x3E conn failed, link supervision
+/// timeout = RF/range). Returns the last ~25 relevant lines, or None if
+/// dmesg isn't readable. Bounded to 2s so a hung dmesg can't stall us.
 async fn capture_recent_bluetooth_dmesg() -> Option<String> {
     use tokio::process::Command;
     let result = tokio::time::timeout(

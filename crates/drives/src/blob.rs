@@ -1,5 +1,5 @@
 //! BLOB encoders/decoders for the parallel-slice point data stored on each
-//! route row. Line-by-line port of Go `server/drives/blob.go`.
+//! route row.
 //!
 //! All formats are little-endian, fixed-stride. Wire format is **binary-
 //! compatible with the Go implementation** so DBs can move between Go and
@@ -118,7 +118,7 @@ pub fn encode_gear_runs(runs: Option<&[GearRun]>) -> Option<Vec<u8>> {
     for r in runs {
         buf.push(r.gear);
         // Frames fits in i32; explicitly cast to stabilize the wire format
-        // across 32/64-bit builds (matches Go's int32 explicit conversion).
+        // across 32/64-bit builds (explicit int32 conversion).
         let frames = r.frames as i32;
         buf.extend_from_slice(&frames.to_le_bytes());
     }

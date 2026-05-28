@@ -259,11 +259,8 @@ else
       # use Tesla BLE API to nudge the car
       then
         # In-process bluez-based BLE — see crates/tesla_ble. Reads
-        # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs +
-        # sends one charge-port-close, exits. Replaces the
-        # tesla-control shell-out that previously needed
-        # exclusive raw-HCI access (which is why we used to have
-        # to stop the iOS GATT daemon for the whole session).
+        # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs + sends one
+        # charge-port-close, exits.
         if ! BLE_response=$(/root/bin/sentryusb-ble-action charge-port-close 2>&1)
         then
           # check false-negative BLE responses

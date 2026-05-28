@@ -188,7 +188,7 @@ async fn main() {
     phase!("drive_store_opened");
 
     // Legacy-JSON migration is now handled automatically inside
-    // DriveStore::open via the one-shot import dance (matches Go Store.Load).
+    // DriveStore::open via the one-shot import dance.
     // No manual step needed here — the import marker in the meta table
     // ensures it only runs once across the lifetime of the DB.
 
@@ -210,8 +210,8 @@ async fn main() {
         importing: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    // Keep-awake manager: busy if archiveloop is archiving OR drive processor
-    // is running. Matches Go's isBusy closure (server/api/keepawake.go).
+    // Keep-awake manager: busy if archiveloop is archiving OR the drive
+    // processor is running.
     let is_busy_processor = processor.clone();
     let is_busy: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(move || {
         sentryusb_api::drives_handler::is_archiving() || is_busy_processor.is_running()

@@ -1,6 +1,5 @@
-//! Load the user's Tesla BLE NIST P-256 private key + derive the
-//! public key for SessionInfoRequest. Also handles fresh key
-//! generation, replacing the previous `tesla-keygen` shell-out.
+//! Load the user's Tesla BLE NIST P-256 private key and derive the
+//! public key for SessionInfoRequest. Also generates fresh keypairs.
 
 use std::path::Path;
 
@@ -42,25 +41,11 @@ impl KeyPair {
     }
 }
 
-/// Generate a fresh P-256 BLE keypair and write both halves to disk
-/// at the standard Tesla locations.
-///
-/// Replaces the previous `tesla-keygen` shell-out. Writes:
-///   * `<dir>/key_private.pem` — PKCS#8 PEM (`-----BEGIN PRIVATE KEY-----`).
-///     Our `KeyPair::load` accepts both PKCS#8 and SEC1, so existing
-///     installs (created by tesla-keygen, which uses SEC1) keep
-///     working untouched; only freshly-generated keys land as PKCS#8.
-///   * `<dir>/key_public.pem` — SubjectPublicKeyInfo PEM
-///     (`-----BEGIN PUBLIC KEY-----`). Same format as tesla-keygen
-///     so anything that still reads the public key file (tesla-control
-///     add-key-request during pair, etc.) keeps working.
-///
-/// File permissions match tesla-keygen's conventions:
-///   * private key: 0600 (owner-only read)
-///   * public key:  0644
-///
-/// Returns the loaded keypair so the caller can use it immediately
-/// without a separate `KeyPair::load`.
+/// Generate a fresh P-256 BLE keypair, write both halves to disk, and
+/// return the loaded keypair. Writes:
+///   * `<dir>/key_private.pem` — PKCS#8 PEM, 0600. (`KeyPair::load` also
+///     accepts the SEC1 PEM that older tesla-keygen installs use.)
+///   * `<dir>/key_public.pem` — SPKI PEM, 0644 (what the pair flow reads).
 pub fn generate_keypair(dir: &Path) -> Result<KeyPair> {
     use p256::elliptic_curve::rand_core::OsRng;
     use p256::pkcs8::EncodePublicKey;

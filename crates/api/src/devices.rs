@@ -1,6 +1,6 @@
 //! Block device listing. Returns removable/external block devices suitable
 //! for use as DATA_DRIVE. Critical: the OS drive is always excluded so the
-//! user cannot accidentally wipe the boot/root disk. Port of server/api/devices.go.
+//! user cannot accidentally wipe the boot/root disk.
 
 use std::collections::HashSet;
 

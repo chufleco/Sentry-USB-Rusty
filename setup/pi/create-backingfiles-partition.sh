@@ -67,35 +67,21 @@ then
   PARTITION_PREFIX=$(partition_prefix_for "$DATA_DRIVE")
   P1="${DATA_DRIVE}${PARTITION_PREFIX}1"
   P2="${DATA_DRIVE}${PARTITION_PREFIX}2"
-  # Reuse existing partitions if they already have the correct labels.
-  # Mirrors the original teslausb 2-condition check so a wizard re-run
-  # for a config-only change (ARCHIVE_SERVER, etc.) cannot trigger a
-  # wipe just because blkid was momentarily slow to return the fstype
-  # or because the FS was being remounted. Stale TeslaCam data is
-  # cleaned separately by setup-sentryusb before creating backing
-  # files; fstab is rewritten unconditionally by update_fstab below
-  # whether we kept partitions or wiped them.
+  # Reuse existing partitions if they already have the correct labels —
+  # a config-only wizard re-run (ARCHIVE_SERVER, etc.) must not wipe data
+  # just because blkid was momentarily slow or the FS was remounting.
+  # Stale TeslaCam data is cleaned separately by setup-sentryusb; fstab is
+  # rewritten unconditionally below whether we keep or wipe partitions.
   if [ /dev/disk/by-label/backingfiles -ef "$P2" ] && \
      [ /dev/disk/by-label/mutable -ef "$P1" ]
   then
     log_progress "Existing backingfiles (xfs) and mutable (ext4) partitions found on $DATA_DRIVE. Keeping them."
-    # Quiesce anything that might be holding the partitions open so
-    # the next mount call finds them clean. Match teslausb's behavior
-    # on the keep-existing path: no xfs_repair, no mkfs.
-    #
-    # The previous incarnation of this block ran `xfs_repair -L` with
-    # a 60s timeout and reformatted the partition (`mkfs.xfs -f`) on
-    # any failure. That destroyed every snapshot and the cam_disk.bin
-    # for users whose xfs_repair couldn't finish in 60s OR whose
-    # repair exited non-zero immediately because the partition was
-    # still held by archiveloop / a loop device / a stale mount.
-    # The intent was to dodge a slow mount during XFS journal replay
-    # on 1TB+ drives previously used by TeslaUSB — but a slow mount
-    # is a UX problem, not a data problem. Mount itself handles log
-    # replay safely; if the log is genuinely broken the mount will
-    # fail loudly and the user can run xfs_repair manually. We never
-    # reformat in the keep-existing path. teslausb's
-    # create-backingfiles-partition.sh has worked this way for years.
+    # Quiesce anything holding the partitions open so the next mount finds
+    # them clean. On the keep-existing path: no xfs_repair, no mkfs — never
+    # reformat. Mount handles XFS log replay safely (it can be slow on
+    # 1TB+ drives, but that's a UX issue, not a data one); if the log is
+    # genuinely broken the mount fails loudly and the user can run
+    # xfs_repair manually.
     killall archiveloop 2>/dev/null || true
     /root/bin/disable_gadget.sh 2>/dev/null || true
     for loop in $(losetup -a 2>/dev/null | grep -E '/backingfiles/|/mnt/' | cut -d: -f1); do

@@ -1,23 +1,18 @@
-//! Tesla vehicle-command crypto primitives.
+//! Tesla vehicle-command crypto primitives: the ECDH-derived session
+//! key.
 //!
-//! This is Push 1 of Phase 2: the ECDH-derived session-key half.
-//! AES-GCM signing comes in Push 2, once we've verified key derivation
-//! matches what tesla-control produces.
+//! Key derivation per Tesla's vehicle-command spec
+//! (`pkg/protocol/protocol/session.go`):
 //!
-//! **Key derivation per Tesla's vehicle-command spec**
-//! (`pkg/protocol/protocol/session.go` in their open-source repo):
+//! 1. ECDH: own private scalar × vehicle ephemeral public key → shared
+//!    point; take the 32-byte X coordinate.
+//! 2. SHA-1(X), first 16 bytes.
+//! 3. That 16-byte value is the AES-128 session key for
+//!    `AES_GCM_PERSONALIZED` signatures.
 //!
-//! 1. ECDH: own private scalar × vehicle ephemeral public key →
-//!    shared point. Take the 32-byte X coordinate.
-//! 2. Hash: SHA-1(X). Take the first 16 bytes.
-//! 3. That 16-byte value is the AES-128 session key used for
-//!    `AES_GCM_PERSONALIZED` signatures on every signed command.
-//!
-//! The use of SHA-1 is intentional and matches Tesla's spec exactly —
-//! it's not collision-bearing here, it's just being used as a key-
-//! derivation hash. Don't "upgrade" this to SHA-256 without first
-//! confirming Tesla changed the wire format, or the car will reject
-//! every command with a decryption failure.
+//! SHA-1 is intentional and matches Tesla's spec — it's a KDF hash here,
+//! not collision-sensitive. Don't "upgrade" to SHA-256 unless Tesla
+//! changes the wire format, or every command fails to decrypt.
 
 use anyhow::{Context, Result};
 use p256::PublicKey;

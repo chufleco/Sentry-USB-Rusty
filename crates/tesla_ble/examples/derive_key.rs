@@ -1,35 +1,20 @@
-//! Phase 2 Push 1 verification: derive the session key for one Tesla
-//! domain and compare to what tesla-control has cached for the same
-//! pairing.
-//!
-//! What this proves: our ECDH + SHA-1 truncation produces a key that
-//! the car will accept. If our derived key matches the bytes in
-//! tesla-control's session-cache JSON, the next step (AES-GCM signing
-//! in Push 2) is wiring up the rest of the protocol around a known-
-//! good key. If they DON'T match, fixing it now is much cheaper than
-//! debugging "decrypt failed on the car" later.
+//! Derive the session key for one Tesla domain and compare it to what
+//! tesla-control has cached for the same pairing — proves our ECDH +
+//! SHA-1 truncation produces a key the car accepts.
 //!
 //! Usage:
 //!   cargo run --example derive_key -- \
 //!     /root/.ble/key_private.pem \
 //!     <vehicle-pubkey-hex>
 //!
-//! Where <vehicle-pubkey-hex> is the 130-character hex string
-//! representing the 65-byte SEC1 uncompressed pubkey the car returned
-//! in its SessionInfo response. The easiest way to get one is to run
-//! the existing `session_info` example first — its output prints the
-//! pubkey for both INFOTAINMENT and VEHICLE_SECURITY domains.
-//!
-//! You can then cross-check against tesla-control's session cache:
+//! <vehicle-pubkey-hex> is the 130-char hex of the 65-byte SEC1 pubkey
+//! the car returned in its SessionInfo (run the `session_info` example
+//! to get it). Cross-check against tesla-control's cache:
 //!
 //!   cat /backingfiles/tesla-session-cache.json | jq .
 //!
-//! The cache stores SessionInfo bytes per (VIN, domain). Decoding
-//! the SessionInfo proto inside one of those entries gives you the
-//! same `public_key` field — same vehicle pubkey we should be using
-//! here. If our derived session key matches the car's expectation
-//! (which we'll know for sure when Push 2 lands and `state climate`
-//! either works or returns a decrypt error), Push 1 is correct.
+//! Decoding the SessionInfo proto in an entry gives the same
+//! `public_key`; a matching derived key means we're correct.
 
 use std::path::PathBuf;
 

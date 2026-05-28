@@ -1,6 +1,6 @@
 //! Startup migration: update peripheral files (shell scripts, BLE daemon,
 //! Avahi service, etc.) when the binary has been replaced by a newer version
-//! but the surrounding artifacts on disk are stale. Port of server/migrate.go.
+//! but the surrounding artifacts on disk are stale.
 //!
 //! This solves the bootstrap problem for existing installs whose Rust binary
 //! was updated via a minimal replace-only update path — their scripts, BLE
@@ -123,7 +123,7 @@ fn build_migration_script(tarball_url: &str) -> String {
 mkdir -p /root/bin
 
 # ── Migrate broken cttseraser FUSE fstab entry to bind mount ──
-# Installs that completed setup before PR #13 (FUSE → bind mount) still
+# Installs that completed setup before the FUSE → bind-mount switch still
 # carry the legacy `mount.ctts#/mutable/TeslaCam …` fstab line, which
 # depends on a /sbin/mount.ctts helper and the cttseraser binary —
 # both removed in the bind-mount switch. With the helper gone the mount
@@ -366,16 +366,15 @@ systemctl enable sentryusb-ble 2>/dev/null || true
 systemctl restart sentryusb-ble 2>/dev/null || true
 
 # ── Post-migration patches (persist across upstream script updates) ──
-# These heal existing installs whose run/ scripts above were just replaced
-# with upstream copies that don't yet carry the user-facing fixes shipped
-# in PRs #31 / #35. Idempotent — the `grep -q` guards prevent re-patching.
+# These re-apply user-facing fixes onto the run/ scripts just replaced with
+# upstream copies. Idempotent — the `grep -q` guards prevent re-patching.
 
-# Patch 1: send-push-message — respect SENTRY_NOTIFICATION_URL (PR #31)
+# Patch 1: send-push-message — respect SENTRY_NOTIFICATION_URL
 if grep -q 'https://notifications.sentry-six.com/send"' /root/bin/send-push-message 2>/dev/null; then
   sed -i 's|"https://notifications.sentry-six.com/send"|"${{SENTRY_NOTIFICATION_URL:-https://notifications.sentry-six.com}}/send"|' /root/bin/send-push-message
 fi
 
-# Patch 2: archiveloop — read active chime from library dir instead of flat file (PR #35)
+# Patch 2: archiveloop — read active chime from library dir instead of flat file
 if grep -q '[ -f "/mutable/LockChime.wav" ]' /root/bin/archiveloop 2>/dev/null; then
   python3 - <<'PYEOF'
 content = open('/root/bin/archiveloop').read()

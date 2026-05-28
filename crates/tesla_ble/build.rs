@@ -8,8 +8,8 @@ fn main() {
         "proto/signatures.proto",
         "proto/universal_message.proto",
         "proto/vcsec.proto",
-        // Added for Push 5 — needed to decode the encrypted state-query
-        // responses the car returns over Infotainment.
+        // Needed to decode the encrypted state-query responses the car
+        // returns over Infotainment.
         "proto/managed_charging.proto",
         "proto/vehicle.proto",
         "proto/car_server.proto",
