@@ -395,6 +395,16 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
     // the clock (systemd-timesyncd keeps sync quietly in the background)
     // but it floods the archive log and causes a cold-boot window where
     // clip folder timestamps are wrong until timesyncd catches up.
+    //
+    // `netcat-openbsd` provides the `nc` binary used by
+    // `run/{nfs,cifs}_archive/archive-is-reachable.sh` (`nc -z -w 5
+    // $HOST 2049|445`). The official Pi OS image preinstalls it, but
+    // alternative images (DietPi, Radxa Debian, etc.) don't, so without
+    // this every archive cycle exits 127 from the reachability probe
+    // and archiveloop is permanently stuck on "Waiting for archive to
+    // be reachable..." — clips and music never sync. The bash flow
+    // installed it inside `verify-and-configure-archive.sh`, which is
+    // no longer executed in the Rust port.
     let packages: &[(&str, &str)] = &[
         ("dos2unix", "dos2unix"),
         ("parted", "parted"),
@@ -403,6 +413,7 @@ pub async fn install_required_packages(emitter: &SetupEmitter) -> Result<bool> {
         ("rsync", "rsync"),
         ("jq", "jq"),
         ("ntpdig", "ntpsec-ntpdig"),
+        ("nc", "netcat-openbsd"),
     ];
     let mut to_install: Vec<&str> = Vec::new();
 
