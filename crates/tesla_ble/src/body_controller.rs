@@ -107,6 +107,6 @@ fn parse_response(bytes: &[u8]) -> Result<VehicleStatus> {
 
 fn random_uuid_bytes() -> [u8; 16] {
     let mut out = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut out);
+    rand::rng().fill_bytes(&mut out);
     out
 }
