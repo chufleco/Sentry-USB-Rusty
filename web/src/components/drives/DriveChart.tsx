@@ -16,14 +16,25 @@ interface DriveChartProps {
   startTime: string
 }
 
-// Chart layout constants — must match the AreaChart's `margin` prop
-// and YAxis `width` below. We compute the click→index mapping in
-// pixel space ourselves because Recharts 3.x's `onClick` handler does
-// not reliably populate `activeTooltipIndex` (the event fires before
-// the chart's redux store settles, so the field is frequently
-// undefined no matter where you click).
-const YAXIS_WIDTH = 36
+// Chart layout constants — must stay in sync with the AreaChart's
+// `margin` prop, YAxis `width`, and XAxis `padding` below. We compute
+// the click→index mapping in pixel space ourselves because Recharts
+// 3.x's `onClick` handler doesn't reliably populate
+// `activeTooltipIndex` (the event fires before the chart's redux
+// store settles).
+//
+// For a `type="number"` XAxis, data is drawn inside
+//   [margin.left + yAxis.width + xPad.left,
+//    containerWidth - margin.right - xPad.right]
+// Skipping `margin.left` and the XAxis padding shifts the mapped time
+// by ~(margin.left + xPad.left + xPad.right) / plotWidth of the drive
+// duration — visible as ~30-60 sec of click-vs-map drift on a long
+// drive.
+const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 16
+const YAXIS_WIDTH = 36
+const X_PADDING_LEFT = 10
+const X_PADDING_RIGHT = 4
 
 export default function DriveChart({
   series,
@@ -49,8 +60,8 @@ export default function DriveChart({
     const container = containerRef.current
     if (!container) return
     const rect = container.getBoundingClientRect()
-    const plotLeft = YAXIS_WIDTH
-    const plotRight = rect.width - RIGHT_MARGIN
+    const plotLeft = LEFT_MARGIN + YAXIS_WIDTH + X_PADDING_LEFT
+    const plotRight = rect.width - RIGHT_MARGIN - X_PADDING_RIGHT
     const plotWidth = plotRight - plotLeft
     if (plotWidth <= 0) return
     const x = e.clientX - rect.left
@@ -86,7 +97,7 @@ export default function DriveChart({
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <AreaChart
           data={series}
-          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 16, left: 4 }}
+          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 16, left: LEFT_MARGIN }}
         >
           <defs>
             <linearGradient id="speedFill" x1="0" y1="0" x2="0" y2="1">
@@ -105,7 +116,7 @@ export default function DriveChart({
             axisLine={false}
             tickMargin={10}
             minTickGap={56}
-            padding={{ left: 10, right: 4 }}
+            padding={{ left: X_PADDING_LEFT, right: X_PADDING_RIGHT }}
           />
           <YAxis
             stroke="#475569"
@@ -114,7 +125,7 @@ export default function DriveChart({
             tickLine={false}
             axisLine={false}
             tickMargin={4}
-            width={36}
+            width={YAXIS_WIDTH}
           />
           <Tooltip
             content={({ active, payload }) => {
@@ -130,7 +141,7 @@ export default function DriveChart({
                     {valueFormatter(p.value)}
                   </div>
                   <div className="text-[10px] text-slate-500 tabular-nums">
-                    {formatTickTime(baseMs, p.time)}
+                    {formatTooltipTime(baseMs, p.time)}
                   </div>
                 </div>
               )
@@ -155,4 +166,18 @@ function formatTickTime(baseMs: number, relMs: number): string {
   const t = new Date(baseMs + relMs)
   if (Number.isNaN(t.getTime())) return ""
   return t.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })
+}
+
+// Tooltip needs second-level resolution so the user can verify the
+// clicked sample matches what the map's playback card shows — the
+// map card already includes seconds. Axis ticks keep minute
+// resolution (cleaner on a 30-min+ drive).
+function formatTooltipTime(baseMs: number, relMs: number): string {
+  const t = new Date(baseMs + relMs)
+  if (Number.isNaN(t.getTime())) return ""
+  return t.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+  })
 }

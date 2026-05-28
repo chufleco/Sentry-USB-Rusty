@@ -11,12 +11,21 @@ import {
 } from "recharts"
 import { useScrubberActions } from "@/hooks/useScrubberSync"
 
-// Layout constants must match the LineChart's `margin` + YAxis `width`
-// below. Click-to-seek is computed in pixel space because Recharts
-// 3.x's onClick fires before its internal redux store settles, so
-// `activeTooltipIndex` is unreliable.
-const YAXIS_WIDTH = 44
+// Layout constants — must stay in sync with the LineChart's `margin`,
+// YAxis `width`, and XAxis `padding` below. Click-to-seek is computed
+// in pixel space because Recharts 3.x's onClick fires before its
+// internal redux store settles, so `activeTooltipIndex` is unreliable.
+//
+// For a `type="number"` XAxis, data is drawn inside
+//   [margin.left + yAxis.width + xPad.left,
+//    containerWidth - margin.right - xPad.right]
+// Skipping `margin.left` or the X padding produces ~30-60 sec of
+// click-vs-map drift on a long drive.
+const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 16
+const YAXIS_WIDTH = 44
+const X_PADDING_LEFT = 10
+const X_PADDING_RIGHT = 4
 
 export interface TemperaturePoint {
   // Unix ms — backend (drives_handler::temperature_series) emits the
@@ -105,8 +114,8 @@ export default function TemperatureChart({
     const container = containerRef.current
     if (!container) return
     const rect = container.getBoundingClientRect()
-    const plotLeft = YAXIS_WIDTH
-    const plotRight = rect.width - RIGHT_MARGIN
+    const plotLeft = LEFT_MARGIN + YAXIS_WIDTH + X_PADDING_LEFT
+    const plotRight = rect.width - RIGHT_MARGIN - X_PADDING_RIGHT
     const plotWidth = plotRight - plotLeft
     if (plotWidth <= 0) return
     const x = e.clientX - rect.left
@@ -132,7 +141,7 @@ export default function TemperatureChart({
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
           data={converted}
-          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: 4 }}
+          margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
           <XAxis
@@ -146,7 +155,7 @@ export default function TemperatureChart({
             axisLine={false}
             tickMargin={10}
             minTickGap={56}
-            padding={{ left: 10, right: 4 }}
+            padding={{ left: X_PADDING_LEFT, right: X_PADDING_RIGHT }}
           />
           <YAxis
             stroke="#475569"
@@ -155,7 +164,7 @@ export default function TemperatureChart({
             tickLine={false}
             axisLine={false}
             tickMargin={4}
-            width={44}
+            width={YAXIS_WIDTH}
             domain={["dataMin - 2", "dataMax + 2"]}
           />
           <Tooltip
