@@ -1,0 +1,68 @@
+# Dependency monitoring for Sentry-USB-Rusty.
+#
+# Weekly grouped PRs for minor + patch updates to keep noise down.
+# Security advisories fire immediately as separate ungrouped PRs
+# (Dependabot default — security updates ignore the schedule).
+
+version: 2
+
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Edmonton"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "rust"
+    commit-message:
+      prefix: "deps(cargo)"
+      include: "scope"
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "npm"
+    directory: "/web"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Edmonton"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "web"
+    commit-message:
+      prefix: "deps(web)"
+      include: "scope"
+    groups:
+      web-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "America/Edmonton"
+    open-pull-requests-limit: 5
+    labels:
+      - "dependencies"
+      - "ci"
+    commit-message:
+      prefix: "deps(ci)"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
