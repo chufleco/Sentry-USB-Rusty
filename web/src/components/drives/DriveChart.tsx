@@ -36,8 +36,14 @@ export default function DriveChart({
   const containerRef = useRef<HTMLDivElement>(null)
 
   // Click anywhere in the chart → seek to that fractional position
-  // along the time axis. Maps the click's X relative to the plot area
-  // (container minus Y-axis + right margin) to a data-point index.
+  // along the time axis. The XAxis is `type="number"` keyed on `time`,
+  // so Recharts positions points by their time value, NOT by array
+  // index. Sample density is non-uniform (each 1-minute clip has a
+  // different point count, plus small gaps can sit between clips), so
+  // mapping click-X to an array index would land on a different sample
+  // than the tooltip shows at the cursor. Resolve click-X → target
+  // time, then binary-search the (time-sorted) series for the nearest
+  // sample.
   const handleClick = (e: React.MouseEvent<HTMLDivElement>) => {
     if (series.length < 2) return
     const container = containerRef.current
@@ -50,9 +56,24 @@ export default function DriveChart({
     const x = e.clientX - rect.left
     const clamped = Math.max(plotLeft, Math.min(plotRight, x))
     const frac = (clamped - plotLeft) / plotWidth
-    const idx = Math.round(frac * (series.length - 1))
-    const safe = Math.max(0, Math.min(series.length - 1, idx))
-    setIndex(series[safe].index)
+    const tMin = series[0].time
+    const tMax = series[series.length - 1].time
+    if (!(tMax > tMin)) return
+    const target = tMin + frac * (tMax - tMin)
+    let lo = 0
+    let hi = series.length - 1
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1
+      if (series[mid].time < target) lo = mid + 1
+      else hi = mid
+    }
+    let best = lo
+    if (lo > 0) {
+      const a = Math.abs(series[lo - 1].time - target)
+      const b = Math.abs(series[lo].time - target)
+      if (a < b) best = lo - 1
+    }
+    setIndex(series[best].index)
   }
 
   return (
