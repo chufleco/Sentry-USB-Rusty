@@ -100,6 +100,32 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
     let elapsed = started.elapsed().as_millis();
 
     let shift_state = drive.shift_state.as_ref().map(map_shift_state);
+    // Root-cause capture for cars that report a non-gear shift while
+    // parked (older firmware encodes Park as Invalid/SNA/empty rather
+    // than an explicit `P`, which we collapse to Unknown and the
+    // quiet-mode gate then ignores). When shift doesn't resolve to a
+    // real gear, log the RAW decoded field plus speed so a bundle shows
+    // exactly what the car sent. Deliberately NOT logging the whole
+    // DriveState — it carries GPS coords + route destination (PII).
+    // Throttled to ~1/min so a parked car doesn't flood the journal.
+    if !matches!(
+        shift_state,
+        Some(ShiftState::Park | ShiftState::Drive | ShiftState::Reverse | ShiftState::Neutral)
+    ) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LAST_LOG_SECS: AtomicU64 = AtomicU64::new(0);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        if now.saturating_sub(LAST_LOG_SECS.load(Ordering::Relaxed)) >= 60 {
+            LAST_LOG_SECS.store(now, Ordering::Relaxed);
+            info!(
+                "shift diagnostic: raw shift_state={:?}, optional_speed={:?} → maps to {:?}",
+                drive.shift_state, drive.optional_speed, shift_state
+            );
+        }
+    }
     let odometer_mi = drive
         .optional_odometer_in_hundredths_of_a_mile
         .as_ref()
