@@ -79,9 +79,11 @@ interface BleLatestSample {
   odometer_mi?: number | null
   location_name?: string | null
   /** Live gate inputs from the daemon's snapshot file (not the DB).
-   *  "unknown" means the daemon couldn't read the field from the car. */
+   *  "unknown" means the daemon couldn't read the field from the car;
+   *  shift "absent" means Tesla omitted shift_state on a good drive poll. */
   sentry_mode?: string | null
   charging_state?: string | null
+  shift_state?: string | null
   source?: string
   /** Age (seconds) of the most recent body-controller poll, or null
    *  if the sampler has never done one. Body-controller polls run
@@ -1074,6 +1076,12 @@ function TelemetryOutputPanel({
             <Row
               label="Charging"
               value={sample.charging_state === "unknown" ? "Unknown" : sample.charging_state}
+            />
+          )}
+          {sample.shift_state && (
+            <Row
+              label="Shift"
+              value={sample.shift_state === "absent" ? "Not reported" : sample.shift_state}
             />
           )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />

@@ -461,7 +461,7 @@ async fn tick(
     // A persistent `[DEFAULTED]` here means Tesla isn't reporting that
     // field over BLE (it drops optional fields), so the car can never
     // qualify for Quiet. Throttled to ~once/min.
-    if want_quiet && !in_quiet_mode {
+    if !in_quiet_mode {
         let now = Instant::now();
         let due = last_gate_log
             .map(|t| now.duration_since(t) >= Duration::from_secs(60))
@@ -471,17 +471,31 @@ async fn tick(
             let sentry_src = if last_sentry_mode.is_some() {
                 "read"
             } else {
-                "DEFAULTED: no closures reading yet"
+                "DEFAULTED: unread"
             };
             let charge_src = if last_charging_state.is_some() {
                 "read"
             } else {
-                "DEFAULTED: no charge reading yet"
+                "DEFAULTED: unread"
             };
+            // Active means we keep polling, which keeps the car awake.
+            // Quiet needs (car_truly_asleep OR parked_confirmed) AND
+            // !charge AND !sentry. Surface all four so a stuck Active is
+            // diagnosable: a car that's parked-awake (cam_disk touched
+            // because OUR polling keeps it awake) never goes
+            // `car_truly_asleep`, so the only escape is `parked_confirmed`
+            // — and if shift_state isn't observed as Park, that's stuck
+            // too and the car can never sleep.
             info!(
-                "gate: parked/asleep but staying Active — sentry_on={} [{}], \
-                 actively_charging={} [{}] (car only qualifies for Quiet when both are false)",
-                sentry_on, sentry_src, actively_charging, charge_src
+                "gate: staying Active — car_truly_asleep={}, parked_polls={}/{}, \
+                 sentry_on={} [{}], actively_charging={} [{}]",
+                car_truly_asleep,
+                *parked_polls,
+                PARK_CONFIRMATIONS_BEFORE_QUIET,
+                sentry_on,
+                sentry_src,
+                actively_charging,
+                charge_src,
             );
         }
     }
@@ -910,7 +924,9 @@ async fn tick(
         // Live snapshot of the gate inputs for the BLE card (not the DB).
         // Reflects this tick's charge/closures polls; "Poll now" forces an
         // Active tick, so the card shows a fresh sentry/charge read.
-        write_gate_status_file(*last_sentry_mode, *last_charging_state);
+        // shift_state_observed is this tick's drive read (None = drive
+        // didn't run this tick OR Tesla omitted shift_state).
+        write_gate_status_file(*last_sentry_mode, *last_charging_state, shift_state_observed);
 
         // Sleep until the next sub-sampler is due (usually drive, 15s).
         let next = schedule.next_due();
@@ -1023,6 +1039,7 @@ const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 fn write_gate_status_file(
     sentry: Option<sample::SentryMode>,
     charging: Option<sample::ChargingState>,
+    shift: Option<sample::ShiftState>,
 ) {
     let sentry_s = sentry
         .map(|s| format!("{s:?}"))
@@ -1030,12 +1047,20 @@ fn write_gate_status_file(
     let charging_s = charging
         .map(|c| format!("{c:?}"))
         .unwrap_or_else(|| "unknown".into());
+    // `absent` (vs `Unknown`) means the drive poll succeeded but Tesla
+    // didn't include shift_state at all — the case that wedges the
+    // park-confirmation counter, since the gate can't tell "parked" from
+    // "drive didn't run". Surfacing it makes the wedge self-evident.
+    let shift_s = shift
+        .map(|s| format!("{s:?}"))
+        .unwrap_or_else(|| "absent".into());
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let body =
-        format!("sentry_mode={sentry_s}\ncharging_state={charging_s}\nupdated={now}\n");
+    let body = format!(
+        "sentry_mode={sentry_s}\ncharging_state={charging_s}\nshift_state={shift_s}\nupdated={now}\n"
+    );
     let _ = std::fs::write(GATE_STATUS_PATH, body);
 }
 

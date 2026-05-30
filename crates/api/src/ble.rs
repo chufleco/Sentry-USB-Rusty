@@ -509,20 +509,23 @@ const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
 /// of `"unknown"` is preserved (not nulled) — it means the daemon hasn't
 /// read that field from the car, which is exactly what the user wants to
 /// see when diagnosing "why won't my car sleep".
-fn read_gate_status() -> (Option<String>, Option<String>) {
+fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
     let Ok(body) = std::fs::read_to_string(GATE_STATUS_PATH) else {
-        return (None, None);
+        return (None, None, None);
     };
     let mut sentry = None;
     let mut charging = None;
+    let mut shift = None;
     for line in body.lines() {
         if let Some(v) = line.strip_prefix("sentry_mode=") {
             sentry = Some(v.trim().to_string());
         } else if let Some(v) = line.strip_prefix("charging_state=") {
             charging = Some(v.trim().to_string());
+        } else if let Some(v) = line.strip_prefix("shift_state=") {
+            shift = Some(v.trim().to_string());
         }
     }
-    (sentry, charging)
+    (sentry, charging, shift)
 }
 
 /// Returns the most recent row from `telemetry_samples` so the UI can
@@ -656,8 +659,8 @@ pub async fn ble_latest_sample(
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
 
-    // Live sentry/charge from the daemon's gate file (not the DB).
-    let (sentry_mode, charging_state) = read_gate_status();
+    // Live sentry/charge/shift from the daemon's gate file (not the DB).
+    let (sentry_mode, charging_state, shift_state) = read_gate_status();
 
     match result {
         Some((
@@ -689,11 +692,14 @@ pub async fn ble_latest_sample(
                 "tire_rr_psi": tire_rr_psi,
                 "odometer_mi": odometer_mi,
                 "location_name": location_name,
-                // Live gate inputs (sentry mode, charging state) from the
-                // daemon's snapshot file, not the DB. "unknown" means the
-                // daemon couldn't read the field from the car.
+                // Live gate inputs (sentry mode, charging state, shift)
+                // from the daemon's snapshot file, not the DB. "unknown"
+                // means the daemon couldn't read the field; shift
+                // "absent" means Tesla omitted shift_state on a
+                // successful drive poll (wedges the park-sleep gate).
                 "sentry_mode": sentry_mode,
                 "charging_state": charging_state,
+                "shift_state": shift_state,
                 "source": source,
                 // Null if we've never seen a body-controller poll. The
                 // UI uses recent body-controller-but-stale-state to
