@@ -301,6 +301,14 @@ export function DriveMap({
     // no visible gap at the transition. Falls back to a single-color
     // polyline (emerald for SEI, violet for Tessie-source) when
     // fsdStates is missing or length-mismatched.
+    // Break the route wherever consecutive points jump more than GAP_M apart.
+    // Happens on a genuine GPS dropout (tunnel/signal loss) and at the seam left
+    // when an overlapping/duplicate RecentClips segment is dropped upstream —
+    // without the break the polyline slashes a straight line across the map
+    // between the two. (The data layer's monotonic-time filter removes the bulk
+    // of any overlap; this catches the residual seam.)
+    const GAP_M = 300
+
     const hasFsdSegments =
       fsdStates !== undefined && fsdStates.length === points.length
     if (hasFsdSegments) {
@@ -308,7 +316,9 @@ export function DriveMap({
       for (let i = 1; i <= points.length; i++) {
         const prevEngaged = fsdStates[i - 1] > 0
         const curEngaged = i < points.length ? fsdStates[i] > 0 : !prevEngaged
-        if (curEngaged !== prevEngaged || i === points.length) {
+        const gap =
+          i < points.length && latLngs[i - 1].distanceTo(latLngs[i]) > GAP_M
+        if (curEngaged !== prevEngaged || gap || i === points.length) {
           const segPts = latLngs.slice(segStart, i)
           if (segPts.length >= 2) {
             L.polyline(segPts, {
@@ -318,17 +328,30 @@ export function DriveMap({
               smoothFactor: 1.2,
             }).addTo(map)
           }
-          segStart = Math.max(i - 1, 0)
+          // Gap → start fresh at i (don't bridge). State change → share the
+          // boundary point so the colors meet seamlessly.
+          segStart = gap ? i : Math.max(i - 1, 0)
         }
       }
     } else {
       const stroke = source === "tessie" ? COLOR_TESSIE : COLOR_FSD
-      L.polyline(latLngs, {
-        color: stroke,
-        weight: 4,
-        opacity: 1,
-        smoothFactor: 1.2,
-      }).addTo(map)
+      let segStart = 0
+      for (let i = 1; i <= latLngs.length; i++) {
+        const gap =
+          i < latLngs.length && latLngs[i - 1].distanceTo(latLngs[i]) > GAP_M
+        if (gap || i === latLngs.length) {
+          const segPts = latLngs.slice(segStart, i)
+          if (segPts.length >= 2) {
+            L.polyline(segPts, {
+              color: stroke,
+              weight: 4,
+              opacity: 1,
+              smoothFactor: 1.2,
+            }).addTo(map)
+          }
+          segStart = i
+        }
+      }
     }
 
     // Start / end / pulse all use DOM markers (divIcon) so the pulse

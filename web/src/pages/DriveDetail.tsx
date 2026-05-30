@@ -130,9 +130,61 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
     }
   }, [drive.id])
 
+  // RecentClips can stitch overlapping/duplicate same-minute clips into one
+  // drive, which makes a point's synthesized time jump backward at the seam
+  // (and teleport position). Filter to a strictly non-decreasing time sequence
+  // so the colliding clip's backward points are dropped and EVERY consumer
+  // (map, scrubber, speed chart) shares one clean, monotonic, index-aligned
+  // sequence. fsdStates is parallel to points, so it's filtered in lockstep or
+  // the route's FSD/manual coloring would break. A normal contiguous drive is
+  // already monotonic → no-op.
+  const { monoPoints, monoFsdStates } = useMemo(() => {
+    // Drop points that break a single continuous trajectory: (1) backward-in-time
+    // samples from overlapping RecentClips clips, and (2) teleports — a position
+    // jump too far for the elapsed time to be real travel (the surviving tail of
+    // a colliding clip lands 3.7km away in a few ms = ~50,000 m/s). What remains
+    // is one clean, monotonic, index-aligned sequence shared by the map, scrubber
+    // and speed chart; fsdStates is filtered in lockstep so route coloring stays
+    // aligned. No-op on a normal contiguous drive.
+    const hav = (la1: number, lo1: number, la2: number, lo2: number) => {
+      const R = 6371000
+      const r = Math.PI / 180
+      const dLa = (la2 - la1) * r
+      const dLo = (lo2 - lo1) * r
+      const a =
+        Math.sin(dLa / 2) ** 2 +
+        Math.cos(la1 * r) * Math.cos(la2 * r) * Math.sin(dLo / 2) ** 2
+      return 2 * R * Math.asin(Math.sqrt(a))
+    }
+    const MAX_MPS = 60 // ~134 mph; faster than any real drive → a data teleport
+    const pts: typeof drive.points = []
+    const fsd: number[] = []
+    const hasFsd =
+      Array.isArray(drive.fsdStates) &&
+      drive.fsdStates.length === drive.points.length
+    let maxT = -Infinity
+    let last: (typeof drive.points)[number] | null = null
+    drive.points.forEach((p, i) => {
+      if (p[2] < maxT) return // backward in time → drop
+      if (last) {
+        const dt = (p[2] - last[2]) / 1000
+        const dist = hav(last[0], last[1], p[0], p[1])
+        if (dist > 50 && (dt <= 0 || dist / dt > MAX_MPS)) return // teleport → drop
+      }
+      pts.push(p)
+      if (hasFsd) fsd.push(drive.fsdStates![i])
+      maxT = p[2]
+      last = p
+    })
+    return {
+      monoPoints: pts,
+      monoFsdStates: hasFsd ? fsd : drive.fsdStates,
+    }
+  }, [drive.points, drive.fsdStates])
+
   useEffect(() => {
-    setTotal(drive.points.length)
-  }, [drive.points.length, setTotal])
+    setTotal(monoPoints.length)
+  }, [monoPoints.length, setTotal])
 
   const title = drive.endLocation ?? "Drive"
   // Only the "imported from Tessie" badge is informative — drives from
@@ -156,7 +208,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
   //     last value (most recent reading wins — matches what the
   //     scrubber would land on).
   const speedSeries = useMemo(() => {
-    const raw = drive.points
+    const raw = monoPoints
       .map((p, i) => ({
         index: i,
         time: p[2],
@@ -179,7 +231,7 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
       }
     }
     return out
-  }, [drive.points, metric])
+  }, [monoPoints, metric])
 
   const speedUnit = metric ? "km/h" : "mph"
   const fsdFull = drive.fsdPercent >= 100
@@ -219,8 +271,8 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
       <div className={hasFsdEvents ? "mt-2" : "mt-4"}>
         <div className="relative">
           <DriveMap
-            points={drive.points}
-            fsdStates={drive.fsdStates}
+            points={monoPoints}
+            fsdStates={monoFsdStates}
             fsdEvents={drive.fsdEvents}
             showEvents={showFsdEvents}
             source={drive.source}
@@ -238,9 +290,9 @@ function DriveDetailContent({ drive, onSaveTags }: DriveDetailContentProps) {
         {/* DriveScrubber now renders the FSD engagement overlay on its
             own track — the standalone FsdEngagementStripe is retired. */}
         <DriveScrubber
-          points={drive.points}
+          points={monoPoints}
           startTime={drive.startTime}
-          fsdStates={drive.fsdStates}
+          fsdStates={monoFsdStates}
         />
       </div>
 
