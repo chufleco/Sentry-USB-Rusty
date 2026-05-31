@@ -164,6 +164,20 @@ fn append_line(line: &str) -> Result<()> {
     Ok(())
 }
 
+/// Append a one-off, timestamped event line to the persistent BLE log
+/// (the same file the Logs → Bluetooth tab shows). Unlike the systemd
+/// journal — which is volatile on this Pi and wiped on every reboot —
+/// this survives power cuts, so keep-accessory ON/OFF decisions can be
+/// reviewed after the fact to diagnose parked-power behavior.
+pub fn log_event(msg: &str) {
+    let local: DateTime<Local> = Local::now();
+    let ts_str = local.format("%Y-%m-%d %H:%M:%S %Z").to_string();
+    let line = format!("[{ts_str}] {msg}\n");
+    if let Err(e) = append_line(&line) {
+        debug!("diag log_event append failed: {e:#}");
+    }
+}
+
 fn rotate_if_needed() -> Result<()> {
     let meta = match std::fs::metadata(LOG_PATH) {
         Ok(m) => m,

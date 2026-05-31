@@ -21,7 +21,10 @@ const sections = [
   },
   {
     title: "Keep Awake",
-    fields: ["TESLA_BLE_VIN", "TESLAFI_API_TOKEN", "TESSIE_API_TOKEN", "TESSIE_VIN", "KEEP_AWAKE_WEBHOOK_URL", "SENTRY_CASE"],
+    fields: [
+      "TESLA_BLE_VIN", "TESLAFI_API_TOKEN", "TESSIE_API_TOKEN", "TESSIE_VIN", "KEEP_AWAKE_WEBHOOK_URL", "SENTRY_CASE",
+      "KEEP_ACCESSORY_ENABLED", "KEEP_ACCESSORY_HOME_LAT", "KEEP_ACCESSORY_HOME_LON", "KEEP_ACCESSORY_HOME_RADIUS_M",
+    ],
   },
   {
     title: "Notifications",

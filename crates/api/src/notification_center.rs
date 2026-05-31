@@ -73,6 +73,14 @@ pub struct NotificationSettings {
     pub drives: bool,
     pub rtc_battery: bool,
     pub music_sync: bool,
+    /// Keep-Accessory automation events (e.g. "Pi going offline" when the
+    /// 12V outlet is released at home). Only relevant for 12V-powered Pis.
+    #[serde(default = "default_true")]
+    pub keep_accessory: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for NotificationSettings {
@@ -87,6 +95,7 @@ impl Default for NotificationSettings {
             drives: true,
             rtc_battery: true,
             music_sync: true,
+            keep_accessory: true,
         }
     }
 }
@@ -111,6 +120,7 @@ fn load_settings() -> NotificationSettings {
         drives: bool_pref(&prefs, "notify_drives", true),
         rtc_battery: bool_pref(&prefs, "notify_rtc_battery", true),
         music_sync: bool_pref(&prefs, "notify_music_sync", true),
+        keep_accessory: bool_pref(&prefs, "notify_keep_accessory", true),
     }
 }
 
@@ -130,6 +140,7 @@ fn save_settings(s: &NotificationSettings) {
     put(&mut prefs, "notify_drives", s.drives);
     put(&mut prefs, "notify_rtc_battery", s.rtc_battery);
     put(&mut prefs, "notify_music_sync", s.music_sync);
+    put(&mut prefs, "notify_keep_accessory", s.keep_accessory);
     crate::preferences::save_prefs(&prefs);
 }
 
@@ -260,6 +271,7 @@ pub(crate) fn is_type_enabled(notification_type: Option<&str>) -> bool {
         "drives" => s.drives,
         "rtc_battery" => s.rtc_battery,
         "music_sync" => s.music_sync,
+        "keep_accessory" => s.keep_accessory,
         // Unknown types default to allowed.
         _ => true,
     }
@@ -327,6 +339,7 @@ pub async fn check_notification_type(
         "drives" => s.drives,
         "rtc_battery" => s.rtc_battery,
         "music_sync" => s.music_sync,
+        "keep_accessory" => s.keep_accessory,
         _ => true,
     };
     (StatusCode::OK, Json(serde_json::json!({"type": ntype, "enabled": enabled})))

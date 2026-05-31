@@ -184,7 +184,7 @@ fn now_secs() -> i64 {
 /// True when archiveloop is currently running (status file fresh
 /// within 120s). Used by the orphan-lock check to distinguish a
 /// stuck "keep_awake" lock from a real archive cycle.
-fn is_archive_active() -> bool {
+pub fn is_archive_active() -> bool {
     let Ok(meta) = std::fs::metadata(ARCHIVE_STATUS_PATH) else {
         return false;
     };

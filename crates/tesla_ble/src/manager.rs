@@ -444,11 +444,52 @@ impl PersistentSession {
     }
 }
 
+/// Idle-keepalive cadence for the held car link (Fix A1). A car can drop
+/// a GATT link that sees no application traffic for a while; between the
+/// scheduler's polls the link is otherwise silent — and that's where the
+/// drops cluster, especially while parked. ~8s is well inside typical
+/// car-side idle windows without wasting air time (do NOT drop to 2-3s).
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(8);
+/// Only send a keepalive if the link has actually been idle this long,
+/// so we skip a redundant feed right after a real command.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(6);
+
 async fn run_session_task(
     mut state: SessionState,
     mut cmd_rx: mpsc::Receiver<Command>,
 ) {
-    while let Some(cmd) = cmd_rx.recv().await {
+    // Idle keepalive (Fix A1): feed the held link on a timer between
+    // commands so the car doesn't drop an otherwise-silent GATT link.
+    let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
+    keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    keepalive.tick().await; // consume the immediate first tick
+    let mut last_activity = Instant::now();
+    loop {
+        let cmd = tokio::select! {
+            maybe_cmd = cmd_rx.recv() => match maybe_cmd {
+                Some(c) => c,
+                None => break,
+            },
+            _ = keepalive.tick() => {
+                // Feed the link with the sleep-safe, unauthenticated
+                // body-controller query (no session key needed). Only
+                // when we hold a connection and it's genuinely idle. A
+                // failure here just drops + reconnects on the next op —
+                // which also proactively recovers a silently-dead link.
+                if state.conn.is_some() && last_activity.elapsed() >= KEEPALIVE_IDLE {
+                    let r = handle_body_controller(&mut state).await;
+                    handle_transport_error_if_any(&mut state, &r).await;
+                    match &r {
+                        Ok(_) => debug!("BLE keepalive: idle-feed ok"),
+                        Err(e) => debug!(
+                            "BLE keepalive: idle-feed failed (recovers on next op): {e:#}"
+                        ),
+                    }
+                    last_activity = Instant::now();
+                }
+                continue;
+            }
+        };
         // Time each command end-to-end so the latency window reflects
         // the full round-trip (refresh retry, scan, reconnect included).
         let started = Instant::now();
@@ -523,6 +564,7 @@ async fn run_session_task(
                 write_status_file(&state, ConnectionEvent::Connected);
             }
         }
+        last_activity = Instant::now();
     }
     if let Some(conn) = state.conn.take() {
         conn.close().await;

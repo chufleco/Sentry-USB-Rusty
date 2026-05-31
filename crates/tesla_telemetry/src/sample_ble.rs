@@ -129,14 +129,28 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
             let car_server::drive_state::OptionalOdometerInHundredthsOfAMile::OdometerInHundredthsOfAMile(h) = o;
             (*h as f64) / 100.0
         });
-    // location_name from the bundled LocationState; None when parked-
-    // and-unchanged, which is expected.
-    let location_name = location.and_then(|l| {
-        l.optional_location_name.as_ref().map(|v| {
-            let car_server::location_state::OptionalLocationName::LocationName(n) = v;
-            n.clone()
-        })
-    });
+    // location_name + raw GPS from the bundled LocationState; all None
+    // when parked-and-unchanged, which is expected. The coords feed the
+    // keep-accessory home geofence (see keep_accessory.rs) at zero extra
+    // round-trip cost — they ride along in the same `state drive` reply.
+    let (location_name, lat, lon) = match location.as_ref() {
+        Some(l) => {
+            let name = l.optional_location_name.as_ref().map(|v| {
+                let car_server::location_state::OptionalLocationName::LocationName(n) = v;
+                n.clone()
+            });
+            let lat = l.optional_latitude.as_ref().map(|v| {
+                let car_server::location_state::OptionalLatitude::Latitude(x) = v;
+                *x as f64
+            });
+            let lon = l.optional_longitude.as_ref().map(|v| {
+                let car_server::location_state::OptionalLongitude::Longitude(x) = v;
+                *x as f64
+            });
+            (name, lat, lon)
+        }
+        None => (None, None, None),
+    };
     let meta = build_meta(drive.timestamp.as_ref(), started);
 
     // Log address freshness so a bundle shows whether Tesla is
@@ -156,6 +170,8 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
         location_name,
         odometer_mi,
         shift_state,
+        lat,
+        lon,
         meta,
     })
 }
@@ -234,10 +250,25 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     })
 }
 
-// No location sampler: standalone `state location` returns GPS coords
-// but not location_name (Tesla only emits the name in `state drive`),
-// so sample_drive_ble extracts the address instead. session.get_location()
-// still works for raw coords if needed.
+/// `state location` over BLE — raw GPS `(lat, lon)`. Separate from the
+/// drive poll because Tesla bundles only the reverse-geocoded
+/// `location_name` in `state drive`; the raw coordinates come solely
+/// from `state location`. Used by the keep-accessory home geofence,
+/// which is why it's polled only when that feature is enabled.
+pub async fn sample_location_ble(
+    session: &PersistentSession,
+) -> Result<(Option<f64>, Option<f64>)> {
+    let loc = session.get_location().await?;
+    let lat = loc.optional_latitude.as_ref().map(|v| {
+        let car_server::location_state::OptionalLatitude::Latitude(x) = v;
+        *x as f64
+    });
+    let lon = loc.optional_longitude.as_ref().map(|v| {
+        let car_server::location_state::OptionalLongitude::Longitude(x) = v;
+        *x as f64
+    });
+    Ok((lat, lon))
+}
 
 /// `state closures` over BLE. Used only for `sentry_mode_state` (the
 /// quiet-mode gate); door/window/port state is in the same response if

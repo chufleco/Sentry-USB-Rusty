@@ -11,6 +11,23 @@ use anyhow::Result;
 /// enumerate as `hci1`, `hci2`, etc.
 pub const DEFAULT_ADAPTER: &str = "hci0";
 
+/// Default home geofence radius (meters) when `KEEP_ACCESSORY_HOME_RADIUS_M`
+/// is unset. ~120m comfortably swallows the reverse-geocode drift that
+/// makes Tesla occasionally report a neighbor's address.
+pub const DEFAULT_HOME_RADIUS_M: f64 = 120.0;
+
+/// Keep-Accessory-Power automation config (see `keep_accessory.rs`).
+/// Inert unless the user declares their Pi is powered from the 12V
+/// accessory outlet (`KEEP_ACCESSORY_ENABLED`) and sets a home
+/// geofence center. Radius defaults to `DEFAULT_HOME_RADIUS_M`.
+#[derive(Debug, Clone, Default)]
+pub struct KeepAccessoryConfig {
+    pub enabled: bool,
+    pub home_lat: Option<f64>,
+    pub home_lon: Option<f64>,
+    pub home_radius_m: f64,
+}
+
 /// Snapshot of the BLE-relevant config values.
 #[derive(Debug, Clone)]
 pub struct BleConfig {
@@ -22,6 +39,8 @@ pub struct BleConfig {
     /// use it, this gets set to `hci1` and the onboard radio is
     /// left alone.
     pub adapter: String,
+    /// Keep-Accessory-Power automation (12V-powered Pis only).
+    pub keep_accessory: KeepAccessoryConfig,
 }
 
 impl Default for BleConfig {
@@ -30,6 +49,7 @@ impl Default for BleConfig {
             enabled: false,
             vin: String::new(),
             adapter: DEFAULT_ADAPTER.to_string(),
+            keep_accessory: KeepAccessoryConfig::default(),
         }
     }
 }
@@ -88,7 +108,37 @@ impl BleConfig {
             None => DEFAULT_ADAPTER.to_string(),
         };
 
-        Ok(Self { enabled, vin, adapter })
+        // Keep-Accessory-Power automation. Inert unless explicitly
+        // enabled (the user-declared "Pi powered from 12V" gate). Home
+        // geofence center is lat/lon; radius defaults to ~120m.
+        let ka_enabled = active
+            .get("KEEP_ACCESSORY_ENABLED")
+            .map(|v| matches!(v.trim(), "yes" | "true" | "1"))
+            .unwrap_or(false);
+        let home_lat = active
+            .get("KEEP_ACCESSORY_HOME_LAT")
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        let home_lon = active
+            .get("KEEP_ACCESSORY_HOME_LON")
+            .and_then(|s| s.trim().parse::<f64>().ok());
+        let home_radius_m = active
+            .get("KEEP_ACCESSORY_HOME_RADIUS_M")
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .filter(|r| *r > 0.0)
+            .unwrap_or(DEFAULT_HOME_RADIUS_M);
+        let keep_accessory = KeepAccessoryConfig {
+            enabled: ka_enabled,
+            home_lat,
+            home_lon,
+            home_radius_m,
+        };
+
+        Ok(Self {
+            enabled,
+            vin,
+            adapter,
+            keep_accessory,
+        })
     }
 }
 

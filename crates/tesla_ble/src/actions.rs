@@ -11,7 +11,7 @@
 use prost::Message;
 
 use crate::proto::car_server::{
-    Action, ChargePortDoorClose, ChargePortDoorOpen,
+    Action, ChargePortDoorClose, ChargePortDoorOpen, SetKeepAccessoryPowerModeAction,
     VehicleAction, VehicleControlSetSentryModeAction, action, vehicle_action,
 };
 use crate::proto::vcsec::{UnsignedMessage, unsigned_message};
@@ -84,6 +84,28 @@ pub fn charge_port_close() -> ActionPayload {
             vehicle_action_msg: Some(
                 vehicle_action::VehicleActionMsg::ChargePortDoorClose(
                     ChargePortDoorClose {},
+                ),
+            ),
+        })),
+    };
+    ActionPayload {
+        domain: Domain::Infotainment,
+        inner: action.encode_to_vec(),
+    }
+}
+
+/// Turn "Keep Accessory Power" on or off via INFOTAINMENT — the same toggle the
+/// Tesla app exposes on the Charging screen. Mirrors [`set_sentry_mode`]; lives
+/// under the `setKeepAccessoryPowerModeAction` oneof variant in
+/// `car_server.VehicleAction` (field 138).
+pub fn set_keep_accessory_power(on: bool) -> ActionPayload {
+    let action = Action {
+        action_msg: Some(action::ActionMsg::VehicleAction(VehicleAction {
+            vehicle_action_msg: Some(
+                vehicle_action::VehicleActionMsg::SetKeepAccessoryPowerModeAction(
+                    SetKeepAccessoryPowerModeAction {
+                        keep_accessory_power_mode: on,
+                    },
                 ),
             ),
         })),

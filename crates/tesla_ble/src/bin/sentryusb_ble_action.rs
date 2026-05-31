@@ -82,7 +82,7 @@ async fn main() -> ExitCode {
         Some(v) => v,
         None => {
             eprintln!(
-                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close>"
+                "usage: sentryusb-ble-action <wake|sentry-on|sentry-off|charge-port-open|charge-port-close|keep-accessory-on|keep-accessory-off>"
             );
             return ExitCode::from(1);
         }
@@ -129,6 +129,8 @@ async fn main() -> ExitCode {
         "sentry-off" => actions::set_sentry_mode(false),
         "charge-port-open" => actions::charge_port_open(),
         "charge-port-close" => actions::charge_port_close(),
+        "keep-accessory-on" => actions::set_keep_accessory_power(true),
+        "keep-accessory-off" => actions::set_keep_accessory_power(false),
         other => {
             eprintln!("unknown verb '{}'", other);
             return ExitCode::from(1);
