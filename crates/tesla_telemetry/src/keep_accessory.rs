@@ -177,6 +177,25 @@ pub async fn evaluate(
         return; // no change warranted (home but moving)
     };
 
+    // Coverage notification keys on the home→away transition, NOT the
+    // power-state change — fire it even when the Pi is already ON. Observed
+    // live 2026-05-31: the Pi booted at home into the archive-grace ON state,
+    // then drove away while still ON, so the power state went ON→ON with no
+    // change and the `last_sent == desired` early-return below skipped the
+    // coverage push entirely. It's just a push (no car radio needed), so it
+    // runs before both the no-change and radio-held returns.
+    if is_home {
+        state.coverage_notified = false; // back home → re-arm coverage push
+    }
+    if desired && !is_home && !state.coverage_notified {
+        notify_event(
+            "Sentry coverage active",
+            "Parked away from home — accessory power is on and the Pi stays alive for Sentry.",
+        )
+        .await;
+        state.coverage_notified = true;
+    }
+
     if state.last_sent == Some(desired) {
         return; // already in the desired state
     }
@@ -189,23 +208,14 @@ pub async fn evaluate(
         return;
     }
 
-    // Notifications (all under the `keep_accessory` toggle, gated
-    // server-side). One-shot per cycle; re-armed by the opposite state.
-    if is_home {
-        state.coverage_notified = false; // back home → re-arm coverage push
-    }
+    // Offline ("Pi going offline") notification — must fire synchronously
+    // right before the OFF send, while we still have power + the radio. The
+    // coverage ("Sentry coverage active") push is handled earlier (before the
+    // no-change return) since it keys on the home→away transition, not the send.
     if desired {
         state.offline_notified = false; // power ON → re-arm offline push
     }
-    if desired && !is_home && !state.coverage_notified {
-        // Left home → powering ON for Sentry coverage away.
-        notify_event(
-            "Sentry coverage active",
-            "Parked away from home — accessory power is on and the Pi stays alive for Sentry.",
-        )
-        .await;
-        state.coverage_notified = true;
-    } else if !desired && !state.offline_notified {
+    if !desired && !state.offline_notified {
         // Home release cuts our 12V the instant it lands, so fire BEFORE
         // sending OFF and synchronously (the helper blocks until the local
         // server dispatched the push) so it egresses while we still have
