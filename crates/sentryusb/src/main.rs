@@ -143,6 +143,13 @@ async fn main() {
         migrate::run_startup_migration().await;
     });
 
+    // Boot-time timezone safety net: if setup left TIME_ZONE=auto unresolved
+    // (no network during setup → Pi stuck on UTC → drive telemetry mis-links),
+    // re-resolve once now. Non-blocking; no-op once a real zone is set.
+    tokio::spawn(async {
+        sentryusb_setup::system::ensure_timezone_resolved().await;
+    });
+
     // Periodic malloc_trim — releases heap pages back to the kernel that
     // glibc would otherwise keep cached in its per-arena free lists.
     // Combined with MALLOC_ARENA_MAX=2 (set in the systemd unit) this

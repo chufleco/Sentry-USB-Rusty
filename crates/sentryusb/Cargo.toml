@@ -22,5 +22,6 @@ sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
 sentryusb-ws = { path = "../ws", package = "sentryusb-ws" }
 sentryusb-drives = { path = "../drives", package = "sentryusb-drives" }
 sentryusb-api = { path = "../api", package = "sentryusb-api" }
+sentryusb-setup = { path = "../setup", package = "sentryusb-setup" }
 sentryusb-gadget = { path = "../usb_gadget", package = "sentryusb-gadget" }
 sentryusb-cloud-uploader = { path = "../cloud_uploader", package = "sentryusb-cloud-uploader" }

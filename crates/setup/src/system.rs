@@ -444,20 +444,52 @@ pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
         _ => return Ok(false),
     };
 
-    // Newer Pi OS / Debian images (bookworm and later) ship only the
-    // canonical IANA tzdata zones and drop the legacy `US/*` and
-    // single-name aliases that older images still carried. Configs
-    // saved with one of those shortcuts then fail timedatectl with
-    // "Invalid or not installed time zone". Map them up front so we
-    // hand timedatectl a name every shipped tzdata version recognizes.
-    let tz = normalize_timezone(&raw);
+    // The setup wizard ships "auto" as the default timezone, but "auto" is
+    // NOT a valid IANA zone — `timedatectl set-timezone auto` fails with
+    // "Invalid or not installed time zone". Left unhandled that either
+    // loops the setup phase (the error propagates and the phase retries
+    // forever) or silently leaves the Pi on UTC. A UTC Pi then mis-links
+    // drive telemetry: Tesla clip filenames are in the car's LOCAL clock
+    // but `telemetry_samples` are UTC epoch, so the odometer/battery/temps
+    // join pulls from the wrong (tz-offset) window. Resolve "auto" to a
+    // real zone via IP geolocation; fall back gracefully if that fails.
+    let tz = if raw.eq_ignore_ascii_case("auto") {
+        match resolve_timezone_via_geoip().await {
+            Some(z) => {
+                emitter.progress(&format!("Auto-detected timezone: {}", z));
+                z
+            }
+            None => {
+                emitter.progress(
+                    "Timezone 'auto' could not be geolocated — leaving system default. \
+                     You can set it later in Settings.",
+                );
+                return Ok(false);
+            }
+        }
+    } else {
+        // Newer Pi OS / Debian images (bookworm and later) ship only the
+        // canonical IANA tzdata zones and drop the legacy `US/*` and
+        // single-name aliases that older images still carried. Configs
+        // saved with one of those shortcuts then fail timedatectl with
+        // "Invalid or not installed time zone". Map them up front so we
+        // hand timedatectl a name every shipped tzdata version recognizes.
+        normalize_timezone(&raw)
+    };
 
     if current_timezone().as_deref() == Some(tz.as_str()) {
         return Ok(false);
     }
 
     emitter.progress(&format!("Setting timezone to {}", tz));
-    sentryusb_shell::run("timedatectl", &["set-timezone", &tz]).await?;
+    // Non-fatal: an unknown/invalid zone must never loop the setup phase.
+    if let Err(e) = sentryusb_shell::run("timedatectl", &["set-timezone", &tz]).await {
+        emitter.progress(&format!(
+            "Could not set timezone to {} ({}); leaving system default",
+            tz, e
+        ));
+        return Ok(false);
+    }
 
     // Keep /etc/timezone in sync with the symlink. On images where the
     // file is missing this also creates it, which makes our own
@@ -465,6 +497,124 @@ pub async fn configure_timezone(env: &SetupEnv, emitter: &SetupEmitter) -> Resul
     let _ = std::fs::write("/etc/timezone", format!("{}\n", tz));
 
     Ok(true)
+}
+
+/// Best-effort IANA timezone via IP geolocation, used when the wizard
+/// leaves the timezone as "auto". The setup phase already requires
+/// network, so we shell `curl`. Tries several free, no-key providers in
+/// turn so one being down or rate-limited doesn't break timezone setup;
+/// each returns the bare zone name (e.g. "America/New_York"). Returns
+/// `None` only when ALL providers fail, so the caller can fall back.
+pub(crate) async fn resolve_timezone_via_geoip() -> Option<String> {
+    // First-party ONLY: SentryUSB's own server geolocates the caller's IP
+    // (MaxMind GeoLite2) and returns it as JSON, so IP processing stays
+    // under the SentryUSB privacy policy (sentryusb.com/legal/privacy) with
+    // NO third party. We deliberately do NOT fall back to public geo-IP
+    // services — if this is unreachable / rate-limited we leave the system
+    // default (UTC) and the boot-time retry resolves it on a later boot.
+    const ENDPOINTS: &[&str] = &["https://sentryusb.com/api/geoip/me"];
+    for url in ENDPOINTS {
+        if let Ok(out) = sentryusb_shell::run("curl", &["-s", "--max-time", "5", url]).await {
+            if let Some(tz) = extract_timezone(&out) {
+                return Some(tz);
+            }
+        }
+    }
+    None
+}
+
+/// Pull an IANA zone from the first-party geo-IP response. The
+/// `sentryusb.com/api/geoip/me` endpoint returns JSON with a `timeZone`
+/// field (e.g. `{"timeZone":"America/New_York", ...}`); we also accept
+/// `timezone`/`time_zone`, nested `location.time_zone`, and a bare-text
+/// body — defensively, so a future response-shape tweak won't break it.
+fn extract_timezone(body: &str) -> Option<String> {
+    let t = body.trim();
+    if t.starts_with('{') {
+        let v: serde_json::Value = serde_json::from_str(t).ok()?;
+        // Flat key (preferred: `{"timezone":"America/New_York", ...}`)
+        // or GeoLite2's native nested `{"location":{"time_zone":"..."}}`.
+        let candidates = [
+            v.get("timeZone").and_then(|x| x.as_str()), // sentryusb.com/api/geoip/me
+            v.get("timezone").and_then(|x| x.as_str()),
+            v.get("time_zone").and_then(|x| x.as_str()),
+            v.get("tz").and_then(|x| x.as_str()),
+            v.pointer("/location/time_zone").and_then(|x| x.as_str()),
+            v.pointer("/location/timezone").and_then(|x| x.as_str()),
+        ];
+        for z in candidates.into_iter().flatten() {
+            let z = z.trim();
+            if is_valid_iana_zone(z) {
+                return Some(z.to_string());
+            }
+        }
+        return None;
+    }
+    if is_valid_iana_zone(t) {
+        Some(t.to_string())
+    } else {
+        None
+    }
+}
+
+/// Cheap sanity check that a string looks like an IANA zone
+/// ("Area/Location") and not an error page / empty body.
+pub(crate) fn is_valid_iana_zone(tz: &str) -> bool {
+    !tz.is_empty()
+        && tz.len() < 64
+        && tz.contains('/')
+        && !tz.chars().any(char::is_whitespace)
+        && tz.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '-' | '+'))
+}
+
+/// Boot-time safety net for `TIME_ZONE=auto`. If setup couldn't reach a
+/// geo-IP provider (e.g. the network wasn't up yet during setup), the Pi
+/// is left on UTC and drive telemetry mis-links — clip filenames are in
+/// the car's local clock but `telemetry_samples` are UTC epoch.
+///
+/// The main service spawns this NON-BLOCKING on startup, so it never
+/// delays boot. It re-resolves once and sets the zone only if we're still
+/// on UTC; it's a cheap no-op when `TIME_ZONE` isn't "auto" or the zone is
+/// already a real (non-UTC) one. If geolocation still fails (no network
+/// yet) it simply leaves UTC and a later boot tries again.
+pub async fn ensure_timezone_resolved() {
+    let path = sentryusb_config::find_config_path();
+    let Ok((active, commented)) = sentryusb_config::parse_file(path) else {
+        return;
+    };
+    // Only act when the user left the wizard on "auto".
+    let raw = sentryusb_config::get_config_value(&active, &commented, "TIME_ZONE");
+    if !matches!(raw.as_deref(), Some(v) if v.eq_ignore_ascii_case("auto")) {
+        return;
+    }
+    // Already on a real zone? Nothing to do (don't override a resolved tz).
+    match current_timezone().as_deref() {
+        Some("UTC") | Some("Etc/UTC") | None => {}
+        Some(_) => return,
+    }
+    let Some(tz) = resolve_timezone_via_geoip().await else {
+        return; // still no network — a later boot will retry
+    };
+    if current_timezone().as_deref() == Some(tz.as_str()) {
+        return;
+    }
+    // RO root → flip to rw just for the write, then back.
+    let _ = sentryusb_shell::run(
+        "sh",
+        &[
+            "-c",
+            "/root/bin/remountfs_rw 2>/dev/null || mount -o remount,rw / 2>/dev/null || true",
+        ],
+    )
+    .await;
+    if sentryusb_shell::run("timedatectl", &["set-timezone", &tz])
+        .await
+        .is_ok()
+    {
+        let _ = std::fs::write("/etc/timezone", format!("{}\n", tz));
+        tracing::info!("timezone (auto) resolved on boot: {}", tz);
+    }
+    let _ = sentryusb_shell::run("sh", &["-c", "mount -o remount,ro / 2>/dev/null || true"]).await;
 }
 
 /// Translate legacy tzdata aliases to their canonical IANA names.
@@ -529,6 +679,38 @@ mod timezone_normalize_tests {
     fn maps_single_name_legacy() {
         assert_eq!(normalize_timezone("Japan"), "Asia/Tokyo");
         assert_eq!(normalize_timezone("Eire"), "Europe/Dublin");
+    }
+}
+
+#[cfg(test)]
+mod timezone_extract_tests {
+    use super::extract_timezone;
+
+    #[test]
+    fn parses_first_party_geoip_json() {
+        // Exact shape of sentryusb.com/api/geoip/me (camelCase `timeZone`).
+        let body = r#"{"ip":"100.37.225.74","country":"US","region":"NY","city":"Staten Island","timeZone":"America/New_York"}"#;
+        assert_eq!(extract_timezone(body).as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn parses_bare_text_fallback() {
+        // ipinfo.io/timezone / ipapi.co/timezone style.
+        assert_eq!(extract_timezone("America/New_York\n").as_deref(), Some("America/New_York"));
+    }
+
+    #[test]
+    fn parses_nested_geolite2_shape() {
+        let body = r#"{"location":{"time_zone":"Europe/Berlin"}}"#;
+        assert_eq!(extract_timezone(body).as_deref(), Some("Europe/Berlin"));
+    }
+
+    #[test]
+    fn rejects_rate_limited_and_garbage() {
+        assert_eq!(extract_timezone(r#"{"error":"rate_limited","message":"Too many requests."}"#), None);
+        assert_eq!(extract_timezone("<!doctype html>"), None);
+        assert_eq!(extract_timezone(""), None);
+        assert_eq!(extract_timezone("auto"), None);
     }
 }
 
