@@ -212,6 +212,17 @@ fn is_nudge_alive() -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// True when something currently wants the car kept awake: an archive
+/// cycle (fresh `archive_status.json`) or any keep-awake nudge loop
+/// (`awake_start`'s Case-3 PID file — archiveloop, web-UI, drive
+/// processing). The quiet-mode gate consults this so it never green-lights
+/// sleep out from under an in-flight archive. Both inputs self-clear — the
+/// status file goes stale (120s), the PID dies — so this can't wedge the
+/// car permanently awake once the work finishes.
+pub fn keep_awake_requested() -> bool {
+    is_archive_active() || is_nudge_alive()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

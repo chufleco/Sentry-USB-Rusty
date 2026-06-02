@@ -365,6 +365,31 @@ async fn main() -> Result<()> {
     }
 }
 
+/// Whether the gate may drop to sleep-permitting (Quiet) polling.
+/// Quiet means "let the car sleep": permitted only when the car is
+/// parked-or-asleep AND nothing has a reason to hold it awake — not
+/// charging, sentry off, and no keep-awake (archive cycle or web-UI /
+/// manual nudge) in effect.
+///
+/// The keep-awake term is the fix for letting a parked car sleep
+/// mid-archive: an archive disconnects the USB gadget, so the car both
+/// confirms Park (drive computer powers down → Unknown shift) and later
+/// trips `car_truly_asleep` (cam_disk stops updating). The override has to
+/// sit on the whole decision, not just one path, or a >5min archive slips
+/// through the asleep door.
+fn should_enter_quiet(
+    car_truly_asleep: bool,
+    parked_confirmed: bool,
+    actively_charging: bool,
+    sentry_on: bool,
+    keep_awake_active: bool,
+) -> bool {
+    (car_truly_asleep || parked_confirmed)
+        && !actively_charging
+        && !sentry_on
+        && !keep_awake_active
+}
+
 /// One main-loop iteration; returns how long to sleep before the next.
 ///
 /// Two phases, decided each tick:
@@ -444,12 +469,25 @@ async fn tick(
         .unwrap_or(true);
     let sentry_on = last_sentry_mode.map(|s| s.is_on()).unwrap_or(true);
 
+    // A keep-awake in effect — an archive cycle or any nudge loop (web-UI,
+    // drive processing) — must pin us Active. Dropping to sleep-safe
+    // polling mid-archive lets the car sleep, which cuts USB power and
+    // aborts the copy. Self-clears when the work finishes, so it can't
+    // wedge the car permanently awake (see lock::keep_awake_requested).
+    let keep_awake_active = lock::keep_awake_requested();
+
     // Two paths to quiet mode: car_truly_asleep (no recent clip writes)
-    // or parked_confirmed (Park 3+ polls). Both also require the car
-    // isn't charging or running sentry — those keep it awake, and
-    // quieting would leave battery_pct / sentry_mode_state stale.
-    let want_quiet = car_truly_asleep || parked_confirmed;
-    let in_quiet_mode = want_quiet && !actively_charging && !sentry_on;
+    // or parked_confirmed (Park 3+ polls). Both also require the car isn't
+    // charging, running sentry, or being held awake for an archive — those
+    // keep it awake, and quieting would leave battery_pct/sentry stale or
+    // break the copy.
+    let in_quiet_mode = should_enter_quiet(
+        car_truly_asleep,
+        parked_confirmed,
+        actively_charging,
+        sentry_on,
+        keep_awake_active,
+    );
 
     // Diagnostic: the car is parked/asleep but we're staying Active
     // because charging or sentry says it has a reason to be awake. This
@@ -476,11 +514,13 @@ async fn tick(
             } else {
                 "DEFAULTED: unread"
             };
-            // Quiet needs (asleep || parked_confirmed) && !charge && !sentry.
-            // Log all four so a stuck-Active gate is diagnosable.
+            // Quiet needs (asleep || parked_confirmed) && !charge &&
+            // !sentry && !keep_awake. Log all five so a stuck-Active gate
+            // is diagnosable; keep_awake_active=true is an archive/nudge
+            // hold (the deliberate stay-awake during a copy).
             info!(
                 "gate: staying Active — car_truly_asleep={}, parked_polls={}/{}, \
-                 sentry_on={} [{}], actively_charging={} [{}]",
+                 sentry_on={} [{}], actively_charging={} [{}], keep_awake_active={}",
                 car_truly_asleep,
                 *parked_polls,
                 PARK_CONFIRMATIONS_BEFORE_QUIET,
@@ -488,6 +528,7 @@ async fn tick(
                 sentry_src,
                 actively_charging,
                 charge_src,
+                keep_awake_active,
             );
         }
     }
@@ -879,16 +920,18 @@ async fn tick(
                 // Park, or Unknown (drive computer asleep).
                 *parked_polls = parked_polls.saturating_add(1);
                 if *parked_polls == PARK_CONFIRMATIONS_BEFORE_QUIET {
-                    // One-shot on first confirm; charge/sentry decide the
-                    // next tick.
-                    if actively_charging || sentry_on {
+                    // One-shot on first confirm; charge/sentry/keep-awake
+                    // decide the next tick.
+                    if actively_charging || sentry_on || keep_awake_active {
                         info!(
                             "{} consecutive parked observations — but staying Active \
-                             (actively_charging={}, sentry_on={}); car is awake for \
-                             a reason, quiet polling would freeze battery/sentry signals",
+                             (actively_charging={}, sentry_on={}, keep_awake_active={}); \
+                             car is awake for a reason, quiet polling would freeze \
+                             battery/sentry signals or break an in-flight archive",
                             PARK_CONFIRMATIONS_BEFORE_QUIET,
                             actively_charging,
                             sentry_on,
+                            keep_awake_active,
                         );
                     } else {
                         info!(
@@ -1205,5 +1248,53 @@ async fn release_radio() {
     // is a no-op and sentryusb-ble runs continuously.
     if let Err(e) = lock::release(OWNER) {
         warn!("failed to release radio lock: {e}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `should_enter_quiet` is the gate's sleep decision. Quiet = "let the
+    // car sleep"; permitted only when the car is parked or asleep AND
+    // nothing has a reason to hold it awake. Args, in order:
+    // (car_truly_asleep, parked_confirmed, actively_charging, sentry_on,
+    //  keep_awake_active).
+
+    #[test]
+    fn parked_idle_car_is_allowed_to_sleep() {
+        // Parked, sentry off, not charging, nothing running → may sleep.
+        // The behavior we preserve for a genuinely idle parked car.
+        assert!(should_enter_quiet(false, true, false, false, false));
+    }
+
+    #[test]
+    fn keep_awake_pins_active_while_parked() {
+        // The regression (commit fba51ce): parked + sentry off + not
+        // charging would quiet, but an archive / keep-awake nudge is
+        // running, so the car must NOT be allowed to sleep mid-archive.
+        assert!(!should_enter_quiet(false, true, false, false, true));
+    }
+
+    #[test]
+    fn keep_awake_pins_active_even_when_car_looks_asleep() {
+        // A long archive disconnects the USB gadget, so cam_disk.bin stops
+        // updating and the car trips "truly asleep" after 5 min even though
+        // it's awake. The override must cover this second path too — hence
+        // it sits on the whole decision, not just the parked-polls counter.
+        assert!(should_enter_quiet(true, false, false, false, false));
+        assert!(!should_enter_quiet(true, false, false, false, true));
+    }
+
+    #[test]
+    fn charging_or_sentry_still_pins_active() {
+        assert!(!should_enter_quiet(false, true, true, false, false)); // charging
+        assert!(!should_enter_quiet(false, true, false, true, false)); // sentry on
+    }
+
+    #[test]
+    fn moving_car_never_quiets() {
+        // Not parked-confirmed and not asleep (e.g. driving).
+        assert!(!should_enter_quiet(false, false, false, false, false));
     }
 }
