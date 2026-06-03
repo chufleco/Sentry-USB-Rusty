@@ -1084,11 +1084,11 @@ function TelemetryOutputPanel({
           )}
           {sample.shift_state === "Unknown" && (
             <p className="pt-1 text-[10px] text-amber-400/80">
-              Shift reads <strong>Unknown</strong> — this is expected on older
-              (Intel-based) Teslas. Tesla powers down the gear computer when the
-              car is in Park with nobody inside, so the gear is no longer
-              reported. We treat <strong>Unknown as Park</strong> so the car is
-              still allowed to sleep.
+              Shift reads <strong>Unknown</strong> — normal for a parked Tesla.
+              The car powers down its drive computer shortly after you park, so
+              it stops reporting the gear (this happens on both AMD- and
+              Intel-MCU cars). We treat <strong>Unknown as Park</strong>: the car
+              may sleep when idle, but stays awake while an archive is running.
             </p>
           )}
           <Row label="Interior temp" value={fmtTemp(sample.interior_temp_c, metric)} />
