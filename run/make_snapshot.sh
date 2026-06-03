@@ -101,36 +101,6 @@ function make_links_for_snapshot {
     fi
     ln -sf "$f" "$track"
   done
-  # Encrypted clips (Tesla firmware 2026.20+): the car writes a parallel
-  # TeslaCam/EncryptedClips/{RecentClips,SavedClips,SentryClips} tree whose
-  # video contents are encrypted (decryptable only via the owner's Tesla
-  # account at dashcam.tesla.com). Mirror it into a SEPARATE
-  # /mutable/TeslaCam/EncryptedClips/ subtree so it archives to
-  # <archive>/EncryptedClips/... and stays isolated from the plain-MP4
-  # RecentClips view used by the web viewer and drive map — the encrypted
-  # files won't play, so they must not be cross-linked into RecentClips.
-  local encrecent=/mutable/TeslaCam/EncryptedClips/RecentClips
-  local encsaved=/mutable/TeslaCam/EncryptedClips/SavedClips
-  local encsentry=/mutable/TeslaCam/EncryptedClips/SentryClips
-  for f in "$curmnt/TeslaCam/EncryptedClips/RecentClips/"*
-  do
-    local efilename=${f##/*/}
-    [[ "$efilename" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}.* ]] || continue
-    mkdir -p "$encrecent/${efilename:0:10}"
-    ln -sf "${f/"$curmnt"/$finalmnt}" "$encrecent/${efilename:0:10}"
-  done
-  for f in "$curmnt/TeslaCam/EncryptedClips/SavedClips"/*/*
-  do
-    local eeventtime=${f%/*}; eeventtime=${eeventtime##/*/}
-    mkdir -p "$encsaved/$eeventtime"
-    ln -sf "${f/"$curmnt"/$finalmnt}" "$encsaved/$eeventtime"
-  done
-  for f in "$curmnt/TeslaCam/EncryptedClips/SentryClips"/*/*
-  do
-    local eeventtime=${f%/*}; eeventtime=${eeventtime##/*/}
-    mkdir -p "$encsentry/$eeventtime"
-    ln -sf "${f/"$curmnt"/$finalmnt}" "$encsentry/$eeventtime"
-  done
   log "made all links for $curmnt"
   $restore_nullglob
 }

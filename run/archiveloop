@@ -668,13 +668,9 @@ function clean_cam_mount {
     rm -f /tmp/rmcandidates.txt /tmp/rmcandidatesbytime.txt
   fi
 
-  # delete directories that are now empty (encrypted-clip dirs included; they
-  # don't exist on pre-2026.20 cars, so suppress find's missing-path errors)
+  # delete directories that are now empty
   find "$CAM_MOUNT/TeslaCam/RecentClips" "$CAM_MOUNT/TeslaCam/SavedClips" \
-    "$CAM_MOUNT/TeslaCam/SentryClips" \
-    "$CAM_MOUNT/TeslaCam/EncryptedClips/RecentClips" "$CAM_MOUNT/TeslaCam/EncryptedClips/SavedClips" \
-    "$CAM_MOUNT/TeslaCam/EncryptedClips/SentryClips" \
-    "$CAM_MOUNT/TeslaTrackMode" -mindepth 1 -type d -empty -delete 2>/dev/null || true
+    "$CAM_MOUNT/TeslaCam/SentryClips" "$CAM_MOUNT/TeslaTrackMode" -mindepth 1 -type d -empty -delete || true
 
   # Trim the camera archive to reduce the number of blocks in the snapshot.
   trim_free_space "$CAM_MOUNT"
@@ -745,27 +741,19 @@ function archive_teslacam_clips () {
 
   # Find files by name only. Don't follow the symlinks yet, since that
   # would cause all snapshots to be mounted.
-  #
-  # Tesla firmware 2026.20+ writes encrypted clips to a parallel
-  # TeslaCam/EncryptedClips/{RecentClips,SavedClips,SentryClips} tree (mirrored
-  # into /mutable/TeslaCam/EncryptedClips/ by make_snapshot.sh). Each category's
-  # encrypted variant rides the SAME on/off flag as its plain counterpart, so
-  # enabling SavedClips archiving also archives encrypted SavedClips. They're
-  # copied verbatim (still .mp4, just encrypted) and land under
-  # <archive>/EncryptedClips/... for later decryption via the owner's account.
   local -a savedclipsopt
   local -a sentryclipsopt
   local -a trackmodeclipsopt
   local -a recentclipsopt
   if [ "${ARCHIVE_SAVEDCLIPS:-true}" = "true" ]
   then
-    savedclipsopt=("-path" "./SavedClips/*" "-o" "-path" "./EncryptedClips/SavedClips/*")
+    savedclipsopt=("-path" "./SavedClips/*")
   else
     savedclipsopt=("-false")
   fi
   if [ "${ARCHIVE_SENTRYCLIPS:-true}" = "true" ]
   then
-    sentryclipsopt=("-o" "-path" "./SentryClips/*" "-o" "-path" "./EncryptedClips/SentryClips/*")
+    sentryclipsopt=("-o" "-path" "./SentryClips/*")
   fi
   if [ "${ARCHIVE_TRACKMODECLIPS:-true}" = "true" ]
   then
@@ -773,7 +761,7 @@ function archive_teslacam_clips () {
   fi
   if [ "${ARCHIVE_RECENTCLIPS:-false}" = "true" ]
   then
-    recentclipsopt=("-o" "-path" "./RecentClips/*" "-o" "-path" "./EncryptedClips/RecentClips/*")
+    recentclipsopt=("-o" "-path" "./RecentClips/*")
   fi
   (cd "$overlaylower"; find . \( \( "${savedclipsopt[@]}" "${sentryclipsopt[@]}" "${trackmodeclipsopt[@]}" "${recentclipsopt[@]}" \) -type l \) \
         -a -fprintf "$sentrylist" '%P\n')
