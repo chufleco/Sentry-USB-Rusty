@@ -697,9 +697,10 @@ mod timezone_extract_tests {
 
     #[test]
     fn parses_first_party_geoip_json() {
-        // Exact shape of sentryusb.com/api/geoip/me (camelCase `timeZone`).
-        let body = r#"{"ip":"100.37.225.74","country":"US","region":"NY","city":"Staten Island","timeZone":"America/New_York"}"#;
-        assert_eq!(extract_timezone(body).as_deref(), Some("America/New_York"));
+        // Shape of sentryusb.com/api/geoip/me (camelCase `timeZone`).
+        // Placeholder values — RFC 5737 documentation IP, no real location.
+        let body = r#"{"ip":"203.0.113.7","country":"US","region":"CA","city":"Mountain View","timeZone":"America/Los_Angeles"}"#;
+        assert_eq!(extract_timezone(body).as_deref(), Some("America/Los_Angeles"));
     }
 
     #[test]
