@@ -19,6 +19,7 @@ import {
   Filter,
   Loader2,
   Info,
+  Plug,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 
@@ -44,6 +45,7 @@ interface NotificationSettings {
   drives: boolean
   rtc_battery: boolean
   music_sync: boolean
+  keep_accessory: boolean
 }
 
 interface HistoryResponse {
@@ -67,6 +69,7 @@ const NOTIFICATION_TYPES = [
   { key: "drives", label: "New Drives Detected", description: "When new TeslaCam drives are mapped", icon: HardDrive },
   { key: "rtc_battery", label: "RTC Battery Warning", description: "When the real-time clock battery is low or missing", icon: Battery },
   { key: "music_sync", label: "Music Sync", description: "When music files finish syncing to USB", icon: Music },
+  { key: "keep_accessory", label: "Keep Accessory", description: "When the Pi releases 12V accessory power at home and is about to go offline", icon: Plug },
 ] as const
 
 function typeIcon(type: string) {
@@ -184,6 +187,7 @@ export default function Notifications() {
         drives: true,
         rtc_battery: true,
         music_sync: true,
+        keep_accessory: true,
       })
     }
   }, [])

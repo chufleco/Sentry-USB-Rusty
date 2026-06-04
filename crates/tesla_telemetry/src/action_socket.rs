@@ -221,9 +221,11 @@ pub fn parse_verb(verb: &str) -> Result<ActionPayload> {
         "sentry-off" => Ok(actions::set_sentry_mode(false)),
         "charge-port-open" => Ok(actions::charge_port_open()),
         "charge-port-close" => Ok(actions::charge_port_close()),
+        "keep-accessory-on" => Ok(actions::set_keep_accessory_power(true)),
+        "keep-accessory-off" => Ok(actions::set_keep_accessory_power(false)),
         other => bail!(
             "unknown verb '{}' (expected: wake | sentry-on | sentry-off | \
-             charge-port-open | charge-port-close)",
+             charge-port-open | charge-port-close | keep-accessory-on | keep-accessory-off)",
             other
         ),
     }

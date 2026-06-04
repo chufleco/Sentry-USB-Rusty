@@ -148,6 +148,10 @@ pub struct DriveResult {
     pub location_name: Option<String>,
     pub odometer_mi: Option<f64>,
     pub shift_state: Option<ShiftState>,
+    /// Raw GPS from the bundled LocationState (same round-trip). `None`
+    /// on parked-and-unchanged polls. Feeds the keep-accessory geofence.
+    pub lat: Option<f64>,
+    pub lon: Option<f64>,
     pub meta: ResponseMeta,
 }
 
@@ -293,6 +297,10 @@ pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
         // Shift state for the phase machine. Not persisted — purely
         // a transient signal for "should the sampler back off?"
         shift_state: pick_shift_state(&drive),
+        // Raw GPS from locationState (same response). Feeds the
+        // keep-accessory geofence; None on parked-and-unchanged polls.
+        lat: pick_f64(&drive, &["latitude", "nativeLatitude", "native_latitude"]),
+        lon: pick_f64(&drive, &["longitude", "nativeLongitude", "native_longitude"]),
         meta,
     })
 }

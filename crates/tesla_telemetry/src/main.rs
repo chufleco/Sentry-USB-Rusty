@@ -21,6 +21,7 @@ mod clock_sync;
 mod config;
 mod db;
 mod diag_log;
+mod keep_accessory;
 mod lock;
 mod sample;
 mod sample_ble;
@@ -101,6 +102,12 @@ const PARKED_AWAKE_TPMS_INTERVAL: Duration = Duration::from_secs(1800);
 /// — rides through a stop at a light but lets the car sleep soon after
 /// parking.
 const PARK_CONFIRMATIONS_BEFORE_QUIET: u32 = 3;
+
+/// Cadence for the keep-accessory geofence `state location` poll. Raw
+/// GPS isn't bundled in `state drive`, so this is its own round-trip —
+/// kept coarse (home/away changes slowly) and only run when the
+/// keep-accessory feature is enabled, to spare BLE air time.
+const LOCATION_POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 // Software version isn't sampled: `state software-update` returns only
 // the pending OTA version, never the installed `car_version`. Users
@@ -286,6 +293,14 @@ async fn main() -> Result<()> {
     let mut last_sentry_mode: Option<sample::SentryMode> = None;
     // Throttle for the staying-Active gate log (~1/min).
     let mut last_gate_log: Option<Instant> = None;
+    // Last known GPS from the drive poll (held across ticks; parked
+    // polls legitimately omit coords). Feeds the keep-accessory geofence.
+    let mut last_lat: Option<f64> = None;
+    let mut last_lon: Option<f64> = None;
+    // Throttle for the geofence `state location` poll (keep-accessory only).
+    let mut last_location_poll: Option<Instant> = None;
+    // Keep-Accessory-Power automation policy state (see keep_accessory.rs).
+    let mut keep_accessory_state = keep_accessory::KeepAccessoryState::default();
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -358,7 +373,35 @@ async fn main() -> Result<()> {
                 &mut last_charging_state,
                 &mut last_sentry_mode,
                 &mut last_gate_log,
+                &mut last_lat,
+                &mut last_lon,
+                &mut last_location_poll,
             ) => {
+                // Keep-Accessory-Power automation runs after each tick
+                // with the freshly-updated signals. Best-effort; gated
+                // on the 12V flag + home geofence inside evaluate(), and
+                // a no-op until both are configured.
+                if let Ok(cfg) = config::BleConfig::load() {
+                    if let Some(handle) = ble_session.as_ref() {
+                        keep_accessory::evaluate(
+                            &cfg.keep_accessory,
+                            &handle.session,
+                            &mut keep_accessory_state,
+                            last_lat,
+                            last_lon,
+                            // "parked" must be HW3-robust: HW3 reports
+                            // shift_state=Unknown when parked, so the
+                            // shift-based counter never confirms. OR in
+                            // car_truly_asleep (the daemon's own quiet
+                            // signal) so home→OFF works on HW3 too.
+                            parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET
+                                || usb_watch::observe() == CarState::Asleep,
+                            lock::is_archive_active(),
+                            held_radio,
+                        )
+                        .await;
+                    }
+                }
                 tokio::time::sleep(sleep).await;
             }
         }
@@ -414,6 +457,9 @@ async fn tick(
     last_charging_state: &mut Option<sample::ChargingState>,
     last_sentry_mode: &mut Option<sample::SentryMode>,
     last_gate_log: &mut Option<Instant>,
+    last_lat: &mut Option<f64>,
+    last_lon: &mut Option<f64>,
+    last_location_poll: &mut Option<Instant>,
 ) -> Duration {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -807,6 +853,14 @@ async fn tick(
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
                     shift_state_observed = d.shift_state;
+                    // Hold last-known GPS across ticks (parked polls omit
+                    // coords); feeds the keep-accessory geofence.
+                    if d.lat.is_some() {
+                        *last_lat = d.lat;
+                    }
+                    if d.lon.is_some() {
+                        *last_lon = d.lon;
+                    }
                     true
                 }
                 Err(e) => {
@@ -818,6 +872,45 @@ async fn tick(
             // success. See Schedule::next_after for the pattern.
             schedule.mark_drive(tick_now, success);
             any_call_ran = true;
+        }
+
+        // ── 1b. LOCATION (geofence) ── raw GPS for the keep-accessory
+        // home geofence. Not bundled in `state drive`, so it's its own
+        // round-trip; coarse cadence, and only when the feature is on.
+        // Pure geofence input (not a DB sample) — doesn't set any_call_ran.
+        if cfg.keep_accessory.enabled {
+            let due = last_location_poll
+                .map(|t| tick_now.duration_since(t) >= LOCATION_POLL_INTERVAL)
+                .unwrap_or(true);
+            if due {
+                match sample_ble::sample_location_ble(session).await {
+                    Ok((la, lo)) => {
+                        if la.is_some() {
+                            *last_lat = la;
+                        }
+                        if lo.is_some() {
+                            *last_lon = lo;
+                        }
+                        *last_location_poll = Some(tick_now);
+                        info!(
+                            "state-poll: location gps=({}, {})",
+                            la.map(|v| format!("{v:.6}")).unwrap_or_else(|| "?".into()),
+                            lo.map(|v| format!("{v:.6}")).unwrap_or_else(|| "?".into()),
+                        );
+                        // Expose the current fix for the web UI's "Use
+                        // current location" button (sets the home geofence).
+                        // Best-effort; tiny JSON on the writable /mutable.
+                        if let (Some(la), Some(lo)) = (la, lo) {
+                            let json = format!(
+                                "{{\"lat\":{la},\"lon\":{lo},\"ts\":{}}}\n",
+                                sample::now_secs()
+                            );
+                            let _ = std::fs::write("/mutable/keep_accessory_gps.json", json);
+                        }
+                    }
+                    Err(e) => warn!("state-poll: location failed: {e}"),
+                }
+            }
         }
 
         // ── 2. CLIMATE (every 60s) ──

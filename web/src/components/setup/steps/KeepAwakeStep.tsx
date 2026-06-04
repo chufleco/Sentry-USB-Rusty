@@ -2,6 +2,7 @@ import { Bluetooth, Webhook, Zap } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SecretInput } from "../SecretInput"
 import { cn } from "@/lib/utils"
+import { KeepAccessoryConfig } from "@/components/settings/KeepAccessoryConfig"
 
 const methods = [
   { id: "ble", label: "Bluetooth LE", icon: Bluetooth, desc: "Direct connection, unlimited. Requires initial pairing." },
@@ -184,6 +185,53 @@ export function KeepAwakeStep({ data, onChange, onBatchChange }: StepProps) {
       {method !== "none" && !data.SENTRY_CASE && (
         <p className="text-xs text-red-400">Select a Sentry Mode behavior above to continue.</p>
       )}
+
+      {/* Pi Power (12V accessory outlet) — keep-accessory automation.
+          Distinct from keep-awake: this keeps the *Pi* powered (not the
+          car awake) for cig-lighter-powered Pis, and is off unless the
+          user opts in. */}
+      <div className="space-y-2 border-t border-white/10 pt-5">
+        <h3 className="text-sm font-semibold uppercase tracking-wider text-slate-400">
+          Pi Power (12V outlet)
+        </h3>
+        <p className="text-xs text-slate-500">
+          Only for Pis powered from the 12V / cigarette-lighter outlet. Keeps the Pi alive for
+          Sentry coverage while you're parked away from home. (Glovebox-USB Pis: leave this off —
+          the car powers the USB itself.)
+        </p>
+        <KeepAccessoryConfig
+          values={{
+            enabled: data.KEEP_ACCESSORY_ENABLED === "yes",
+            homeLat: data.KEEP_ACCESSORY_HOME_LAT ? Number(data.KEEP_ACCESSORY_HOME_LAT) : null,
+            homeLon: data.KEEP_ACCESSORY_HOME_LON ? Number(data.KEEP_ACCESSORY_HOME_LON) : null,
+            radiusM: data.KEEP_ACCESSORY_HOME_RADIUS_M
+              ? Number(data.KEEP_ACCESSORY_HOME_RADIUS_M)
+              : 120,
+          }}
+          onChange={(patch) => {
+            const b: Record<string, string> = {}
+            if (patch.enabled !== undefined)
+              b.KEEP_ACCESSORY_ENABLED = patch.enabled ? "yes" : "no"
+            if (patch.homeLat !== undefined)
+              b.KEEP_ACCESSORY_HOME_LAT = patch.homeLat == null ? "" : patch.homeLat.toFixed(6)
+            if (patch.homeLon !== undefined)
+              b.KEEP_ACCESSORY_HOME_LON = patch.homeLon == null ? "" : patch.homeLon.toFixed(6)
+            if (patch.radiusM !== undefined)
+              b.KEEP_ACCESSORY_HOME_RADIUS_M = String(Math.round(patch.radiusM))
+            onBatchChange(b)
+          }}
+          onUseCurrentLocation={async () => {
+            try {
+              const d = await fetch("/api/system/keep-accessory-gps").then((r) => r.json())
+              if (typeof d.lat === "number" && typeof d.lon === "number")
+                return { lat: d.lat, lon: d.lon }
+              return null
+            } catch {
+              return null
+            }
+          }}
+        />
+      </div>
     </div>
   )
 }
