@@ -183,9 +183,16 @@ pub async fn delete_snapshot(
     // Prefer the on-disk script so we share the runtime's careful
     // umount + symlink cleanup logic. Fall back to a plain rm only if
     // the script is missing (possible on a partially-installed system).
+    //
+    // Pass the bare `id`, NOT the full path: the Rust-installed
+    // `release_snapshot.sh` is a thin shim that forwards "$@" to
+    // `sentryusb snapshot release`, which expects a `snap-NNNNNN` name.
+    // The id is already validated above, and `release_snapshot` now also
+    // accepts a full path, so this is robust across both the thin-wrapper
+    // and full-script installs.
     let script_exists = std::path::Path::new(RELEASE_SNAPSHOT_SCRIPT).exists();
     let result = if script_exists {
-        sentryusb_shell::run(RELEASE_SNAPSHOT_SCRIPT, &[path.as_str()]).await
+        sentryusb_shell::run(RELEASE_SNAPSHOT_SCRIPT, &[id.as_str()]).await
     } else {
         sentryusb_shell::run("rm", &["-rf", &path]).await
     };

@@ -160,15 +160,34 @@ pub async fn make_snapshot(skip_fsck: bool) -> Result<Option<String>> {
     Ok(Some(snap_name))
 }
 
-/// Release (delete) a snapshot.
-pub async fn release_snapshot(snap_name: &str) -> Result<()> {
-    if snap_name.contains("..") || snap_name.contains('/') {
-        bail!("invalid snapshot name");
+/// Normalize a snapshot identifier to its bare `snap-NNNNNN` name.
+///
+/// Callers pass either a bare name (`snap-000001`, e.g. from autofs) or a
+/// full path under the snapshots dir (`/backingfiles/snapshots/snap-000001`,
+/// e.g. the WebUI delete handler and `make_snapshot.sh`'s discard path). We
+/// take the final path component so every form works. Taking the basename
+/// also neutralizes any `..` traversal in the input — only the last
+/// component is ever used, then appended to `SNAPSHOTS_DIR`.
+fn normalize_snap_name(input: &str) -> Option<String> {
+    let name = Path::new(input).file_name()?.to_str()?;
+    if name.starts_with("snap-") && !name.contains("..") {
+        Some(name.to_string())
+    } else {
+        None
     }
+}
 
-    let snap_dir = format!("{}/{}", SNAPSHOTS_DIR, snap_name);
+/// Release (delete) a snapshot. Accepts a bare `snap-NNNNNN` name or a full
+/// path under the snapshots dir (see [`normalize_snap_name`]).
+pub async fn release_snapshot(snap_name: &str) -> Result<()> {
+    let name = match normalize_snap_name(snap_name) {
+        Some(n) => n,
+        None => bail!("invalid snapshot name: {}", snap_name),
+    };
+
+    let snap_dir = format!("{}/{}", SNAPSHOTS_DIR, name);
     if !Path::new(&snap_dir).exists() {
-        bail!("snapshot not found: {}", snap_name);
+        bail!("snapshot not found: {}", name);
     }
 
     let mnt_dir = format!("{}/mnt", snap_dir);
@@ -177,7 +196,7 @@ pub async fn release_snapshot(snap_name: &str) -> Result<()> {
     }
 
     std::fs::remove_dir_all(&snap_dir)?;
-    info!("Released snapshot: {}", snap_name);
+    info!("Released snapshot: {}", name);
     Ok(())
 }
 
@@ -643,5 +662,51 @@ async fn apply_bookworm_32bit_timestamp_fix(snap_file: &str) -> Result<()> {
     let _ = sentryusb_shell::run("umount", &[&tmpmnt]).await;
     let _ = sentryusb_shell::run("rmdir", &[&tmpmnt]).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_accepts_bare_name() {
+        // autofs and a correct WebUI call pass the bare id.
+        assert_eq!(normalize_snap_name("snap-000001").as_deref(), Some("snap-000001"));
+    }
+
+    #[test]
+    fn normalize_accepts_full_path() {
+        // The regression: the WebUI delete handler (and make_snapshot.sh's
+        // discard path) pass a full path. The old `contains('/')` guard
+        // rejected this outright, so deletes failed via the thin-wrapper
+        // `release_snapshot.sh` → `sentryusb snapshot release "$@"` route.
+        assert_eq!(
+            normalize_snap_name("/backingfiles/snapshots/snap-000001").as_deref(),
+            Some("snap-000001"),
+        );
+    }
+
+    #[test]
+    fn normalize_accepts_trailing_slash() {
+        assert_eq!(
+            normalize_snap_name("/backingfiles/snapshots/snap-000042/").as_deref(),
+            Some("snap-000042"),
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_non_snapshot() {
+        assert_eq!(normalize_snap_name("etc"), None);
+        assert_eq!(normalize_snap_name(""), None);
+        assert_eq!(normalize_snap_name(".."), None);
+    }
+
+    #[test]
+    fn normalize_rejects_traversal() {
+        // basename takes only the final component, so traversal can't
+        // escape SNAPSHOTS_DIR — the final segment isn't a `snap-` name.
+        assert_eq!(normalize_snap_name("snap-1/../../etc/passwd"), None);
+        assert_eq!(normalize_snap_name("/etc/../snap-1/.."), None);
+    }
 }
 
