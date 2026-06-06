@@ -32,7 +32,10 @@ export function ChargingSummaryStrip({
   const avgKwh = stats.count > 0 ? stats.totalEnergyKwh / stats.count : 0
 
   return (
-    <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
+    // 2x2 grid when space is tight (mobile / shrunk browser); a single
+    // flex row with dividers once there's room (sm+). Dividers are
+    // hidden below sm so they don't take grid cells.
+    <div className="grid grid-cols-2 gap-x-4 gap-y-3 sm:flex sm:flex-wrap sm:items-center sm:gap-x-5 sm:gap-y-2">
       <StatCell
         icon={<BatteryCharging className="h-3.5 w-3.5" />}
         label="Sessions"
