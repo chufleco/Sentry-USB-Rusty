@@ -344,6 +344,11 @@ pub struct Sample {
     pub charge_energy_added_kwh: Option<f32>,
     pub charge_limit_soc: Option<i32>,
     pub battery_range_mi: Option<f32>,
+    // Raw GPS (v12). Populated from the bundled LocationState only when
+    // the experimental flag is on; None otherwise. Lets a parked-and-
+    // charging sample carry the charger's location for the map pin.
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub source: String,
 }
 

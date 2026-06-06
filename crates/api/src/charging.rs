@@ -42,6 +42,8 @@ struct ChargeRow {
     interior_temp_c: Option<f64>,
     exterior_temp_c: Option<f64>,
     location: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
 }
 
 /// Summary of one charge session for the list view.
@@ -54,6 +56,8 @@ struct ChargeSessionSummary {
     end_ms: i64,
     duration_secs: i64,
     location: Option<String>,
+    location_lat: Option<f64>,
+    location_lon: Option<f64>,
     energy_added_kwh: Option<f64>,
     peak_power_kw: Option<i64>,
     start_soc: Option<f64>,
@@ -143,7 +147,8 @@ fn load_charge_rows(
         "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
                 charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
                 battery_range_mi, battery_pct, \
-                battery_temp_c, interior_temp_c, exterior_temp_c, location_name \
+                battery_temp_c, interior_temp_c, exterior_temp_c, location_name, \
+                latitude, longitude \
          FROM telemetry_samples \
          WHERE ts BETWEEN ?1 AND ?2 \
            AND (charger_power_kw IS NOT NULL OR charge_rate_mph IS NOT NULL) \
@@ -164,6 +169,8 @@ fn load_charge_rows(
             interior_temp_c: r.get(10)?,
             exterior_temp_c: r.get(11)?,
             location: r.get(12)?,
+            lat: r.get(13)?,
+            lon: r.get(14)?,
         })
     })?;
     let mut out = Vec::new();
@@ -210,6 +217,8 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         end_ms: last.ts * 1000,
         duration_secs: last.ts - first.ts,
         location: rows.iter().find_map(|r| r.location.clone()),
+        location_lat: rows.iter().find_map(|r| r.lat),
+        location_lon: rows.iter().find_map(|r| r.lon),
         energy_added_kwh,
         peak_power_kw: rows.iter().filter_map(|r| r.power_kw).max(),
         start_soc: rows.iter().find_map(|r| r.battery_pct),
@@ -338,6 +347,8 @@ mod tests {
             interior_temp_c: None,
             exterior_temp_c: None,
             location: None,
+            lat: None,
+            lon: None,
         }
     }
 

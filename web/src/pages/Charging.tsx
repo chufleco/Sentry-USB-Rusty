@@ -8,6 +8,7 @@ import {
   ChargingSummaryStrip,
   type ChargingStats,
 } from "@/components/charging/ChargingSummaryStrip"
+import { MiniPinMap } from "@/components/charging/MiniPinMap"
 import { rangeBounds, type DateRange } from "@/hooks/useDrivesList"
 import { fmtDuration, fmtEnergy, fmtSoc } from "@/lib/charge-format"
 
@@ -120,7 +121,7 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
       to={`/charging/${session.id}`}
       className="group flex items-center gap-4 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-4 transition-colors hover:border-white/10 hover:bg-white/[0.04]"
     >
-      <span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
+      <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
         <BatteryCharging className="h-5 w-5" />
       </span>
 
@@ -142,6 +143,10 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
             </>
           )}
         </div>
+        <div className="mt-1 flex items-center gap-1 text-sm font-semibold text-emerald-300 tabular-nums sm:hidden">
+          <Zap className="h-3.5 w-3.5" />
+          {fmtEnergy(session.energyAddedKwh)}
+        </div>
       </div>
 
       <div className="hidden shrink-0 text-right sm:block">
@@ -151,6 +156,14 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
         </div>
         <div className="mt-0.5 text-xs text-slate-500 tabular-nums">{socDelta}</div>
       </div>
+
+      {session.locationLat != null && session.locationLon != null && (
+        <MiniPinMap
+          lat={session.locationLat}
+          lon={session.locationLon}
+          className="h-16 w-24 sm:h-20 sm:w-32"
+        />
+      )}
 
       <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
     </Link>

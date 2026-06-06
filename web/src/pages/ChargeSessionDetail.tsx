@@ -14,6 +14,7 @@ import type { ChargeSessionDetail } from "@/types/charging"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import ChargePowerChart from "@/components/charging/ChargePowerChart"
 import ChargingLineChart from "@/components/charging/ChargingLineChart"
+import { MiniPinMap } from "@/components/charging/MiniPinMap"
 import type { ChargePoint } from "@/types/charging"
 import { fmtDuration, fmtEnergy, fmtPower, fmtRange, fmtSoc } from "@/lib/charge-format"
 
@@ -98,6 +99,15 @@ export default function ChargeSessionDetailPage() {
               )}
             </div>
           </div>
+
+          {session.locationLat != null && session.locationLon != null && (
+            <MiniPinMap
+              lat={session.locationLat}
+              lon={session.locationLon}
+              zoom={16}
+              className="h-44 w-full"
+            />
+          )}
 
           <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-5">
             <SectionHeading>Session</SectionHeading>

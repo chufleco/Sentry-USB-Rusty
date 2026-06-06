@@ -10,6 +10,8 @@ export interface ChargeSessionSummary {
   endMs: number
   durationSecs: number
   location: string | null
+  locationLat: number | null
+  locationLon: number | null
   energyAddedKwh: number | null
   peakPowerKw: number | null
   startSoc: number | null
