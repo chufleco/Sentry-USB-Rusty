@@ -48,6 +48,7 @@ struct ChargeRow {
 
 /// Summary of one charge session for the list view.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChargeSessionSummary {
     /// Session id == start timestamp in unix seconds. Stable and
     /// directly usable as the detail-endpoint key.
@@ -71,6 +72,7 @@ struct ChargeSessionSummary {
 /// charging view plots — all sourced from columns the sampler already
 /// records, so adding them costs nothing extra on the device.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChargePoint {
     ts: i64,
     power_kw: Option<i64>,
@@ -86,6 +88,7 @@ struct ChargePoint {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChargeSessionDetail {
     #[serde(flatten)]
     summary: ChargeSessionSummary,
@@ -385,5 +388,44 @@ mod tests {
         assert!(!is_charging(None, None));
         assert!(is_charging(Some(7), None));
         assert!(is_charging(None, Some(12.0)));
+    }
+
+    #[test]
+    fn structs_serialize_camelcase_for_the_web_client() {
+        // Regression for the on-vehicle bug: the web UI reads camelCase
+        // keys (startMs, energyAddedKwh, powerKw, ...). Without
+        // #[serde(rename_all = "camelCase")] the structs emit snake_case,
+        // so EVERY field arrives `undefined` → "Invalid Date", NaN
+        // duration, "—" stats, 0.0 energy. Pin the wire names here.
+        let s = summarize(&[
+            row(1_000, Some(7), Some(25.0), Some(2.0)),
+            row(1_300, Some(11), Some(40.0), Some(9.4)),
+        ]);
+        let j = serde_json::to_string(&s).unwrap();
+        for key in ["startMs", "endMs", "durationSecs", "energyAddedKwh", "peakPowerKw"] {
+            assert!(j.contains(&format!("\"{key}\"")), "summary must emit {key}: {j}");
+        }
+        assert!(!j.contains("\"start_ms\""), "summary must NOT emit snake_case: {j}");
+
+        // Obviously-synthetic placeholder values — the test asserts only the
+        // serialized KEY NAMES (camelCase), never these numbers.
+        let p = ChargePoint {
+            ts: 1,
+            power_kw: Some(1),
+            current_a: Some(1),
+            voltage_v: Some(1),
+            rate_mph: Some(1.0),
+            soc: Some(1.0),
+            range_mi: Some(1.0),
+            energy_added_kwh: Some(1.0),
+            battery_temp_c: None,
+            interior_temp_c: None,
+            exterior_temp_c: None,
+        };
+        let jp = serde_json::to_string(&p).unwrap();
+        for key in ["powerKw", "currentA", "voltageV", "rateMph", "rangeMi", "energyAddedKwh"] {
+            assert!(jp.contains(&format!("\"{key}\"")), "point must emit {key}: {jp}");
+        }
+        assert!(!jp.contains("\"power_kw\""), "point must NOT emit snake_case: {jp}");
     }
 }
