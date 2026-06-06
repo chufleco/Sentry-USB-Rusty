@@ -98,6 +98,7 @@ mod tests {
             odometer_mi: Some(12453.5),
             location_name: Some("123 Main St".into()),
             source: "state".into(),
+            ..Sample::default()
         };
         insert(&conn, &s).unwrap();
         let count: i64 = conn
