@@ -22,6 +22,7 @@ import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
+import ChargingBanner from "@/components/charging/ChargingBanner"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
@@ -446,6 +447,8 @@ export default function Dashboard() {
         <h1 className="text-2xl font-bold text-slate-100">Dashboard</h1>
         <p className="mt-0.5 text-sm text-slate-500">System overview and status</p>
       </div>
+
+      <ChargingBanner />
 
       <BannerStack banners={banners} />
 

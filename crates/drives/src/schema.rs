@@ -78,7 +78,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Also: `software_version` columns on both tables are kept for
 /// forward-compat but no longer written â€” Tesla doesn't expose
 /// `car_version` over BLE state queries.
-pub const CURRENT_SCHEMA_VERSION: i32 = 12;
+pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -288,6 +288,14 @@ pub const V12_TELEMETRY_GPS_COLUMNS: &[(&str, &str)] = &[
     ("longitude", "REAL"),
 ];
 
+/// v13 estimated-minutes-to-full column on `telemetry_samples`. The car
+/// already reports this in its `ChargeState`; persisting it lets the
+/// dashboard "charging" banner show a live time-to-full. Additive +
+/// nullable like the rest.
+pub const V13_TELEMETRY_MINUTES_COLUMN: &[(&str, &str)] = &[
+    ("charge_minutes_to_full", "INTEGER"),
+];
+
 /// v10 per-clip location-name rollups on `routes`. Populated by
 /// the aggregator from the first / last non-null sample in the
 /// clip's 60s window.
@@ -364,6 +372,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V10_TELEMETRY_COLUMNS.iter())
         .chain(V11_TELEMETRY_CHARGE_COLUMNS.iter())
         .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
+        .chain(V13_TELEMETRY_MINUTES_COLUMN.iter())
     {
         if existing_tele.contains(*name) {
             continue;
@@ -538,7 +547,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12"),
+            Some("13"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -576,7 +585,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -608,7 +617,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -642,7 +651,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -749,7 +758,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -800,7 +809,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -853,7 +862,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 
@@ -896,7 +905,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("12")
+            Some("13")
         );
     }
 

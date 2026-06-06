@@ -977,6 +977,7 @@ async fn tick(
                     sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
                     sample.charge_limit_soc = d.charge_limit_soc;
                     sample.battery_range_mi = d.battery_range_mi;
+                    sample.charge_minutes_to_full = d.minutes_to_full_charge;
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     // Refresh the gate input on success; keep the previous

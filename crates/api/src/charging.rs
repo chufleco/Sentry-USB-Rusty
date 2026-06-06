@@ -305,6 +305,97 @@ pub async fn single_charging(
     (StatusCode::OK, Json(serde_json::to_value(detail).unwrap()))
 }
 
+/// Live charge status for the dashboard banner. `charging` is false when
+/// the latest sample isn't an active charge or is stale (the car stopped
+/// being sampled); the other fields are present only while charging.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CurrentCharge {
+    charging: bool,
+    soc: Option<f64>,
+    limit_soc: Option<i64>,
+    power_kw: Option<i64>,
+    minutes_to_full: Option<i64>,
+    range_mi: Option<f64>,
+}
+
+impl CurrentCharge {
+    fn idle() -> Self {
+        Self {
+            charging: false,
+            soc: None,
+            limit_soc: None,
+            power_kw: None,
+            minutes_to_full: None,
+            range_mi: None,
+        }
+    }
+}
+
+/// The single most-recent telemetry row, charge-relevant columns only.
+struct LatestCharge {
+    ts: i64,
+    soc: Option<f64>,
+    limit_soc: Option<i64>,
+    power_kw: Option<i64>,
+    rate_mph: Option<f64>,
+    minutes_to_full: Option<i64>,
+    range_mi: Option<f64>,
+}
+
+/// GET /api/charging/current — is the car charging right now, with the
+/// fields the dashboard banner shows. Reads one row (latest by ts); a
+/// sample older than 10 minutes counts as "not charging" so a long-asleep
+/// car doesn't keep the banner stuck on.
+pub async fn current_charging(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    use rusqlite::OptionalExtension;
+    let latest = state.drives.store.with_locked_conn(|conn| {
+        conn.query_row(
+            "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
+                    charge_rate_mph, charge_minutes_to_full, battery_range_mi \
+             FROM telemetry_samples ORDER BY ts DESC LIMIT 1",
+            [],
+            |r| {
+                Ok(LatestCharge {
+                    ts: r.get(0)?,
+                    soc: r.get(1)?,
+                    limit_soc: r.get(2)?,
+                    power_kw: r.get(3)?,
+                    rate_mph: r.get(4)?,
+                    minutes_to_full: r.get(5)?,
+                    range_mi: r.get(6)?,
+                })
+            },
+        )
+        .optional()
+    });
+
+    let cur = match latest {
+        Ok(Some(l)) => {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs() as i64)
+                .unwrap_or(l.ts);
+            if now - l.ts <= 600 && is_charging(l.power_kw, l.rate_mph) {
+                CurrentCharge {
+                    charging: true,
+                    soc: l.soc,
+                    limit_soc: l.limit_soc,
+                    power_kw: l.power_kw,
+                    minutes_to_full: l.minutes_to_full,
+                    range_mi: l.range_mi,
+                }
+            } else {
+                CurrentCharge::idle()
+            }
+        }
+        _ => CurrentCharge::idle(),
+    };
+    (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

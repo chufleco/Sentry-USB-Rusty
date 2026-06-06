@@ -45,3 +45,15 @@ export interface ChargeSessionDetail extends ChargeSessionSummary {
   avgBatteryTempC: number | null
   points: ChargePoint[]
 }
+
+// Live charge status for the dashboard banner (/api/charging/current).
+// `charging` is false when the car isn't actively charging; the other
+// fields are present only while charging.
+export interface CurrentCharge {
+  charging: boolean
+  soc: number | null
+  limitSoc: number | null
+  powerKw: number | null
+  minutesToFull: number | null
+  rangeMi: number | null
+}

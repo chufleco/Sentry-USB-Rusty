@@ -203,6 +203,7 @@ pub fn build_router(state: AppState) -> Router {
         // Charging — sessions derived on-demand from the per-sample
         // charge columns. Empty unless the experimental flag is on.
         .route("/api/charging", get(crate::charging::list_charging))
+        .route("/api/charging/current", get(crate::charging::current_charging))
         .route("/api/charging/{id}", get(crate::charging::single_charging))
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))

@@ -41,9 +41,9 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
           charger_power_kw, charger_actual_current_a, charger_voltage_v, \
           charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
           latitude, longitude, \
-          source) \
+          source, charge_minutes_to_full) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
-                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23)",
         params![
             s.ts,
             s.battery_pct,
@@ -67,6 +67,7 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.latitude,
             s.longitude,
             s.source,
+            s.charge_minutes_to_full,
         ],
     )?;
     Ok(())

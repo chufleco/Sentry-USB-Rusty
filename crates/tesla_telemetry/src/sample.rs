@@ -344,6 +344,9 @@ pub struct Sample {
     pub charge_energy_added_kwh: Option<f32>,
     pub charge_limit_soc: Option<i32>,
     pub battery_range_mi: Option<f32>,
+    // Estimated minutes to full charge (v13). Drives the dashboard
+    // "charging" banner's time-to-full readout.
+    pub charge_minutes_to_full: Option<i32>,
     // Raw GPS (v12). Populated from the bundled LocationState only when
     // the experimental flag is on; None otherwise. Lets a parked-and-
     // charging sample carry the charger's location for the map pin.
