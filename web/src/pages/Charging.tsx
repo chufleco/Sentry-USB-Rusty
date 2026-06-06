@@ -100,16 +100,20 @@ export default function Charging() {
 
 function ChargeRow({ session }: { session: ChargeSessionSummary }) {
   const start = new Date(session.startMs)
-  // "19% (40 mi) → 90% (193 mi)" when range is known, else just the
-  // SoC pair.
-  const socPart = (
-    pct: number | null,
-    mi: number | null,
-  ): string => {
+  // Two forms so the SoC range degrades instead of vanishing when the
+  // row is tight: `socShort` is always shown ("62% → 79%"); the miles
+  // ("62% (132 mi) → …") only appear when there's room (sm+).
+  const socShort =
+    session.startSoc != null && session.endSoc != null
+      ? `${fmtSoc(session.startSoc)} → ${fmtSoc(session.endSoc)}`
+      : session.endSoc != null
+        ? fmtSoc(session.endSoc)
+        : "—"
+  const socPart = (pct: number | null, mi: number | null): string => {
     if (pct == null) return "—"
     return mi != null ? `${fmtSoc(pct)} (${Math.round(mi)} mi)` : fmtSoc(pct)
   }
-  const socDelta =
+  const socFull =
     session.startSoc != null && session.endSoc != null
       ? `${socPart(session.startSoc, session.startRangeMi)} → ${socPart(session.endSoc, session.endRangeMi)}`
       : session.endSoc != null
@@ -143,18 +147,17 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
           <span>·</span>
           <span>{fmtDuration(session.durationSecs)}</span>
         </div>
-        <div className="mt-1 flex items-center gap-1 text-sm font-semibold text-emerald-300 tabular-nums sm:hidden">
-          <Zap className="h-3.5 w-3.5" />
-          {fmtEnergy(session.energyAddedKwh)}
-        </div>
       </div>
 
-      <div className="hidden shrink-0 text-right sm:block">
+      <div className="shrink-0 text-right">
         <div className="flex items-center justify-end gap-1 text-sm font-semibold text-emerald-300 tabular-nums">
           <Zap className="h-3.5 w-3.5" />
           {fmtEnergy(session.energyAddedKwh)}
         </div>
-        <div className="mt-0.5 text-xs text-slate-500 tabular-nums">{socDelta}</div>
+        <div className="mt-0.5 text-xs text-slate-500 tabular-nums">
+          <span className="sm:hidden">{socShort}</span>
+          <span className="hidden sm:inline">{socFull}</span>
+        </div>
       </div>
 
       {session.locationLat != null && session.locationLon != null && (
