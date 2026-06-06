@@ -79,7 +79,10 @@ const _: () = {
 
 /// Priority of a queued radio job. Derived `Ord` makes `Phone > Sampler`
 /// by declaration order (later variant = greater), so a phone job always
-/// sorts ahead of a sampler job in the actor's biased arbitration.
+/// will sort ahead of a sampler job once the actor implements priority-
+/// aware cooperative preemption (slice 5). NOTE: the current `run_radio_actor`
+/// loop is plain FIFO and does NOT yet consult this ordering — see that
+/// function's docs for why preemption must be cooperative, not a queue sort.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
 pub enum Priority {
@@ -269,10 +272,27 @@ where
     RadioHandle { tx }
 }
 
-/// The actor loop. Receives jobs and arbitrates the single radio.
+/// The actor loop. Receives jobs and runs them.
 ///
-/// Biased toward draining a granted phone lease before resuming sampling
-/// (the priority semantics of [`Priority`]). On the sampler arm it calls
+/// HONEST STATEMENT OF CURRENT BEHAVIOR: this is a single-task FIFO loop.
+/// It pulls one job off the channel and runs it to completion before
+/// taking the next. It does NOT consult [`Priority`], and it does NOT
+/// preempt — a `PhonePreempt` queued behind a `Poll` waits for that
+/// poll's `tick_fn().await` (a multi-second BLE round-trip) to finish.
+/// So today "preempt" is structural scaffolding, not real preemption.
+///
+/// Why it is not just "make the channel a priority queue": you cannot
+/// safely interrupt a `tick()` mid-flight. It is doing GATT reads/writes;
+/// dropping that future mid-operation leaves the car link in a
+/// half-written framing state. Real preemption (slice 5) is therefore
+/// COOPERATIVE, not a cancellation: the sampler checks a preempt signal
+/// at each sub-poll boundary (drive→climate→charge→closures→tires — the
+/// safe points between discrete BLE round-trips), and on signal calls
+/// `suspend_link()` (keeps the session domains → no re-pair), yields the
+/// radio for the lease, then `resume_link()`s and continues. That bounds
+/// preempt latency to one sub-poll (~1-2s) without corrupting the link.
+/// The [`Priority`] enum encodes the INTENT of that future design; the
+/// loop below does not yet implement it. On the sampler arm it calls
 /// `tick_fn`, which wraps the unchanged [`crate::tick`].
 async fn run_radio_actor<F, Fut>(mut rx: mpsc::Receiver<RadioJob>, mut tick_fn: F)
 where
