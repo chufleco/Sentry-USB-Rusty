@@ -2494,6 +2494,7 @@ dependencies = [
  "hex",
  "libc",
  "ring",
+ "sentryusb-config",
  "sentryusb-shell",
  "tempfile",
  "tokio",

@@ -212,6 +212,48 @@ fn is_nudge_alive() -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// Cede-sentinel path. When this file exists, the radio actor (the
+/// experimental broker) has claimed exclusive responsibility for
+/// sampling, and any standalone legacy sampler loop must CEDE — stop
+/// driving its own polls — so the two can never double-sample the car
+/// over the one radio.
+///
+/// Lives on tmpfs alongside the radio-owner lock. The broker creates it
+/// when it takes over and removes it on shutdown; a normal (flag-off)
+/// install never creates it, so the legacy loop runs exactly as before.
+pub const CEDE_SENTINEL_PATH: &str = "/tmp/ble_sampler_ceded";
+
+/// Mark that the actor/broker owns sampling: create the cede-sentinel so
+/// a standalone sampler defers. Best-effort on tmpfs.
+pub fn set_sampler_ceded() -> Result<()> {
+    fs::write(CEDE_SENTINEL_PATH, b"ceded\n")
+        .with_context(|| format!("failed to create cede sentinel {}", CEDE_SENTINEL_PATH))
+}
+
+/// Clear the cede-sentinel (broker shutting down / handing sampling
+/// back). No-op if absent.
+pub fn clear_sampler_ceded() -> Result<()> {
+    match fs::remove_file(CEDE_SENTINEL_PATH) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => {
+            Err(e).with_context(|| format!("failed to remove {}", CEDE_SENTINEL_PATH))
+        }
+    }
+}
+
+/// Whether a standalone sampler should cede to the broker. True iff the
+/// cede-sentinel exists. This is the READ side of the sentinel: a
+/// standalone sampler calls it to defer so that, even if a broker is
+/// running in the same install, the two never sample concurrently over
+/// the single radio. The broker only writes the sentinel (it never reads
+/// it), so this is unused in the broker binary itself — it is the API the
+/// deferring sampler consumes, and the unit tests exercise it.
+#[allow(dead_code)]
+pub fn sampler_should_cede() -> bool {
+    Path::new(CEDE_SENTINEL_PATH).exists()
+}
+
 /// True when something currently wants the car kept awake: an archive
 /// cycle (fresh `archive_status.json`) or any keep-awake nudge loop
 /// (`awake_start`'s Case-3 PID file — archiveloop, web-UI, drive
@@ -325,5 +367,32 @@ mod tests {
             release("telemetry").unwrap();
             assert_eq!(current_owner().as_deref(), Some("keep_awake"));
         });
+    }
+
+    // Cede-sentinel — serialized on its own mutex since it touches a
+    // fixed tmpfs path. A normal (flag-off) install never sets it, so
+    // the default must be "do not cede".
+    static CEDE_LOCK: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cede_sentinel_absent_means_no_cede() {
+        let _g = CEDE_LOCK.lock().unwrap();
+        let _ = clear_sampler_ceded();
+        assert!(
+            !sampler_should_cede(),
+            "default (no broker) install must not cede sampling",
+        );
+    }
+
+    #[test]
+    fn set_and_clear_cede_sentinel() {
+        let _g = CEDE_LOCK.lock().unwrap();
+        let _ = clear_sampler_ceded();
+        set_sampler_ceded().unwrap();
+        assert!(sampler_should_cede(), "after set, standalone sampler cedes");
+        clear_sampler_ceded().unwrap();
+        assert!(!sampler_should_cede(), "after clear, sampler resumes");
+        // Idempotent clear.
+        clear_sampler_ceded().unwrap();
     }
 }

@@ -134,6 +134,23 @@ enum Command {
     CheckPairing {
         reply: oneshot::Sender<PairingStatus>,
     },
+    /// Drop ONLY the live GATT connection while KEEPING every cached
+    /// per-domain session (key/epoch/counter/clock). Used to yield the
+    /// single controller to a phone on a single-radio board without
+    /// destroying the authenticated session domains — so resuming
+    /// reconnects and reuses the existing keys with NO re-handshake and,
+    /// crucially, NO re-pair. See [`PersistentSession::suspend_link`].
+    SuspendLink {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Re-establish the GATT connection after a [`Command::SuspendLink`],
+    /// reusing the preserved domains. Idempotent: a no-op if already
+    /// connected. The next query handshakes only domains that are
+    /// somehow absent — after a clean suspend/resume there are none, so
+    /// no re-handshake occurs. See [`PersistentSession::resume_link`].
+    ResumeLink {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Shutdown,
 }
 
@@ -369,6 +386,47 @@ impl PersistentSession {
         ))
     }
 
+    /// Yield the live BLE link, KEEPING the authenticated session
+    /// domains.
+    ///
+    /// Drops only the GATT connection (frees the car's BLE slot / the
+    /// single controller) while every cached per-domain session —
+    /// `SessionKey`, `epoch`, and the monotonic `counter` — is left
+    /// intact. This is the bond-preserving half of a phone preempt on a
+    /// single-radio board: the phone gets the radio, and we can come
+    /// back later with [`resume_link`](Self::resume_link) reusing the
+    /// existing keys. There is NO re-handshake of preserved domains and
+    /// NO re-pair with the car or any phone.
+    ///
+    /// Counter monotonicity is preserved across the gap: because we keep
+    /// each domain's `counter`, the first query after resume continues
+    /// from `counter + 1`, exactly as if the link had never dropped.
+    pub async fn suspend_link(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::SuspendLink { reply: tx })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await.context("session task dropped the reply channel")?
+    }
+
+    /// Re-establish the BLE link after [`suspend_link`](Self::suspend_link),
+    /// reusing the preserved domains.
+    ///
+    /// Reconnects the GATT transport. Cached domains are untouched, so
+    /// the next query signs with the existing key + the next counter and
+    /// the car accepts it without a fresh SessionInfo handshake — no
+    /// re-pair. Idempotent: returns `Ok(())` immediately if a connection
+    /// already exists.
+    pub async fn resume_link(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ResumeLink { reply: tx })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await.context("session task dropped the reply channel")?
+    }
+
     // Typed wrappers: each does a raw Infotainment `query()` and
     // decodes the response into the relevant car_server sub-message.
 
@@ -546,6 +604,19 @@ async fn run_session_task(
                     Err(e) => PairingStatus::Unreachable(format!("{e:#}")),
                 };
                 let _ = reply.send(status);
+            }
+            Command::SuspendLink { reply } => {
+                // Bond-preserving yield: drop ONLY the connection, keep
+                // every domain. No transport-error bookkeeping — this is
+                // a deliberate, clean teardown, not a link failure.
+                suspend_link_inner(&mut state).await;
+                let _ = reply.send(Ok(()));
+            }
+            Command::ResumeLink { reply } => {
+                // Reconnect the transport reusing preserved domains. If
+                // already connected, ensure_connected is a no-op.
+                let result = ensure_connected(&mut state).await;
+                let _ = reply.send(result);
             }
             Command::Shutdown => break,
         }
@@ -947,6 +1018,37 @@ async fn try_signed_request_once(
 
     debug!("PersistentSession: decrypted {} bytes", plaintext.len());
     Ok(QueryOutcome::Plaintext(plaintext))
+}
+
+/// Bond-preserving link suspend: close the GATT connection but KEEP the
+/// cached per-domain sessions (key/epoch/counter/clock) so a later
+/// [`ensure_connected`] resume reuses them with no re-handshake.
+///
+/// Contrast with [`handle_transport_error_if_any`], which on a *failure*
+/// also `state.domains.clear()`s (a dropped link can leave our counter
+/// out of sync with the car, so a fresh handshake is safest). A
+/// deliberate suspend has no such ambiguity: we chose to drop, the
+/// car-side session is undisturbed, and keeping the counter preserves
+/// monotonicity for the first post-resume query.
+///
+/// Connection bookkeeping that does NOT touch domains is reset
+/// (connected_at, queries_since_connect) so the status/diagnostic lines
+/// read correctly after resume; `last_successful_query_at` is kept so a
+/// resume diagnostic can still report the gap.
+async fn suspend_link_inner(state: &mut SessionState) {
+    if let Some(conn) = state.conn.take() {
+        conn.close().await;
+    }
+    // Intentionally do NOT clear `state.domains` — that is the whole
+    // point of suspend vs a transport-error drop.
+    state.connected_at = None;
+    state.queries_since_connect = 0;
+    write_status_file(state, ConnectionEvent::Disconnected);
+    info!(
+        "PersistentSession: link suspended (bond preserved) — \
+         {} domain session(s) kept for resume",
+        state.domains.len()
+    );
 }
 
 /// Drop the held connection if `result` looks like a transport failure
@@ -1512,4 +1614,163 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
         .copied()
         .collect();
     Some(tail.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::SESSION_KEY_LEN;
+    use crate::keys::generate_keypair;
+
+    /// A SessionState seeded with `domain_count` cached domains and no
+    /// live connection — the post-handshake-then-link-suspended shape.
+    /// Each DomainSession carries a deterministic key/epoch/counter so a
+    /// later assertion can prove the exact values survived (not just the
+    /// count).
+    fn seeded_state(domain_count: usize) -> SessionState {
+        let dir = tempfile::tempdir().unwrap();
+        let keypair = generate_keypair(dir.path()).unwrap();
+
+        let mut domains = HashMap::new();
+        // Two distinct real domains; counters chosen so monotonicity is
+        // verifiable post-resume.
+        let order = [Domain::Infotainment, Domain::VehicleSecurity];
+        for (i, d) in order.iter().take(domain_count).enumerate() {
+            domains.insert(
+                *d,
+                DomainSession {
+                    key: SessionKey([(i as u8) + 1; SESSION_KEY_LEN]),
+                    epoch: vec![0xAB, 0xCD, i as u8],
+                    counter: 100 + i as u32,
+                    clock_time_at_handshake: 5000 + i as u32,
+                    handshake_local_time: Instant::now(),
+                },
+            );
+        }
+
+        SessionState {
+            keypair,
+            vin: "5YJ3E1EA0000TEST0".to_string(),
+            adapter_name: None,
+            conn: None,
+            domains,
+            backoff: RECONNECT_BACKOFF_MIN,
+            connected_at: Some(Instant::now()),
+            queries_since_connect: 7,
+            last_successful_query_at: Some(Instant::now()),
+            lifetime_drops: 0,
+            recent_latencies_ms: VecDeque::new(),
+            last_scan_rssi: Some(-60),
+            last_peer_mac: Some("AA:BB:CC:DD:EE:FF".into()),
+            framing_desync_recoveries: 0,
+            cached_adapter: None,
+            consecutive_connect_failures: 0,
+        }
+    }
+
+    /// The core governance guarantee: a bond-preserving suspend drops
+    /// only the connection and KEEPS every domain (key/epoch/counter),
+    /// so a resume reuses them with no re-handshake and no re-pair.
+    ///
+    /// We exercise `suspend_link_inner` directly (no live radio needed)
+    /// and prove domains are non-empty AND byte-identical afterward, then
+    /// prove the resume path takes the early-return (handshake-skipped)
+    /// branch for a preserved domain.
+    #[tokio::test]
+    async fn domains_survive_suspend_then_resume_round_trip() {
+        let mut state = seeded_state(2);
+
+        // Capture the pre-suspend domain fingerprints.
+        let before: Vec<(Domain, [u8; SESSION_KEY_LEN], Vec<u8>, u32, u32)> = {
+            let mut v: Vec<_> = state
+                .domains
+                .iter()
+                .map(|(d, s)| {
+                    (
+                        *d,
+                        *s.key.as_bytes(),
+                        s.epoch.clone(),
+                        s.counter,
+                        s.clock_time_at_handshake,
+                    )
+                })
+                .collect();
+            v.sort_by_key(|t| t.0 as i32);
+            v
+        };
+        assert_eq!(before.len(), 2, "fixture should start with 2 domains");
+
+        // --- suspend: drops the connection, keeps domains ---
+        suspend_link_inner(&mut state).await;
+        assert!(
+            state.conn.is_none(),
+            "suspend must drop the live connection"
+        );
+        assert!(
+            !state.domains.is_empty(),
+            "DOMAIN SURVIVAL: domains must be non-empty after suspend",
+        );
+        assert_eq!(
+            state.domains.len(),
+            2,
+            "no domain may be evicted by a bond-preserving suspend",
+        );
+
+        // --- resume would call ensure_connected; here we assert the
+        // resume path performs NO re-handshake for a preserved domain.
+        // ensure_domain_session early-returns when the domain is present,
+        // never touching `conn` — so even with conn=None it returns Ok
+        // for a preserved domain. A non-preserved domain would instead
+        // hit the "called without connection" error. That contrast is
+        // the proof that resume reuses, not re-handshakes.
+        for d in [Domain::Infotainment, Domain::VehicleSecurity] {
+            ensure_domain_session(&mut state, d)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "ensure_domain_session({d:?}) must take the no-handshake \
+                         early return for a preserved domain, got: {e:#}"
+                    )
+                });
+        }
+        // A domain that was NOT preserved must hit the handshake path,
+        // which requires a connection — proving the early return above
+        // was the *preserved-domain* branch and not a blanket no-op.
+        state.domains.remove(&Domain::VehicleSecurity);
+        let err = ensure_domain_session(&mut state, Domain::VehicleSecurity)
+            .await
+            .expect_err(
+                "an absent domain must attempt a handshake (which needs a connection)",
+            );
+        assert!(
+            format!("{err:#}").contains("without connection"),
+            "absent domain should reach the handshake/connection path, got: {err:#}",
+        );
+
+        // --- final: the still-preserved domain is byte-identical to
+        // before — same key, epoch, counter, clock. No re-derivation.
+        let after = &state.domains[&Domain::Infotainment];
+        let (_, k0, e0, c0, t0) = before
+            .iter()
+            .find(|t| t.0 == Domain::Infotainment)
+            .cloned()
+            .unwrap();
+        assert_eq!(*after.key.as_bytes(), k0, "session key must be unchanged");
+        assert_eq!(after.epoch, e0, "epoch must be unchanged");
+        assert_eq!(after.counter, c0, "counter must be unchanged (monotonicity)");
+        assert_eq!(
+            after.clock_time_at_handshake, t0,
+            "handshake clock must be unchanged",
+        );
+    }
+
+    /// Suspending a session that already has no domains is a clean no-op
+    /// — it must not panic or fabricate state.
+    #[tokio::test]
+    async fn suspend_with_no_domains_is_a_clean_noop() {
+        let mut state = seeded_state(0);
+        suspend_link_inner(&mut state).await;
+        assert!(state.domains.is_empty());
+        assert!(state.conn.is_none());
+    }
 }

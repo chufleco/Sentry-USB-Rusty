@@ -21,8 +21,10 @@ mod clock_sync;
 mod config;
 mod db;
 mod diag_log;
+mod flags;
 mod keep_accessory;
 mod lock;
+mod radio;
 mod sample;
 mod sample_ble;
 mod usb_watch;
@@ -320,6 +322,51 @@ async fn main() -> Result<()> {
         tokio::signal::unix::SignalKind::user_defined1(),
     )?;
 
+    // ── Flag-gated loop selection ──────────────────────────────────────
+    //
+    // Read the experimental flag ONCE here to pick which main loop runs.
+    // (`tick()` itself re-reads the per-feature `experimental` config
+    // fresh every iteration, so flag-driven sampling behavior still
+    // toggles live without a restart — this gate only chooses the loop
+    // *shape*.)
+    //
+    // Flag OFF  → the existing `tokio::select!` loop runs byte-for-byte,
+    //             today-exact behavior. No actor, no cede-sentinel, no
+    //             new code in the sampling path. This is the `else`.
+    //
+    // Flag ON   → `run_actor_main_loop`, the smallest first slice: a
+    //             structural clone of the same `select!` loop that ALSO
+    //             marks the cede-sentinel (so a standalone sampler can't
+    //             double-sample) and constructs the radio actor wiring.
+    //             The actor's live phone-preempt is INERT — the sampler
+    //             still runs via the unchanged `tick()` exactly as the
+    //             legacy loop does. Activating live preemption is slice 5
+    //             (on-vehicle only); see radio.rs.
+    if flags::experimental_enabled() {
+        return run_actor_main_loop(
+            conn,
+            action_rx,
+            held_radio,
+            parked_polls,
+            last_user_presence,
+            schedule,
+            last_parked_awake_refresh,
+            last_parked_awake_tpms_refresh,
+            ble_session,
+            last_charging_state,
+            last_sentry_mode,
+            last_gate_log,
+            last_lat,
+            last_lon,
+            last_location_poll,
+            keep_accessory_state,
+            sigterm,
+            sigint,
+            sigusr1,
+        )
+        .await;
+    }
+
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -406,6 +453,154 @@ async fn main() -> Result<()> {
             }
         }
     }
+}
+
+/// Experimental (flag-ON) main loop.
+///
+/// This is a STRUCTURAL CLONE of the legacy `select!` loop above — the
+/// else path stays the real legacy loop, this if-arm is the clone: the
+/// sampling path is identical — it calls the SAME unchanged `tick()` with
+/// the SAME arguments and the SAME post-tick keep-accessory evaluation.
+/// Nothing about the existing sampler is moved or rewritten.
+///
+/// What this slice adds, additively and inertly:
+///   * Marks the cede-sentinel (`lock::set_sampler_ceded`) so that if a
+///     standalone sampler is ever present in the same install, it defers
+///     and the two never double-sample the single radio. Cleared on exit.
+///   * Constructs the radio-actor wiring (`radio::spawn_radio_actor`) to
+///     prove the types compile end-to-end and the actor coexists with the
+///     loop. The actor's LIVE phone-preempt (suspend/resume the car link)
+///     is INERT — see `radio.rs`. The sampler still runs inline here, so
+///     this loop's observable behavior matches the legacy loop exactly.
+///
+/// Activating live phone preemption (routing the sampler through the
+/// actor and yielding the car link to a phone) is slice 5 and requires
+/// Pi + car + phone sign-off: resume-without-re-pair, BlueZ
+/// central+peripheral coexistence, and preempt latency.
+#[allow(clippy::too_many_arguments)]
+async fn run_actor_main_loop(
+    conn: rusqlite::Connection,
+    mut action_rx: mpsc::Receiver<action_socket::ActionRequest>,
+    mut held_radio: bool,
+    mut parked_polls: u32,
+    mut last_user_presence: Option<bool>,
+    mut schedule: Schedule,
+    mut last_parked_awake_refresh: Option<Instant>,
+    mut last_parked_awake_tpms_refresh: Option<Instant>,
+    mut ble_session: Option<sample_ble::SessionHandle>,
+    mut last_charging_state: Option<sample::ChargingState>,
+    mut last_sentry_mode: Option<sample::SentryMode>,
+    mut last_gate_log: Option<Instant>,
+    mut last_lat: Option<f64>,
+    mut last_lon: Option<f64>,
+    mut last_location_poll: Option<Instant>,
+    mut keep_accessory_state: keep_accessory::KeepAccessoryState,
+    mut sigterm: tokio::signal::unix::Signal,
+    mut sigint: tokio::signal::unix::Signal,
+    mut sigusr1: tokio::signal::unix::Signal,
+) -> Result<()> {
+    info!(
+        "experimental main loop selected (SENTRYUSB_EXPERIMENTAL on) — sampler \
+         runs via the unchanged tick(); radio-actor phone-preempt is INERT \
+         (structure only, pending on-vehicle sign-off)"
+    );
+
+    // Broker is the SINGLE WRITER of /tmp/ble_radio_owner: radio ownership
+    // still flows through tick()'s existing lock::try_acquire/release, so
+    // bash awake_start/awake_stop and the legacy sampler keep reading it
+    // unchanged. The cede-sentinel additionally tells any standalone
+    // sampler to defer so it can't double-sample over the one radio.
+    if let Err(e) = lock::set_sampler_ceded() {
+        warn!("could not write cede sentinel (continuing): {e:#}");
+    }
+
+    // Construct the radio-actor wiring. The closure is the structural
+    // sampler arm — INERT in this slice (the inline tick() below does the
+    // real sampling). It exists so the actor's generic bounds and the
+    // RadioHandle plumbing are exercised at the daemon level. The handle
+    // is intentionally unused beyond keeping the actor alive; dropping it
+    // lets the actor task drain and exit on shutdown.
+    let _radio_actor: radio::RadioHandle = radio::spawn_radio_actor(|_kind| async {
+        // Live slice would route through tick() here. Inert for now.
+    });
+
+    let result: Result<()> = loop {
+        tokio::select! {
+            _ = sigterm.recv() => {
+                info!("SIGTERM received, releasing radio and exiting");
+                if held_radio { release_radio().await; }
+                break Ok(());
+            }
+            _ = sigint.recv() => {
+                info!("SIGINT received, releasing radio and exiting");
+                if held_radio { release_radio().await; }
+                break Ok(());
+            }
+            _ = sigusr1.recv() => {
+                info!("SIGUSR1 received — forcing a full state poll on next tick (all sub-samplers due immediately)");
+                let now = Instant::now();
+                schedule = Schedule::new(now);
+                schedule.next_drive = now;
+                schedule.next_climate = now;
+                schedule.next_charge = now;
+                schedule.next_closures = now;
+                schedule.next_tires = now;
+                last_parked_awake_refresh = None;
+                last_parked_awake_tpms_refresh = None;
+                parked_polls = 0;
+            }
+            Some(req) = action_rx.recv() => {
+                handle_action_request(
+                    req,
+                    &mut held_radio,
+                    &mut ble_session,
+                ).await;
+            }
+            sleep = tick(
+                &conn,
+                &mut held_radio,
+                &mut parked_polls,
+                &mut last_user_presence,
+                &mut schedule,
+                &mut last_parked_awake_refresh,
+                &mut last_parked_awake_tpms_refresh,
+                &mut ble_session,
+                &mut last_charging_state,
+                &mut last_sentry_mode,
+                &mut last_gate_log,
+                &mut last_lat,
+                &mut last_lon,
+                &mut last_location_poll,
+            ) => {
+                // Identical post-tick keep-accessory evaluation as the
+                // legacy loop — same inputs, same call.
+                if let Ok(cfg) = config::BleConfig::load() {
+                    if let Some(handle) = ble_session.as_ref() {
+                        keep_accessory::evaluate(
+                            &cfg.keep_accessory,
+                            &handle.session,
+                            &mut keep_accessory_state,
+                            last_lat,
+                            last_lon,
+                            parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET
+                                || usb_watch::observe() == CarState::Asleep,
+                            lock::is_archive_active(),
+                            held_radio,
+                        )
+                        .await;
+                    }
+                }
+                tokio::time::sleep(sleep).await;
+            }
+        }
+    };
+
+    // Hand sampling back: clear the cede-sentinel so a standalone sampler
+    // (if any) resumes. Best-effort on tmpfs.
+    if let Err(e) = lock::clear_sampler_ceded() {
+        warn!("could not clear cede sentinel on exit: {e:#}");
+    }
+    result
 }
 
 /// Whether the gate may drop to sleep-permitting (Quiet) polling.
