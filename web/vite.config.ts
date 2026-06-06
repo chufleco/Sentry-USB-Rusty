@@ -49,6 +49,7 @@ export default defineConfig({
     },
   },
   server: {
+    allowedHosts: true,
     proxy: {
       '/api': 'http://localhost:8788',
       '/TeslaCam': 'http://localhost:8788',

@@ -96,7 +96,7 @@ function readFilters(params: URLSearchParams): DrivesFilters {
   }
 }
 
-function rangeBounds(range: DateRange, now: Date): { from?: Date; to?: Date } {
+export function rangeBounds(range: DateRange, now: Date): { from?: Date; to?: Date } {
   if (range.kind === "custom") {
     return { from: new Date(range.start), to: new Date(range.end) }
   }

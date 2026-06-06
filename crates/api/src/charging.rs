@@ -1,0 +1,389 @@
+//! Charging history derived on-demand from `telemetry_samples`.
+//!
+//! Charge sessions are not a stored table — they are grouped at query
+//! time from the per-sample charge columns the experimental sampler
+//! writes (`charger_power_kw`, `charge_rate_mph`, ...). A session is a
+//! contiguous run of actively-charging samples; a gap longer than
+//! `SESSION_GAP_SECS` starts a new one. Energy reported by the car is
+//! cumulative within a plug-in and resets to zero on unplug, so the
+//! per-session total is the span between the first and last reading.
+//!
+//! When the experimental flag is off the charge columns are NULL for
+//! every row, so the grouping yields nothing and both endpoints return
+//! empty results. The flag is also checked up front so a normal install
+//! does no query work and surfaces no charging UI.
+
+use axum::Json;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use serde::Serialize;
+
+use crate::router::AppState;
+
+/// A gap larger than this between consecutive charging samples ends the
+/// session. The sampler polls charge state well inside this window while
+/// a car is plugged in; 30 minutes tolerates a missed poll or two
+/// without merging two genuinely separate plug-ins.
+const SESSION_GAP_SECS: i64 = 30 * 60;
+
+/// One row pulled from `telemetry_samples`, already filtered to samples
+/// where the car was drawing power.
+struct ChargeRow {
+    ts: i64,
+    power_kw: Option<i64>,
+    current_a: Option<i64>,
+    voltage_v: Option<i64>,
+    rate_mph: Option<f64>,
+    energy_added_kwh: Option<f64>,
+    limit_soc: Option<i64>,
+    range_mi: Option<f64>,
+    battery_pct: Option<f64>,
+    battery_temp_c: Option<f64>,
+    interior_temp_c: Option<f64>,
+    exterior_temp_c: Option<f64>,
+    location: Option<String>,
+    lat: Option<f64>,
+    lon: Option<f64>,
+}
+
+/// Summary of one charge session for the list view.
+#[derive(Serialize)]
+struct ChargeSessionSummary {
+    /// Session id == start timestamp in unix seconds. Stable and
+    /// directly usable as the detail-endpoint key.
+    id: i64,
+    start_ms: i64,
+    end_ms: i64,
+    duration_secs: i64,
+    location: Option<String>,
+    location_lat: Option<f64>,
+    location_lon: Option<f64>,
+    energy_added_kwh: Option<f64>,
+    peak_power_kw: Option<i64>,
+    start_soc: Option<f64>,
+    end_soc: Option<f64>,
+    start_range_mi: Option<f64>,
+    end_range_mi: Option<f64>,
+    charge_limit_soc: Option<i64>,
+}
+
+/// One point on the detail charts. Carries every per-sample series the
+/// charging view plots — all sourced from columns the sampler already
+/// records, so adding them costs nothing extra on the device.
+#[derive(Serialize)]
+struct ChargePoint {
+    ts: i64,
+    power_kw: Option<i64>,
+    current_a: Option<i64>,
+    voltage_v: Option<i64>,
+    rate_mph: Option<f64>,
+    soc: Option<f64>,
+    range_mi: Option<f64>,
+    energy_added_kwh: Option<f64>,
+    battery_temp_c: Option<f64>,
+    interior_temp_c: Option<f64>,
+    exterior_temp_c: Option<f64>,
+}
+
+#[derive(Serialize)]
+struct ChargeSessionDetail {
+    #[serde(flatten)]
+    summary: ChargeSessionSummary,
+    avg_power_kw: Option<f64>,
+    peak_current_a: Option<i64>,
+    avg_current_a: Option<f64>,
+    peak_voltage_v: Option<i64>,
+    avg_voltage_v: Option<f64>,
+    peak_rate_mph: Option<f64>,
+    avg_battery_temp_c: Option<f64>,
+    points: Vec<ChargePoint>,
+}
+
+/// Whether the master experimental opt-in is set. Mirrors how the
+/// telemetry sampler reads the same key, so both sides agree on what
+/// "on" means. Read fresh per request — config changes without a
+/// daemon restart and these endpoints are low-traffic.
+fn experimental_enabled() -> bool {
+    let path = sentryusb_config::find_config_path();
+    match sentryusb_config::parse_file(path) {
+        Ok((active, commented)) => {
+            match sentryusb_config::get_config_value(&active, &commented, "SENTRYUSB_EXPERIMENTAL") {
+                Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
+                None => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
+/// Mean of an iterator of values, or None when it yields nothing. Used
+/// for the detail view's average power / current / voltage / temp stats.
+fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for v in it {
+        sum += v;
+        n += 1;
+    }
+    if n == 0 { None } else { Some(sum / n as f64) }
+}
+
+/// A sample counts as actively charging when the car reports nonzero
+/// power or a nonzero charge rate. Parked-and-plugged rows (power 0,
+/// carried-over energy) are excluded so they don't pad a session.
+fn is_charging(power_kw: Option<i64>, rate_mph: Option<f64>) -> bool {
+    power_kw.is_some_and(|p| p > 0) || rate_mph.is_some_and(|r| r > 0.0)
+}
+
+/// Pull charging samples in `[from, to]` ordered by time. `to` of
+/// `None` means "no upper bound".
+fn load_charge_rows(
+    conn: &rusqlite::Connection,
+    from: i64,
+    to: Option<i64>,
+) -> anyhow::Result<Vec<ChargeRow>> {
+    let upper = to.unwrap_or(i64::MAX);
+    let mut stmt = conn.prepare(
+        "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
+                charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
+                battery_range_mi, battery_pct, \
+                battery_temp_c, interior_temp_c, exterior_temp_c, location_name, \
+                latitude, longitude \
+         FROM telemetry_samples \
+         WHERE ts BETWEEN ?1 AND ?2 \
+           AND (charger_power_kw IS NOT NULL OR charge_rate_mph IS NOT NULL) \
+         ORDER BY ts ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![from, upper], |r| {
+        Ok(ChargeRow {
+            ts: r.get(0)?,
+            power_kw: r.get(1)?,
+            current_a: r.get(2)?,
+            voltage_v: r.get(3)?,
+            rate_mph: r.get(4)?,
+            energy_added_kwh: r.get(5)?,
+            limit_soc: r.get(6)?,
+            range_mi: r.get(7)?,
+            battery_pct: r.get(8)?,
+            battery_temp_c: r.get(9)?,
+            interior_temp_c: r.get(10)?,
+            exterior_temp_c: r.get(11)?,
+            location: r.get(12)?,
+            lat: r.get(13)?,
+            lon: r.get(14)?,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let row = row?;
+        if is_charging(row.power_kw, row.rate_mph) {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Split time-ordered, already-filtered charging rows into sessions on
+/// the gap threshold. Each inner Vec is one session, in time order.
+fn group_sessions(rows: Vec<ChargeRow>) -> Vec<Vec<ChargeRow>> {
+    let mut sessions: Vec<Vec<ChargeRow>> = Vec::new();
+    for row in rows {
+        match sessions.last_mut() {
+            Some(cur) if row.ts - cur.last().unwrap().ts <= SESSION_GAP_SECS => cur.push(row),
+            _ => sessions.push(vec![row]),
+        }
+    }
+    sessions
+}
+
+/// Reduce one session's rows to a summary. `rows` is non-empty and
+/// time-ordered.
+fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
+    let first = &rows[0];
+    let last = &rows[rows.len() - 1];
+
+    // Energy is cumulative within a plug-in; the span between the first
+    // and last reading is what this session added. Clamp at zero so a
+    // mid-session counter reset can't produce a negative.
+    let energy_added_kwh = match (first.energy_added_kwh, last.energy_added_kwh) {
+        (Some(a), Some(b)) => Some((b - a).max(0.0)),
+        (None, Some(b)) => Some(b),
+        _ => None,
+    };
+
+    ChargeSessionSummary {
+        id: first.ts,
+        start_ms: first.ts * 1000,
+        end_ms: last.ts * 1000,
+        duration_secs: last.ts - first.ts,
+        location: rows.iter().find_map(|r| r.location.clone()),
+        location_lat: rows.iter().find_map(|r| r.lat),
+        location_lon: rows.iter().find_map(|r| r.lon),
+        energy_added_kwh,
+        peak_power_kw: rows.iter().filter_map(|r| r.power_kw).max(),
+        start_soc: rows.iter().find_map(|r| r.battery_pct),
+        end_soc: rows.iter().rev().find_map(|r| r.battery_pct),
+        start_range_mi: rows.iter().find_map(|r| r.range_mi),
+        end_range_mi: rows.iter().rev().find_map(|r| r.range_mi),
+        charge_limit_soc: rows.iter().rev().find_map(|r| r.limit_soc),
+    }
+}
+
+/// GET /api/charging
+///
+/// Charge sessions newest-first. Empty when the experimental flag is off
+/// or no charging has been sampled.
+pub async fn list_charging(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !experimental_enabled() {
+        return (StatusCode::OK, Json(serde_json::json!({ "sessions": [] })));
+    }
+
+    let result = state
+        .drives
+        .store
+        .with_locked_conn(|conn| load_charge_rows(conn, 0, None));
+
+    match result {
+        Ok(rows) => {
+            let mut sessions: Vec<ChargeSessionSummary> =
+                group_sessions(rows).iter().map(|s| summarize(s)).collect();
+            sessions.sort_by(|a, b| b.id.cmp(&a.id));
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "sessions": sessions })),
+            )
+        }
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// GET /api/charging/{id}
+///
+/// Detail for the session whose start timestamp is `id`, including the
+/// per-sample series for the power / SoC charts. Rows are re-grouped
+/// from `id` forward and the first session returned, so the endpoint is
+/// stateless and needs no stored session table.
+pub async fn single_charging(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if !experimental_enabled() {
+        return crate::json_error(StatusCode::NOT_FOUND, "charging history not enabled");
+    }
+
+    // Bound the scan so a session that never closes can't read the whole
+    // table. One plug-in can't plausibly exceed this; the gap split ends
+    // the session well before the bound in practice.
+    let window_end = id + 7 * 24 * 60 * 60;
+    let result = state
+        .drives
+        .store
+        .with_locked_conn(|conn| load_charge_rows(conn, id, Some(window_end)));
+
+    let rows = match result {
+        Ok(rows) => rows,
+        Err(e) => return crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    };
+
+    let session = match group_sessions(rows).into_iter().next() {
+        Some(s) => s,
+        None => return crate::json_error(StatusCode::NOT_FOUND, "charge session not found"),
+    };
+
+    let summary = summarize(&session);
+    let points: Vec<ChargePoint> = session
+        .iter()
+        .map(|r| ChargePoint {
+            ts: r.ts * 1000,
+            power_kw: r.power_kw,
+            current_a: r.current_a,
+            voltage_v: r.voltage_v,
+            rate_mph: r.rate_mph,
+            soc: r.battery_pct,
+            range_mi: r.range_mi,
+            energy_added_kwh: r.energy_added_kwh,
+            battery_temp_c: r.battery_temp_c,
+            interior_temp_c: r.interior_temp_c,
+            exterior_temp_c: r.exterior_temp_c,
+        })
+        .collect();
+
+    let detail = ChargeSessionDetail {
+        avg_power_kw: avg(session.iter().filter_map(|r| r.power_kw.map(|v| v as f64))),
+        peak_current_a: session.iter().filter_map(|r| r.current_a).max(),
+        avg_current_a: avg(session.iter().filter_map(|r| r.current_a.map(|v| v as f64))),
+        peak_voltage_v: session.iter().filter_map(|r| r.voltage_v).max(),
+        avg_voltage_v: avg(session.iter().filter_map(|r| r.voltage_v.map(|v| v as f64))),
+        peak_rate_mph: session
+            .iter()
+            .filter_map(|r| r.rate_mph)
+            .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
+        avg_battery_temp_c: avg(session.iter().filter_map(|r| r.battery_temp_c)),
+        summary,
+        points,
+    };
+
+    (StatusCode::OK, Json(serde_json::to_value(detail).unwrap()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(ts: i64, power: Option<i64>, rate: Option<f64>, energy: Option<f64>) -> ChargeRow {
+        ChargeRow {
+            ts,
+            power_kw: power,
+            current_a: None,
+            voltage_v: None,
+            rate_mph: rate,
+            energy_added_kwh: energy,
+            limit_soc: None,
+            range_mi: None,
+            battery_pct: None,
+            battery_temp_c: None,
+            interior_temp_c: None,
+            exterior_temp_c: None,
+            location: None,
+            lat: None,
+            lon: None,
+        }
+    }
+
+    #[test]
+    fn gap_splits_into_two_sessions() {
+        let rows = vec![
+            row(1_000, Some(7), Some(25.0), Some(0.0)),
+            row(1_300, Some(7), Some(25.0), Some(1.0)),
+            // > 30 min later — new session
+            row(1_300 + SESSION_GAP_SECS + 1, Some(11), Some(40.0), Some(0.0)),
+        ];
+        let sessions = group_sessions(rows);
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].len(), 2);
+        assert_eq!(sessions[1].len(), 1);
+    }
+
+    #[test]
+    fn energy_total_is_first_to_last_span() {
+        let rows = vec![
+            row(1_000, Some(7), Some(25.0), Some(2.0)),
+            row(1_300, Some(7), Some(25.0), Some(9.4)),
+        ];
+        let s = summarize(&rows);
+        assert_eq!(s.energy_added_kwh, Some(7.4));
+        assert_eq!(s.peak_power_kw, Some(7));
+        assert_eq!(s.duration_secs, 300);
+        assert_eq!(s.id, 1_000);
+    }
+
+    #[test]
+    fn non_charging_rows_excluded_by_is_charging() {
+        assert!(!is_charging(Some(0), Some(0.0)));
+        assert!(!is_charging(None, None));
+        assert!(is_charging(Some(7), None));
+        assert!(is_charging(None, Some(12.0)));
+    }
+}
