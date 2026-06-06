@@ -81,9 +81,8 @@ export default function ChargePowerChart({ points }: { points: ChargePoint[] }) 
                   {p.soc != null && (
                     <Row color={SOC_COLOR} label="Battery" value={`${Math.round(p.soc)}%`} />
                   )}
-                  {p.rangeMi != null && (
-                    <Row color="#94a3b8" label="Range" value={`${Math.round(p.rangeMi)} mi`} />
-                  )}
+                  {/* Range intentionally omitted here — it has its own chart
+                      below and just duplicates the battery curve in miles. */}
                 </div>
               )
             }}
