@@ -27,6 +27,10 @@ pub fn build_router(state: AppState) -> Router {
         // Status & config
         .route("/api/status", get(crate::status::get_status))
         .route("/api/status/storage", get(crate::status::get_storage_breakdown))
+        // Experimental page-load aggregate: one round trip that nests the
+        // bodies of the status/storage/drive/config/update handlers. Gated
+        // by SENTRYUSB_EXPERIMENTAL (404 when off) — see crate::overview.
+        .route("/api/overview", get(crate::overview::get_overview))
         .route("/api/config", get(crate::status::get_config))
         .route("/api/wifi", get(crate::status::get_wifi_config))
         // Auth

@@ -22,6 +22,8 @@ import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
+import { useExperimental } from "@/hooks/useExperimental"
+import { getOverview } from "@/api/overview"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
@@ -154,6 +156,10 @@ export default function Dashboard() {
   const updateInfo = useUpdateAvailable()
   const { status: awayStatus } = useAwayMode()
   const { mode: keepAwakeMode } = useKeepAwake()
+  // Master experimental opt-in. null = still probing (treat as off); only a
+  // definite `true` enables the one-shot aggregate seed below. Gating on the
+  // resolved value avoids flashing an experimental code path on first paint.
+  const experimental = useExperimental()
 
   useEffect(() => {
     let mounted = true
@@ -361,6 +367,78 @@ export default function Dashboard() {
       unsubscribe()
     }
   }, [])
+
+  // Experimental, purely additive page-load aggregate. Kept in its own effect
+  // (separate from the legacy mount effect above, whose [] deps must stay
+  // intact so the per-tile pollers are never re-registered) so it can fire
+  // exactly once when `experimental` resolves to a definite `true`. The flag
+  // arrives async (config fetch), so it's typically null on first paint and
+  // flips to true a moment later — depending on it here lets the seed run as
+  // soon as it's known without disturbing the legacy pollers.
+  //
+  // This NEVER replaces the legacy path: the per-tile fetches + pollers remain
+  // the source of truth. On ANY failure — flag off (404), network error, or a
+  // nulled sub-part — we do nothing and today's behavior is unchanged. One
+  // request, used only to seed tiles faster on a cold paint. Each part is
+  // applied independently and guarded against a null (failed) sub-part,
+  // mirroring the backend's per-tile error isolation.
+  useEffect(() => {
+    if (experimental !== true) return
+    let mounted = true
+    getOverview()
+      .then((ov) => {
+        if (!mounted) return
+
+        if (ov.status) {
+          setStatus(ov.status)
+          setUptime(parseFloat(ov.status.uptime))
+          setError(null)
+        }
+
+        if (ov.driveStats) setDriveStats(ov.driveStats)
+
+        // Same derivation the legacy fetchDriveStats applies to
+        // /api/drives/status — kept in lockstep so the seeded tile matches.
+        const ds = ov.driveStatus
+        if (ds) {
+          setProcessing(ds.running)
+          if (!ds.running) {
+            setProcessProgress(null)
+          } else if (ds.process_total != null && ds.process_total > 0) {
+            setProcessProgress({
+              current: ds.process_current ?? 0,
+              total: ds.process_total,
+            })
+          }
+          if (ds.phase === "archiving" && ds.total != null) {
+            setArchiveProgress({
+              current: ds.current ?? 0,
+              total: ds.total,
+            })
+          } else {
+            setArchiveProgress(null)
+          }
+        }
+
+        if (ov.storageBreakdown) setStorageBreakdown(ov.storageBreakdown)
+
+        // Same unit extraction the legacy /api/setup/config fetch does.
+        const cfg = ov.config
+        if (cfg) {
+          const entry = cfg.DRIVE_MAP_UNIT
+          if (entry && entry.active) setMetric(entry.value === "km")
+          const tempEntry = cfg.TEMPERATURE_UNIT
+          if (tempEntry && tempEntry.active)
+            setUseFahrenheit(tempEntry.value === "F")
+        }
+      })
+      // Flag off / fetch failure / nulled parts → keep today's behavior;
+      // the legacy fetches (already loading) remain the source of truth.
+      .catch(() => {})
+    return () => {
+      mounted = false
+    }
+  }, [experimental])
 
   useEffect(() => {
     if (archiveProgress && archiveProgress.current > 0) {

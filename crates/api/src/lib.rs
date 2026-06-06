@@ -29,6 +29,7 @@ pub mod keep_accessory;
 pub mod charging;
 pub mod flags;
 pub mod command;
+pub mod overview;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;

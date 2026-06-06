@@ -64,37 +64,43 @@ pub async fn get_setup_status(State(_s): State<AppState>) -> (StatusCode, Json<s
     })))
 }
 
+/// Build the merged `{ KEY: { value, active } }` config map the
+/// `/api/setup/config` response (and the page-load aggregate) return.
+/// Commented-out entries are inserted first, then active (exported)
+/// entries overwrite them, so an exported key always wins. This is the
+/// single definition of the shape — both `get_setup_config` and the
+/// aggregate's config part call it, so they can never drift.
+pub fn merged_config_map() -> anyhow::Result<serde_json::Map<String, serde_json::Value>> {
+    let config_path = sentryusb_config::find_config_path();
+    let (active, commented) = sentryusb_config::parse_file(config_path)?;
+    let mut merged = serde_json::Map::new();
+    for (k, v) in &commented {
+        merged.insert(k.clone(), serde_json::json!({ "value": v, "active": false }));
+    }
+    for (k, v) in &active {
+        merged.insert(k.clone(), serde_json::json!({ "value": v, "active": true }));
+    }
+    Ok(merged)
+}
+
 /// GET /api/setup/config
 pub async fn get_setup_config(State(_s): State<AppState>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    let config_path = sentryusb_config::find_config_path();
-    match sentryusb_config::parse_file(config_path) {
-        Ok((active, commented)) => {
-            let mut merged = serde_json::Map::new();
-            for (k, v) in &commented {
-                merged.insert(k.clone(), serde_json::json!({
-                    "value": v,
-                    "active": false,
-                }));
-            }
-            for (k, v) in &active {
-                merged.insert(k.clone(), serde_json::json!({
-                    "value": v,
-                    "active": true,
-                }));
-            }
-            // Config only changes when the wizard / raw editor PUTs.
-            // A short 30s cache lets the Dashboard skip the round
-            // trip on quick navigations without hiding edits for
-            // long.
-            (
-                StatusCode::OK,
-                [(axum::http::header::CACHE_CONTROL, "private, max-age=30")],
-                Json(serde_json::Value::Object(merged)),
-            )
-                .into_response()
-        }
-        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("Failed to read config: {}", e)).into_response(),
+    match merged_config_map() {
+        // Config only changes when the wizard / raw editor PUTs. A short
+        // 30s cache lets the Dashboard skip the round trip on quick
+        // navigations without hiding edits for long.
+        Ok(merged) => (
+            StatusCode::OK,
+            [(axum::http::header::CACHE_CONTROL, "private, max-age=30")],
+            Json(serde_json::Value::Object(merged)),
+        )
+            .into_response(),
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("Failed to read config: {}", e),
+        )
+        .into_response(),
     }
 }
 
