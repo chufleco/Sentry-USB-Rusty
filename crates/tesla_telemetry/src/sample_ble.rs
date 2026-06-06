@@ -15,8 +15,9 @@ use sentryusb_tesla_ble::{
 use tracing::{info, warn};
 
 use crate::sample::{
-    BodyControllerSample, ChargeResult, ChargingState, ClimateResult, ClosuresResult,
-    DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult, now_secs,
+    BodyControllerSample, ChargeDetail, ChargeResult, ChargingState, ClimateResult,
+    ClosuresResult, DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult,
+    now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -243,11 +244,82 @@ pub async fn sample_charge_ble(session: &PersistentSession) -> Result<ChargeResu
     let charging_state = charge.charging_state.as_ref().map(map_charging_state);
     let meta = build_meta(charge.timestamp.as_ref(), started);
 
+    // Expanded charging detail — fields the `ChargeState` message already
+    // carries that the sampler didn't previously surface. Decode is cheap
+    // and read-only; the caller only logs/consumes it when the
+    // experimental flag is on, so this is inert on a normal install.
+    let detail = ChargeDetail {
+        charger_actual_current_a: charge.optional_charger_actual_current.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerActualCurrent::ChargerActualCurrent(n) = v;
+            *n
+        }),
+        charger_power_kw: charge.optional_charger_power.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerPower::ChargerPower(n) = v;
+            *n
+        }),
+        charger_voltage_v: charge.optional_charger_voltage.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargerVoltage::ChargerVoltage(n) = v;
+            *n
+        }),
+        charging_amps_set: charge.optional_charging_amps.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargingAmps::ChargingAmps(n) = v;
+            *n
+        }),
+        charge_rate_mph: charge.optional_charge_rate_mph_float.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeRateMphFloat::ChargeRateMphFloat(n) = v;
+            *n
+        }),
+        charge_energy_added_kwh: charge.optional_charge_energy_added.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeEnergyAdded::ChargeEnergyAdded(n) = v;
+            *n
+        }),
+        charge_limit_soc: charge.optional_charge_limit_soc.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargeLimitSoc::ChargeLimitSoc(n) = v;
+            *n
+        }),
+        minutes_to_full_charge: charge.optional_minutes_to_full_charge.as_ref().map(|v| {
+            let car_server::charge_state::OptionalMinutesToFullCharge::MinutesToFullCharge(n) = v;
+            *n
+        }),
+        battery_range_mi: charge.optional_battery_range.as_ref().map(|v| {
+            let car_server::charge_state::OptionalBatteryRange::BatteryRange(n) = v;
+            *n
+        }),
+        charge_port_door_open: charge.optional_charge_port_door_open.as_ref().map(|v| {
+            let car_server::charge_state::OptionalChargePortDoorOpen::ChargePortDoorOpen(n) = v;
+            *n
+        }),
+    };
+
     Ok(ChargeResult {
         battery_pct,
         charging_state,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of the expanded charging detail. Called only
+/// when the experimental flag is on, so a normal install stays quiet.
+/// Lets a tester confirm the new `ChargeState` fields decode correctly
+/// off a real car before we wire them into the DB + API + web UI.
+pub fn log_charge_detail(c: &ChargeResult) {
+    let d = &c.detail;
+    info!(
+        "charge-detail [experimental]: amps={:?} power_kw={:?} volts={:?} amps_set={:?} \
+         rate_mph={:?} added_kwh={:?} limit_soc={:?} mins_to_full={:?} range_mi={:?} \
+         port_open={:?}",
+        d.charger_actual_current_a,
+        d.charger_power_kw,
+        d.charger_voltage_v,
+        d.charging_amps_set,
+        d.charge_rate_mph,
+        d.charge_energy_added_kwh,
+        d.charge_limit_soc,
+        d.minutes_to_full_charge,
+        d.battery_range_mi,
+        d.charge_port_door_open,
+    );
 }
 
 /// `state location` over BLE — raw GPS `(lat, lon)`. Separate from the

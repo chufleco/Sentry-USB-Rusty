@@ -41,6 +41,12 @@ pub struct BleConfig {
     pub adapter: String,
     /// Keep-Accessory-Power automation (12V-powered Pis only).
     pub keep_accessory: KeepAccessoryConfig,
+    /// Master opt-in for in-progress consolidation features (expanded
+    /// sampler decode, etc.). Default OFF — set `SENTRYUSB_EXPERIMENTAL`
+    /// to enable. Anything gated by this flag stays dormant on a normal
+    /// install, so a pre-release build never changes behavior unless a
+    /// tester explicitly turns it on. See the consolidation RFC.
+    pub experimental: bool,
 }
 
 impl Default for BleConfig {
@@ -50,6 +56,7 @@ impl Default for BleConfig {
             vin: String::new(),
             adapter: DEFAULT_ADAPTER.to_string(),
             keep_accessory: KeepAccessoryConfig::default(),
+            experimental: false,
         }
     }
 }
@@ -133,11 +140,23 @@ impl BleConfig {
             home_radius_m,
         };
 
+        // Master experimental opt-in. Default OFF. Gates in-progress
+        // consolidation features so a pre-release build is byte-for-byte
+        // current behavior until a tester sets SENTRYUSB_EXPERIMENTAL.
+        let experimental = sentryusb_config::get_config_value(
+            &active,
+            &commented,
+            "SENTRYUSB_EXPERIMENTAL",
+        )
+        .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
+        .unwrap_or(false);
+
         Ok(Self {
             enabled,
             vin,
             adapter,
             keep_accessory,
+            experimental,
         })
     }
 }

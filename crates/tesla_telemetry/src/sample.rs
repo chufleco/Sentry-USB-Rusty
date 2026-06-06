@@ -182,6 +182,38 @@ pub struct ChargeResult {
     pub battery_pct: Option<f64>,
     pub charging_state: Option<ChargingState>,
     pub meta: ResponseMeta,
+    /// Expanded charging detail. Always decoded (cheap, read-only), but
+    /// only consumed/logged when the experimental flag is on, so a
+    /// normal install is unaffected. Persistence + API/web surfacing is
+    /// a follow-up once the decode is validated on real hardware.
+    pub detail: ChargeDetail,
+}
+
+/// Extra fields from the BLE `ChargeState` message that the car already
+/// sends but the sampler didn't previously surface. All optional — a
+/// field is `None` when the car didn't report it this poll.
+#[derive(Debug, Clone, Default)]
+pub struct ChargeDetail {
+    /// Actual current the charger is delivering, amps.
+    pub charger_actual_current_a: Option<i32>,
+    /// Charging power, kW.
+    pub charger_power_kw: Option<i32>,
+    /// Charger input voltage, volts.
+    pub charger_voltage_v: Option<i32>,
+    /// Set/requested charging amps.
+    pub charging_amps_set: Option<i32>,
+    /// Charge rate, mi/hr added.
+    pub charge_rate_mph: Option<f32>,
+    /// Energy added this session, kWh.
+    pub charge_energy_added_kwh: Option<f32>,
+    /// Charge limit (target SoC), percent.
+    pub charge_limit_soc: Option<i32>,
+    /// Estimated minutes to full charge.
+    pub minutes_to_full_charge: Option<i32>,
+    /// Rated battery range, miles.
+    pub battery_range_mi: Option<f32>,
+    /// Charge port door open.
+    pub charge_port_door_open: Option<bool>,
 }
 
 /// Result of a successful `sample_closures` call. In-memory only —
@@ -363,6 +395,9 @@ pub async fn sample_charge(vin: &str, adapter: &str) -> Result<ChargeResult> {
         // we don't bother parsing charging_state out of the JSON.
         charging_state: None,
         meta,
+        // Expanded detail is decoded only on the in-process BLE path
+        // (sample_charge_ble); the legacy shell-out path leaves it empty.
+        detail: ChargeDetail::default(),
     })
 }
 

@@ -737,6 +737,9 @@ async fn tick(
                         }
                         match sample_ble::sample_charge_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_charge_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
                                 // Also refresh the gate input so a
@@ -936,6 +939,9 @@ async fn tick(
         if schedule.charge_due(tick_now) {
             let success = match sample_ble::sample_charge_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_charge_detail(&c);
+                    }
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     // Refresh the gate input on success; keep the previous
