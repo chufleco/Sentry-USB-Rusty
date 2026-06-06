@@ -758,6 +758,9 @@ async fn tick(
                         // fields, so this doesn't affect `any_ok`.
                         match sample_ble::sample_closures_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_closures_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 if let Some(sm) = c.sentry_mode {
                                     *last_sentry_mode = Some(sm);
@@ -978,6 +981,9 @@ async fn tick(
         if schedule.closures_due(tick_now) {
             let success = match sample_ble::sample_closures_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_closures_detail(&c);
+                    }
                     try_sync_clock(c.meta);
                     if let Some(sm) = c.sentry_mode {
                         *last_sentry_mode = Some(sm);

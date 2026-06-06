@@ -16,8 +16,8 @@ use tracing::{info, warn};
 
 use crate::sample::{
     BodyControllerSample, ChargeDetail, ChargeResult, ChargingState, ClimateResult,
-    ClosuresResult, DriveResult, ResponseMeta, Sample, SentryMode, ShiftState, TiresResult,
-    now_secs,
+    ClosuresDetail, ClosuresResult, DriveResult, ResponseMeta, Sample, SentryMode, ShiftState,
+    TiresResult, now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -357,7 +357,93 @@ pub async fn sample_closures_ble(session: &PersistentSession) -> Result<Closures
     let sentry_mode = closures.sentry_mode_state.as_ref().map(map_sentry_mode);
     let meta = build_meta(closures.timestamp.as_ref(), started);
 
-    Ok(ClosuresResult { sentry_mode, meta })
+    use car_server::closures_state as cs;
+    let detail = ClosuresDetail {
+        locked: closures.optional_locked.as_ref().map(|v| {
+            let cs::OptionalLocked::Locked(b) = v;
+            *b
+        }),
+        door_driver_front_open: closures.optional_door_open_driver_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenDriverFront::DoorOpenDriverFront(b) = v;
+            *b
+        }),
+        door_driver_rear_open: closures.optional_door_open_driver_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenDriverRear::DoorOpenDriverRear(b) = v;
+            *b
+        }),
+        door_passenger_front_open: closures.optional_door_open_passenger_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenPassengerFront::DoorOpenPassengerFront(b) = v;
+            *b
+        }),
+        door_passenger_rear_open: closures.optional_door_open_passenger_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenPassengerRear::DoorOpenPassengerRear(b) = v;
+            *b
+        }),
+        frunk_open: closures.optional_door_open_trunk_front.as_ref().map(|v| {
+            let cs::OptionalDoorOpenTrunkFront::DoorOpenTrunkFront(b) = v;
+            *b
+        }),
+        trunk_open: closures.optional_door_open_trunk_rear.as_ref().map(|v| {
+            let cs::OptionalDoorOpenTrunkRear::DoorOpenTrunkRear(b) = v;
+            *b
+        }),
+        window_driver_front_open: closures.optional_window_open_driver_front.as_ref().map(|v| {
+            let cs::OptionalWindowOpenDriverFront::WindowOpenDriverFront(b) = v;
+            *b
+        }),
+        window_passenger_front_open: closures
+            .optional_window_open_passenger_front
+            .as_ref()
+            .map(|v| {
+                let cs::OptionalWindowOpenPassengerFront::WindowOpenPassengerFront(b) = v;
+                *b
+            }),
+        window_driver_rear_open: closures.optional_window_open_driver_rear.as_ref().map(|v| {
+            let cs::OptionalWindowOpenDriverRear::WindowOpenDriverRear(b) = v;
+            *b
+        }),
+        window_passenger_rear_open: closures
+            .optional_window_open_passenger_rear
+            .as_ref()
+            .map(|v| {
+                let cs::OptionalWindowOpenPassengerRear::WindowOpenPassengerRear(b) = v;
+                *b
+            }),
+        sunroof_percent_open: closures.optional_sun_roof_percent_open.as_ref().map(|v| {
+            let cs::OptionalSunRoofPercentOpen::SunRoofPercentOpen(n) = v;
+            *n
+        }),
+    };
+
+    Ok(ClosuresResult {
+        sentry_mode,
+        meta,
+        detail,
+    })
+}
+
+/// Emit a one-line summary of door / window / lock state. Logged only
+/// when the experimental flag is on so a normal install stays quiet;
+/// lets a tester confirm the `ClosuresState` fields decode correctly off
+/// a real car before they are surfaced in the API and web UI.
+pub fn log_closures_detail(c: &ClosuresResult) {
+    let d = &c.detail;
+    info!(
+        "closures-detail [experimental]: locked={:?} doors[df={:?} dr={:?} pf={:?} pr={:?}] \
+         frunk={:?} trunk={:?} windows[df={:?} pf={:?} dr={:?} pr={:?}] sunroof%={:?}",
+        d.locked,
+        d.door_driver_front_open,
+        d.door_driver_rear_open,
+        d.door_passenger_front_open,
+        d.door_passenger_rear_open,
+        d.frunk_open,
+        d.trunk_open,
+        d.window_driver_front_open,
+        d.window_passenger_front_open,
+        d.window_driver_rear_open,
+        d.window_passenger_rear_open,
+        d.sunroof_percent_open,
+    );
 }
 
 /// `state tire-pressure` over BLE. Converts Tesla's native bar →

@@ -224,6 +224,29 @@ pub struct ChargeDetail {
 pub struct ClosuresResult {
     pub sentry_mode: Option<SentryMode>,
     pub meta: ResponseMeta,
+    /// Door / window / lock / trunk state. Decoded only when the
+    /// experimental flag is on; inert otherwise. Each field is None when
+    /// the car didn't report it this poll.
+    pub detail: ClosuresDetail,
+}
+
+/// Security-relevant closure state from the BLE `ClosuresState` message.
+/// `true` = open / unlocked. `frunk` is the front trunk, `trunk` the rear.
+#[derive(Debug, Clone, Default)]
+pub struct ClosuresDetail {
+    pub locked: Option<bool>,
+    pub door_driver_front_open: Option<bool>,
+    pub door_driver_rear_open: Option<bool>,
+    pub door_passenger_front_open: Option<bool>,
+    pub door_passenger_rear_open: Option<bool>,
+    pub frunk_open: Option<bool>,
+    pub trunk_open: Option<bool>,
+    pub window_driver_front_open: Option<bool>,
+    pub window_passenger_front_open: Option<bool>,
+    pub window_driver_rear_open: Option<bool>,
+    pub window_passenger_rear_open: Option<bool>,
+    /// Sunroof opening as a percentage (0 = closed).
+    pub sunroof_percent_open: Option<i32>,
 }
 
 /// Result of a successful `sample_tires` call. Very slow-changing —
