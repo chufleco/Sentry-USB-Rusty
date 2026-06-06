@@ -30,7 +30,6 @@ import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
 import { useConnectionStatus } from "@/hooks/useConnectionStatus"
 import { useAuth } from "@/hooks/useAuth"
 import { useCommunityPrefs } from "@/hooks/useCommunityPrefs"
-import { useExperimental } from "@/hooks/useExperimental"
 
 interface SidebarProps {
   collapsed: boolean
@@ -51,18 +50,14 @@ const baseNavItems = [
 
 function buildNavItems(
   mode: ReturnType<typeof useCommunityPrefs>["mode"],
-  experimental: boolean,
 ) {
-  // Charging history is gated behind the experimental opt-in (the
-  // sampler only writes charge columns when it's on). Slot it right
-  // after Drives so the two telemetry views sit together.
-  const items = experimental
-    ? baseNavItems.flatMap((item) =>
-        item.to === "/drives"
-          ? [item, { to: "/charging", icon: BatteryCharging, label: "Charging" }]
-          : [item],
-      )
-    : baseNavItems
+  // Charging history is a standard view now — slot it right after Drives
+  // so the two telemetry views sit together.
+  const items = baseNavItems.flatMap((item) =>
+    item.to === "/drives"
+      ? [item, { to: "/charging", icon: BatteryCharging, label: "Charging" }]
+      : [item],
+  )
   return items
     .filter((item) => item.to !== "/community" || mode !== "none")
     .map((item) => {
@@ -81,9 +76,8 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const { state: connState } = useConnectionStatus()
   const { authRequired, logout } = useAuth()
   const { mode: communityMode } = useCommunityPrefs()
-  const experimental = useExperimental()
   const [version, setVersion] = useState<string | null>(null)
-  const navItems = buildNavItems(communityMode, experimental === true)
+  const navItems = buildNavItems(communityMode)
 
   useEffect(() => {
     fetch("/api/system/version")

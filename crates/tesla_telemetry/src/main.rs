@@ -889,11 +889,19 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 1b. LOCATION (geofence) ── raw GPS for the keep-accessory
-        // home geofence. Not bundled in `state drive`, so it's its own
-        // round-trip; coarse cadence, and only when the feature is on.
-        // Pure geofence input (not a DB sample) — doesn't set any_call_ran.
-        if cfg.keep_accessory.enabled {
+        // ── 1b. LOCATION (raw GPS) ── `state drive` returns the address
+        // name but NOT raw coords when parked, so lat/lon need their own
+        // `state location` round-trip. Two consumers: the keep-accessory
+        // home geofence, and the charging-map pin (which needs coords, not
+        // just the address). Run it when keep-accessory is on OR the car is
+        // actively charging — so a charge gets a map pin without polling
+        // GPS on every idle parked car. Coarse cadence; pure input (not a
+        // DB sample) — doesn't set any_call_ran.
+        let charging_now = last_charging_state
+            .as_ref()
+            .map(|s| s.is_active_charging())
+            .unwrap_or(false);
+        if cfg.keep_accessory.enabled || charging_now {
             let due = last_location_poll
                 .map(|t| tick_now.duration_since(t) >= LOCATION_POLL_INTERVAL)
                 .unwrap_or(true);
@@ -956,18 +964,19 @@ async fn tick(
                 Ok(c) => {
                     if cfg.experimental {
                         sample_ble::log_charge_detail(&c);
-                        // Persist the expanded charging detail (v11 columns).
-                        // Gated by the flag so a normal install writes the
-                        // same rows it always has (these stay NULL).
-                        let d = &c.detail;
-                        sample.charger_power_kw = d.charger_power_kw;
-                        sample.charger_actual_current_a = d.charger_actual_current_a;
-                        sample.charger_voltage_v = d.charger_voltage_v;
-                        sample.charge_rate_mph = d.charge_rate_mph;
-                        sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
-                        sample.charge_limit_soc = d.charge_limit_soc;
-                        sample.battery_range_mi = d.battery_range_mi;
                     }
+                    // Persist the charging detail (v11 columns). Charging is a
+                    // standard feature now (graduated off the experimental
+                    // flag), so these are always written — NULL only when the
+                    // car isn't reporting charge data.
+                    let d = &c.detail;
+                    sample.charger_power_kw = d.charger_power_kw;
+                    sample.charger_actual_current_a = d.charger_actual_current_a;
+                    sample.charger_voltage_v = d.charger_voltage_v;
+                    sample.charge_rate_mph = d.charge_rate_mph;
+                    sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
+                    sample.charge_limit_soc = d.charge_limit_soc;
+                    sample.battery_range_mi = d.battery_range_mi;
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     // Refresh the gate input on success; keep the previous
@@ -1081,15 +1090,14 @@ async fn tick(
         // Persist whatever this tick collected; sparse rows (e.g.
         // drive-only) are handled downstream.
         if any_call_ran {
-            // Stamp the held last-known GPS onto the row (experimental
-            // only) so a parked-and-charging sample carries the
-            // charger's location for the charging-view map pin. Parked
-            // polls omit fresh coords, so `*last_lat`/`*last_lon` (held
-            // across ticks) is the right source.
-            if cfg.experimental {
-                sample.latitude = *last_lat;
-                sample.longitude = *last_lon;
-            }
+            // Stamp the held last-known GPS onto the row so a parked-and-
+            // charging sample carries the charger's location for the
+            // charging-view map pin. Parked polls omit fresh coords, so
+            // `*last_lat`/`*last_lon` (held across ticks) is the right
+            // source. Always written now (charging graduated off the flag);
+            // NULL until a location poll has supplied coords.
+            sample.latitude = *last_lat;
+            sample.longitude = *last_lon;
             persist(conn, sample);
         }
 
