@@ -78,7 +78,7 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Also: `software_version` columns on both tables are kept for
 /// forward-compat but no longer written — Tesla doesn't expose
 /// `car_version` over BLE state queries.
-pub const CURRENT_SCHEMA_VERSION: i32 = 11;
+pub const CURRENT_SCHEMA_VERSION: i32 = 12;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -277,6 +277,17 @@ pub const V11_TELEMETRY_CHARGE_COLUMNS: &[(&str, &str)] = &[
     ("battery_range_mi", "REAL"),
 ];
 
+/// v12 raw GPS columns on `telemetry_samples`. The coordinates are
+/// already decoded from the bundled `LocationState` (they feed the
+/// keep-accessory geofence); persisting them lets a parked-and-charging
+/// sample carry the charger's location so the charging view can pin it
+/// on a map. Written only when the experimental flag is on — NULL
+/// otherwise, so a normal install is unaffected.
+pub const V12_TELEMETRY_GPS_COLUMNS: &[(&str, &str)] = &[
+    ("latitude", "REAL"),
+    ("longitude", "REAL"),
+];
+
 /// v10 per-clip location-name rollups on `routes`. Populated by
 /// the aggregator from the first / last non-null sample in the
 /// clip's 60s window.
@@ -352,6 +363,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V9_TELEMETRY_COLUMNS.iter())
         .chain(V10_TELEMETRY_COLUMNS.iter())
         .chain(V11_TELEMETRY_CHARGE_COLUMNS.iter())
+        .chain(V12_TELEMETRY_GPS_COLUMNS.iter())
     {
         if existing_tele.contains(*name) {
             continue;

@@ -1081,6 +1081,15 @@ async fn tick(
         // Persist whatever this tick collected; sparse rows (e.g.
         // drive-only) are handled downstream.
         if any_call_ran {
+            // Stamp the held last-known GPS onto the row (experimental
+            // only) so a parked-and-charging sample carries the
+            // charger's location for the charging-view map pin. Parked
+            // polls omit fresh coords, so `*last_lat`/`*last_lon` (held
+            // across ticks) is the right source.
+            if cfg.experimental {
+                sample.latitude = *last_lat;
+                sample.longitude = *last_lon;
+            }
             persist(conn, sample);
         }
 
