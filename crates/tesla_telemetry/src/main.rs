@@ -941,6 +941,17 @@ async fn tick(
                 Ok(c) => {
                     if cfg.experimental {
                         sample_ble::log_charge_detail(&c);
+                        // Persist the expanded charging detail (v11 columns).
+                        // Gated by the flag so a normal install writes the
+                        // same rows it always has (these stay NULL).
+                        let d = &c.detail;
+                        sample.charger_power_kw = d.charger_power_kw;
+                        sample.charger_actual_current_a = d.charger_actual_current_a;
+                        sample.charger_voltage_v = d.charger_voltage_v;
+                        sample.charge_rate_mph = d.charge_rate_mph;
+                        sample.charge_energy_added_kwh = d.charge_energy_added_kwh;
+                        sample.charge_limit_soc = d.charge_limit_soc;
+                        sample.battery_range_mi = d.battery_range_mi;
                     }
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;

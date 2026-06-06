@@ -274,6 +274,17 @@ pub struct Sample {
     /// current location. Pulled from `state drive`. Used as
     /// drive start/end labels in the UI.
     pub location_name: Option<String>,
+    // Charging detail (v11). Populated from ChargeResult.detail only
+    // when the experimental flag is on; None otherwise, so a normal
+    // install writes the same rows it always has. Powers the charging
+    // view under "Driving".
+    pub charger_power_kw: Option<i32>,
+    pub charger_actual_current_a: Option<i32>,
+    pub charger_voltage_v: Option<i32>,
+    pub charge_rate_mph: Option<f32>,
+    pub charge_energy_added_kwh: Option<f32>,
+    pub charge_limit_soc: Option<i32>,
+    pub battery_range_mi: Option<f32>,
     pub source: String,
 }
 

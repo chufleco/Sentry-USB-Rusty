@@ -37,8 +37,12 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
         "INSERT OR IGNORE INTO telemetry_samples \
          (ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
           tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, \
-          odometer_mi, location_name, source) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+          odometer_mi, location_name, \
+          charger_power_kw, charger_actual_current_a, charger_voltage_v, \
+          charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
+          source) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, \
+                 ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             s.ts,
             s.battery_pct,
@@ -52,6 +56,13 @@ pub fn insert(conn: &Connection, s: &Sample) -> Result<()> {
             s.tire_rr_psi,
             s.odometer_mi,
             s.location_name,
+            s.charger_power_kw,
+            s.charger_actual_current_a,
+            s.charger_voltage_v,
+            s.charge_rate_mph,
+            s.charge_energy_added_kwh,
+            s.charge_limit_soc,
+            s.battery_range_mi,
             s.source,
         ],
     )?;
