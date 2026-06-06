@@ -21,6 +21,7 @@ import {
   BellRing,
   Wifi,
   Camera,
+  BatteryCharging,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
@@ -29,6 +30,7 @@ import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
 import { useConnectionStatus } from "@/hooks/useConnectionStatus"
 import { useAuth } from "@/hooks/useAuth"
 import { useCommunityPrefs } from "@/hooks/useCommunityPrefs"
+import { useExperimental } from "@/hooks/useExperimental"
 
 interface SidebarProps {
   collapsed: boolean
@@ -47,8 +49,21 @@ const baseNavItems = [
   { to: "/settings", icon: Settings, label: "Settings" },
 ]
 
-function buildNavItems(mode: ReturnType<typeof useCommunityPrefs>["mode"]) {
-  return baseNavItems
+function buildNavItems(
+  mode: ReturnType<typeof useCommunityPrefs>["mode"],
+  experimental: boolean,
+) {
+  // Charging history is gated behind the experimental opt-in (the
+  // sampler only writes charge columns when it's on). Slot it right
+  // after Drives so the two telemetry views sit together.
+  const items = experimental
+    ? baseNavItems.flatMap((item) =>
+        item.to === "/drives"
+          ? [item, { to: "/charging", icon: BatteryCharging, label: "Charging" }]
+          : [item],
+      )
+    : baseNavItems
+  return items
     .filter((item) => item.to !== "/community" || mode !== "none")
     .map((item) => {
       if (item.to !== "/community") return item
@@ -66,8 +81,9 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
   const { state: connState } = useConnectionStatus()
   const { authRequired, logout } = useAuth()
   const { mode: communityMode } = useCommunityPrefs()
+  const experimental = useExperimental()
   const [version, setVersion] = useState<string | null>(null)
-  const navItems = buildNavItems(communityMode)
+  const navItems = buildNavItems(communityMode, experimental === true)
 
   useEffect(() => {
     fetch("/api/system/version")

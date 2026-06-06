@@ -17,6 +17,10 @@ const Logs = lazy(() => import("@/pages/Logs"))
 const Settings = lazy(() => import("@/pages/Settings"))
 const Drives = lazy(() => import("@/pages/Drives"))
 const DriveDetail = lazy(() => import("@/pages/DriveDetail"))
+const Charging = lazy(() => import("@/pages/Charging"))
+const ChargeSessionDetail = lazy(() => import("@/pages/ChargeSessionDetail"))
+// Dev-only mock-data preview of in-progress UI; not routed in production.
+const PreviewCharging = lazy(() => import("@/pages/PreviewCharging"))
 const Support = lazy(() => import("@/pages/Support"))
 const Terminal = lazy(() => import("@/pages/Terminal"))
 const FSDAnalytics = lazy(() => import("@/pages/FSDAnalytics"))
@@ -197,6 +201,8 @@ function AppContent() {
             <Route path="/logs" element={<Logs />} />
             <Route path="/drives" element={<Drives />} />
             <Route path="/drives/:id" element={<DriveDetail />} />
+            <Route path="/charging" element={<Charging />} />
+            <Route path="/charging/:id" element={<ChargeSessionDetail />} />
             <Route path="/fsd" element={<FSDAnalytics />} />
             <Route path="/support" element={<Support />} />
             <Route path="/terminal" element={<Terminal />} />
@@ -205,6 +211,9 @@ function AppContent() {
             <Route path="/snapshots" element={<Snapshots />} />
             <Route path="/settings" element={<Settings />} />
           </Route>
+          {import.meta.env.DEV && (
+            <Route path="/preview/charging" element={<PreviewCharging />} />
+          )}
         </Routes>
       </Suspense>
     </BrowserRouter>
