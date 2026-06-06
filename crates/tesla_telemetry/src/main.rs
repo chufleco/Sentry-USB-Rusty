@@ -889,11 +889,15 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 1b. LOCATION (geofence) ── raw GPS for the keep-accessory
-        // home geofence. Not bundled in `state drive`, so it's its own
-        // round-trip; coarse cadence, and only when the feature is on.
-        // Pure geofence input (not a DB sample) — doesn't set any_call_ran.
-        if cfg.keep_accessory.enabled {
+        // ── 1b. LOCATION (raw GPS) ── `state drive` returns the
+        // locationName (address) but NOT raw coords, so lat/lon need their
+        // own `state location` round-trip. Two consumers want it: the
+        // keep-accessory home geofence, AND the experimental charging map
+        // (the charge-session pin needs lat/lon, not just the address —
+        // without this poll a charge shows its address but no map). Coarse
+        // cadence either way. Pure input (not a DB sample) — doesn't set
+        // any_call_ran.
+        if cfg.keep_accessory.enabled || cfg.experimental {
             let due = last_location_poll
                 .map(|t| tick_now.duration_since(t) >= LOCATION_POLL_INTERVAL)
                 .unwrap_or(true);
