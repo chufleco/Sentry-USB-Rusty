@@ -84,8 +84,8 @@ impl StoreCodec for JsonCompatCodec {
 /// side already parses the canonical Go envelope one Route at a time and
 /// writes through the shared insert path, so there is no clean-DB win to be
 /// had by re-plumbing it, and reusing it guarantees the round-trip stays
-/// identical. The typed work that matters for the consolidation is the
-/// export SELECT going through the single `RouteRow::COLUMNS` definition.
+/// identical. The typed work that matters here is the export SELECT going
+/// through the single `RouteRow::COLUMNS` definition.
 pub struct TypedCodec;
 
 impl StoreCodec for TypedCodec {

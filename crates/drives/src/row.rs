@@ -1,7 +1,7 @@
 //! Typed mirror of one `routes` table row.
 //!
-//! This is the clean-DB-codec half of the SentryUSB consolidation: a
-//! single struct whose fields correspond one-to-one with the physical
+//! This is the clean-DB codec: a single struct whose fields correspond
+//! one-to-one with the physical
 //! columns of the `routes` table, in the exact order SQLite reports them
 //! from `pragma_table_info('routes')`.
 //!

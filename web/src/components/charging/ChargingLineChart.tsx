@@ -22,8 +22,7 @@ export interface ChargeSeries {
 // plotting one or more series on a shared left axis. Mirrors the dark
 // theme and tick styling of the drive charts so the charging detail
 // reads as part of the same UI. Used for range, amperage, voltage and
-// the temperature series — each is a separate card with its own unit,
-// matching how Tessie / TeslaScope present them.
+// the temperature series — each is a separate card with its own unit.
 export default function ChargingLineChart({
   points,
   series,
