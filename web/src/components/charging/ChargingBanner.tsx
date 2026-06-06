@@ -29,7 +29,9 @@ export default function ChargingBanner() {
     const tick = () =>
       fetchCurrentCharge()
         .then((c) => alive && setCur(c))
-        .catch(() => alive && setCur(null))
+        // Keep the last good state on a transient fetch error (a single
+        // 30s-poll timeout shouldn't collapse a live charging banner).
+        .catch(() => {})
     tick()
     const id = setInterval(tick, POLL_MS)
     return () => {

@@ -121,6 +121,22 @@ fn is_charging(power_kw: Option<i64>, rate_mph: Option<f64>) -> bool {
     power_kw.is_some_and(|p| p > 0) || rate_mph.is_some_and(|r| r > 0.0)
 }
 
+/// How stale the latest charge row may be before the banner gives up
+/// entirely. Generous (24h) because the only case that can leave a
+/// "charging" phase on the newest row is a charge that ended while BLE
+/// was fully down (so no stopped/complete poll ever landed) — this is
+/// the self-healing backstop for that.
+const CHARGE_STALE_SECS: i64 = 86_400;
+
+/// True/false if the persisted Tesla charge phase is an actively-charging
+/// one. `None` when there's no phase string (pre-v14 rows) so the caller
+/// can fall back to the old power/rate heuristic. The spellings mirror
+/// `ChargingState::as_db_str` in the telemetry crate (the api crate can't
+/// depend on that binary crate, so this is a deliberate string contract).
+fn phase_is_active(phase: Option<&str>) -> Option<bool> {
+    phase.map(|p| matches!(p, "charging" | "starting" | "calibrating"))
+}
+
 /// Pull charging samples in `[from, to]` ordered by time. `to` of
 /// `None` means "no upper bound".
 fn load_charge_rows(
@@ -341,12 +357,20 @@ struct LatestCharge {
     rate_mph: Option<f64>,
     minutes_to_full: Option<i64>,
     range_mi: Option<f64>,
+    charging_state: Option<String>,
 }
 
 /// GET /api/charging/current — is the car charging right now, with the
-/// fields the dashboard banner shows. Reads one row (latest by ts); a
-/// sample older than 10 minutes counts as "not charging" so a long-asleep
-/// car doesn't keep the banner stuck on.
+/// fields the dashboard banner shows.
+///
+/// Reads the most-recent *charge-bearing* row (one that carries a charge
+/// phase or charger power/rate — also the only rows that carry battery %).
+/// The charging decision is phase-first: while the persisted Tesla phase
+/// is charging/starting/calibrating the banner stays up for the whole
+/// charge regardless of how stale the sample is (the BLE sampler can go
+/// minutes between polls mid-charge), and only drops when a poll actually
+/// reports a stopped/complete phase. Pre-v14 rows (no phase) fall back to
+/// the old "fresh within 10 min AND nonzero power/rate" heuristic.
 pub async fn current_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -354,8 +378,13 @@ pub async fn current_charging(
     let latest = state.drives.store.with_locked_conn(|conn| {
         conn.query_row(
             "SELECT ts, battery_pct, charge_limit_soc, charger_power_kw, \
-                    charge_rate_mph, charge_minutes_to_full, battery_range_mi \
-             FROM telemetry_samples ORDER BY ts DESC LIMIT 1",
+                    charge_rate_mph, charge_minutes_to_full, battery_range_mi, \
+                    charging_state \
+             FROM telemetry_samples \
+             WHERE charging_state IS NOT NULL \
+                OR charger_power_kw IS NOT NULL \
+                OR charge_rate_mph IS NOT NULL \
+             ORDER BY ts DESC LIMIT 1",
             [],
             |r| {
                 Ok(LatestCharge {
@@ -366,6 +395,7 @@ pub async fn current_charging(
                     rate_mph: r.get(4)?,
                     minutes_to_full: r.get(5)?,
                     range_mi: r.get(6)?,
+                    charging_state: r.get(7)?,
                 })
             },
         )
@@ -379,12 +409,20 @@ pub async fn current_charging(
                 .map(|d| d.as_secs() as i64)
                 .unwrap_or(l.ts);
             let age = now - l.ts;
-            let charging = age <= 600 && is_charging(l.power_kw, l.rate_mph);
+            let charging = match phase_is_active(l.charging_state.as_deref()) {
+                // Phase says actively charging — hold the banner the whole
+                // charge; only the 24h backstop can drop it.
+                Some(true) => age <= CHARGE_STALE_SECS,
+                // Phase says stopped/complete/disconnected — done, no banner.
+                Some(false) => false,
+                // Pre-v14 row with no phase — old heuristic.
+                None => age <= 600 && is_charging(l.power_kw, l.rate_mph),
+            };
             // Battery % is shown for the persistent car-status banner as long
             // as the data is reasonably fresh (<= 24h), so the banner doesn't
             // vanish the moment a charge ends. The charging-only fields are
             // present only while actively charging.
-            let soc = if age <= 86_400 { l.soc } else { None };
+            let soc = if age <= CHARGE_STALE_SECS { l.soc } else { None };
             CurrentCharge {
                 charging,
                 soc,

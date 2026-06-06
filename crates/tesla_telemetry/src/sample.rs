@@ -92,6 +92,24 @@ impl ChargingState {
             ChargingState::Starting | ChargingState::Charging | ChargingState::Calibrating
         )
     }
+
+    /// Stable lowercase string persisted to `telemetry_samples.charging_state`.
+    /// The api crate (which can't depend on this binary crate) string-matches
+    /// these to decide whether the dashboard banner stays in its charging
+    /// state — so the spellings here are the wire contract; keep them in sync
+    /// with `phase_is_active` in `crates/api/src/charging.rs`.
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            ChargingState::Unknown => "unknown",
+            ChargingState::Disconnected => "disconnected",
+            ChargingState::NoPower => "nopower",
+            ChargingState::Starting => "starting",
+            ChargingState::Charging => "charging",
+            ChargingState::Complete => "complete",
+            ChargingState::Stopped => "stopped",
+            ChargingState::Calibrating => "calibrating",
+        }
+    }
 }
 
 /// Tesla `ClosuresState.SentryModeState` oneof, flattened. Mirrors the
@@ -347,6 +365,12 @@ pub struct Sample {
     // Estimated minutes to full charge (v13). Drives the dashboard
     // "charging" banner's time-to-full readout.
     pub charge_minutes_to_full: Option<i32>,
+    // Persisted charge phase (v14), lowercase via ChargingState::as_db_str.
+    // Was in-memory only before; persisting it lets /api/charging/current
+    // keep the banner up the entire charge across multi-minute BLE sampler
+    // dropouts (the phase only leaves "charging" when a poll actually
+    // reports a stopped/complete phase, not when a sample goes stale).
+    pub charging_state: Option<String>,
     // Raw GPS (v12). Populated from the bundled LocationState only when
     // the experimental flag is on; None otherwise. Lets a parked-and-
     // charging sample carry the charger's location for the map pin.

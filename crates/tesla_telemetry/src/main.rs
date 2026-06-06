@@ -756,6 +756,12 @@ async fn tick(
                                 }
                                 try_sync_clock(c.meta);
                                 refresh.battery_pct = c.battery_pct;
+                                // Persist the phase here too (v14): if a charge
+                                // ends while the car stays parked-awake (e.g.
+                                // Sentry), this quiet refresh is what writes the
+                                // stopped/complete row that drops the banner.
+                                refresh.charging_state =
+                                    c.charging_state.map(|cs| cs.as_db_str().to_string());
                                 // Also refresh the gate input so a
                                 // charge that starts mid-quiet bumps
                                 // us back to Active on the next tick.
@@ -991,6 +997,11 @@ async fn tick(
                     sample.charge_limit_soc = d.charge_limit_soc;
                     sample.battery_range_mi = d.battery_range_mi;
                     sample.charge_minutes_to_full = d.minutes_to_full_charge;
+                    // Persist the charge phase (v14) so /api/charging/current
+                    // can keep the dashboard banner up the whole charge across
+                    // BLE sampler dropouts — and only drop it when a poll
+                    // actually reports a stopped/complete phase.
+                    sample.charging_state = c.charging_state.map(|cs| cs.as_db_str().to_string());
                     try_sync_clock(c.meta);
                     sample.battery_pct = c.battery_pct;
                     // Refresh the gate input on success; keep the previous

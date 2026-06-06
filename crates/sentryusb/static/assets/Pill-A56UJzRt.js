@@ -1,0 +1,1 @@
+import{j as s,c as n}from"./index-Dls3Bme7.js";function i({kind:a="slate",children:t,className:l}){return s.jsx("span",{className:n("pill",`pill--${a}`,l),children:t})}function o(){return s.jsx("span",{className:"dot-live"})}export{o as L,i as P};
