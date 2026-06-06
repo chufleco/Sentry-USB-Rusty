@@ -38,6 +38,9 @@ struct ChargeRow {
     limit_soc: Option<i64>,
     range_mi: Option<f64>,
     battery_pct: Option<f64>,
+    battery_temp_c: Option<f64>,
+    interior_temp_c: Option<f64>,
+    exterior_temp_c: Option<f64>,
     location: Option<String>,
 }
 
@@ -60,24 +63,35 @@ struct ChargeSessionSummary {
     charge_limit_soc: Option<i64>,
 }
 
-/// One point on the detail charts.
+/// One point on the detail charts. Carries every per-sample series the
+/// charging view plots — all sourced from columns the sampler already
+/// records, so adding them costs nothing extra on the device.
 #[derive(Serialize)]
 struct ChargePoint {
     ts: i64,
     power_kw: Option<i64>,
+    current_a: Option<i64>,
+    voltage_v: Option<i64>,
     rate_mph: Option<f64>,
     soc: Option<f64>,
     range_mi: Option<f64>,
     energy_added_kwh: Option<f64>,
+    battery_temp_c: Option<f64>,
+    interior_temp_c: Option<f64>,
+    exterior_temp_c: Option<f64>,
 }
 
 #[derive(Serialize)]
 struct ChargeSessionDetail {
     #[serde(flatten)]
     summary: ChargeSessionSummary,
+    avg_power_kw: Option<f64>,
     peak_current_a: Option<i64>,
+    avg_current_a: Option<f64>,
     peak_voltage_v: Option<i64>,
+    avg_voltage_v: Option<f64>,
     peak_rate_mph: Option<f64>,
+    avg_battery_temp_c: Option<f64>,
     points: Vec<ChargePoint>,
 }
 
@@ -98,6 +112,18 @@ fn experimental_enabled() -> bool {
     }
 }
 
+/// Mean of an iterator of values, or None when it yields nothing. Used
+/// for the detail view's average power / current / voltage / temp stats.
+fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut sum = 0.0;
+    let mut n = 0u32;
+    for v in it {
+        sum += v;
+        n += 1;
+    }
+    if n == 0 { None } else { Some(sum / n as f64) }
+}
+
 /// A sample counts as actively charging when the car reports nonzero
 /// power or a nonzero charge rate. Parked-and-plugged rows (power 0,
 /// carried-over energy) are excluded so they don't pad a session.
@@ -116,7 +142,8 @@ fn load_charge_rows(
     let mut stmt = conn.prepare(
         "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
                 charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
-                battery_range_mi, battery_pct, location_name \
+                battery_range_mi, battery_pct, \
+                battery_temp_c, interior_temp_c, exterior_temp_c, location_name \
          FROM telemetry_samples \
          WHERE ts BETWEEN ?1 AND ?2 \
            AND (charger_power_kw IS NOT NULL OR charge_rate_mph IS NOT NULL) \
@@ -133,7 +160,10 @@ fn load_charge_rows(
             limit_soc: r.get(6)?,
             range_mi: r.get(7)?,
             battery_pct: r.get(8)?,
-            location: r.get(9)?,
+            battery_temp_c: r.get(9)?,
+            interior_temp_c: r.get(10)?,
+            exterior_temp_c: r.get(11)?,
+            location: r.get(12)?,
         })
     })?;
     let mut out = Vec::new();
@@ -259,20 +289,29 @@ pub async fn single_charging(
         .map(|r| ChargePoint {
             ts: r.ts * 1000,
             power_kw: r.power_kw,
+            current_a: r.current_a,
+            voltage_v: r.voltage_v,
             rate_mph: r.rate_mph,
             soc: r.battery_pct,
             range_mi: r.range_mi,
             energy_added_kwh: r.energy_added_kwh,
+            battery_temp_c: r.battery_temp_c,
+            interior_temp_c: r.interior_temp_c,
+            exterior_temp_c: r.exterior_temp_c,
         })
         .collect();
 
     let detail = ChargeSessionDetail {
+        avg_power_kw: avg(session.iter().filter_map(|r| r.power_kw.map(|v| v as f64))),
         peak_current_a: session.iter().filter_map(|r| r.current_a).max(),
+        avg_current_a: avg(session.iter().filter_map(|r| r.current_a.map(|v| v as f64))),
         peak_voltage_v: session.iter().filter_map(|r| r.voltage_v).max(),
+        avg_voltage_v: avg(session.iter().filter_map(|r| r.voltage_v.map(|v| v as f64))),
         peak_rate_mph: session
             .iter()
             .filter_map(|r| r.rate_mph)
             .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
+        avg_battery_temp_c: avg(session.iter().filter_map(|r| r.battery_temp_c)),
         summary,
         points,
     };
@@ -295,6 +334,9 @@ mod tests {
             limit_soc: None,
             range_mi: None,
             battery_pct: None,
+            battery_temp_c: None,
+            interior_temp_c: None,
+            exterior_temp_c: None,
             location: None,
         }
     }
