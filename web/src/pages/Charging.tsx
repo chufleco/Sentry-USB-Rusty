@@ -123,7 +123,7 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
   return (
     <Link
       to={`/charging/${session.id}`}
-      className="group flex items-center gap-4 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-4 transition-colors hover:border-white/10 hover:bg-white/[0.04]"
+      className="group flex items-center gap-3 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-3 transition-colors hover:border-white/10 hover:bg-white/[0.04] sm:gap-4 sm:p-4"
     >
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
         <BatteryCharging className="h-5 w-5" />
@@ -147,24 +147,31 @@ function ChargeRow({ session }: { session: ChargeSessionSummary }) {
           <span>·</span>
           <span>{fmtDuration(session.durationSecs)}</span>
         </div>
+        {/* Mobile: energy + SoC sit below the meta line so the title gets
+            the full row width instead of being squeezed by a side column. */}
+        <div className="mt-1.5 flex items-center gap-2.5 tabular-nums sm:hidden">
+          <span className="inline-flex items-center gap-1 text-sm font-semibold text-emerald-300">
+            <Zap className="h-3.5 w-3.5" />
+            {fmtEnergy(session.energyAddedKwh)}
+          </span>
+          <span className="text-xs text-slate-500">{socShort}</span>
+        </div>
       </div>
 
-      <div className="shrink-0 text-right">
+      {/* Desktop: energy + SoC as a right-aligned column. */}
+      <div className="hidden shrink-0 text-right sm:block">
         <div className="flex items-center justify-end gap-1 text-sm font-semibold text-emerald-300 tabular-nums">
           <Zap className="h-3.5 w-3.5" />
           {fmtEnergy(session.energyAddedKwh)}
         </div>
-        <div className="mt-0.5 text-xs text-slate-500 tabular-nums">
-          <span className="sm:hidden">{socShort}</span>
-          <span className="hidden sm:inline">{socFull}</span>
-        </div>
+        <div className="mt-0.5 text-xs text-slate-500 tabular-nums">{socFull}</div>
       </div>
 
       {session.locationLat != null && session.locationLon != null && (
         <MiniPinMap
           lat={session.locationLat}
           lon={session.locationLon}
-          className="h-16 w-24 sm:h-20 sm:w-32"
+          className="h-14 w-20 sm:h-20 sm:w-32"
         />
       )}
 
