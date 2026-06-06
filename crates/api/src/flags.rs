@@ -11,15 +11,11 @@
 
 /// Whether `SENTRYUSB_EXPERIMENTAL` is set to an affirmative value
 /// (`yes` / `true` / `1`, case-insensitive). Read fresh per call.
+///
+/// Thin delegate to the canonical reader in `sentryusb_config` so the api
+/// crate and every other consumer share one definition of "on". Kept here
+/// (same symbol, same `pub(crate)` visibility) so existing callers are
+/// unchanged; behaviour is identical to the previous inline implementation.
 pub(crate) fn experimental_enabled() -> bool {
-    let path = sentryusb_config::find_config_path();
-    match sentryusb_config::parse_file(path) {
-        Ok((active, commented)) => {
-            match sentryusb_config::get_config_value(&active, &commented, "SENTRYUSB_EXPERIMENTAL") {
-                Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
-                None => false,
-            }
-        }
-        Err(_) => false,
-    }
+    sentryusb_config::experimental_enabled()
 }

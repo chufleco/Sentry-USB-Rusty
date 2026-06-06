@@ -572,8 +572,11 @@ pub async fn download_data(
     let store = state.drives.store.clone();
     let tmp = "/tmp/drive-data-export.json".to_string();
     let export_path = tmp.clone();
+    // Read the experimental flag in the api crate and inject the bool into
+    // drives. Flag off => JsonCompatCodec => byte-identical legacy output.
+    let experimental = crate::flags::experimental_enabled();
     let export_result = tokio::task::spawn_blocking(move || {
-        store.export_json_to_file(&export_path)
+        store.export_json_to_file_with(&export_path, experimental)
     })
     .await;
 
@@ -636,7 +639,11 @@ pub async fn export_for_sync(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = state.drives.store.clone();
-    let export_result = tokio::task::spawn_blocking(move || store.export_json_for_sync()).await;
+    // Inject the experimental flag (read in the api crate) into drives.
+    // Flag off => JsonCompatCodec => byte-identical legacy mirror.
+    let experimental = crate::flags::experimental_enabled();
+    let export_result =
+        tokio::task::spawn_blocking(move || store.export_json_for_sync_with(experimental)).await;
     match export_result {
         Ok(Ok(())) => {
             let bytes = std::fs::metadata(sentryusb_drives::db::DEFAULT_JSON_MIRROR_PATH)
@@ -732,14 +739,21 @@ pub async fn upload_data(
     let store = state.drives.store.clone();
     let importing = state.drives.importing.clone();
     let hub_task = hub.clone();
+    // Inject the experimental flag (read in the api crate) into drives.
+    // Flag off => JsonCompatCodec => legacy import behaviour.
+    let experimental = crate::flags::experimental_enabled();
     let result = tokio::task::spawn_blocking(move || {
         let hub_cb = hub_task.clone();
-        let res = store.import_json_file_with_progress(tmp, move |routes| {
-            hub_cb.broadcast(
-                "drive_import",
-                &serde_json::json!({"phase": "progress", "routes": routes}),
-            );
-        });
+        let res = store.import_json_file_with_progress_with(
+            tmp,
+            move |routes| {
+                hub_cb.broadcast(
+                    "drive_import",
+                    &serde_json::json!({"phase": "progress", "routes": routes}),
+                );
+            },
+            experimental,
+        );
         importing.store(false, Ordering::SeqCst);
         res
     })

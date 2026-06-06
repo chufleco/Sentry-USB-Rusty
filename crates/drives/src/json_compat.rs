@@ -421,7 +421,7 @@ fn insert_imported_route(
 /// `Route` instead of the full store. On a 5500-clip DB this caps the
 /// export at a few hundred KB of working memory vs. the ~17 MB that
 /// materialising all routes used to consume.
-pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
+pub fn export_json<W: Write + ?Sized>(conn: &Connection, writer: &mut W) -> Result<()> {
     let mut processed_files = {
         let mut stmt =
             conn.prepare("SELECT file FROM processed_files ORDER BY file")?;

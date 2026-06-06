@@ -200,6 +200,32 @@ pub fn get_config_value(active: &SetupConfig, commented: &SetupConfig, key: &str
     active.get(key).or_else(|| commented.get(key)).cloned()
 }
 
+/// Whether the master experimental opt-in (`SENTRYUSB_EXPERIMENTAL`) is set
+/// to an affirmative value — `yes` / `true` / `1`, case-insensitive and
+/// trimmed. Canonical home for the answer so every consumer (the api crate's
+/// `flags::experimental_enabled`, the experimental sampler, the clean-DB
+/// codec selector) agrees on what "on" means.
+///
+/// Read fresh on every call from the on-disk config: there is no caching, so
+/// toggling the key takes effect immediately with no daemon restart, and
+/// reverting it instantly restores byte-for-byte legacy behaviour. The cost
+/// is one small-file re-parse per call, which these low-traffic checks can
+/// trivially afford. Missing key, missing/unreadable file, or an
+/// unrecognised value all answer `false` — so a normal install behaves
+/// exactly as it did before any experimental code existed.
+pub fn experimental_enabled() -> bool {
+    let path = find_config_path();
+    match parse_file(path) {
+        Ok((active, commented)) => {
+            match get_config_value(&active, &commented, "SENTRYUSB_EXPERIMENTAL") {
+                Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
+                None => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

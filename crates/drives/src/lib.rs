@@ -7,12 +7,15 @@ pub mod extract;
 pub mod grouper;
 pub mod json_compat;
 pub mod processor;
+pub mod row;
 pub mod schema;
+pub mod store_codec;
 pub mod syncguard;
 pub mod types;
 
 pub use backfill::{migration_status, MigrationStatus};
 pub use db::{cleanup_legacy_mutable_files, DriveStore};
+pub use store_codec::{select_codec, JsonCompatCodec, StoreCodec, TypedCodec};
 pub use types::*;
 
 /// Default SQLite DB path.

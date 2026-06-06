@@ -657,8 +657,21 @@ impl DriveStore {
 
     /// Regenerate the canonical `/backingfiles/drive-data.json` mirror for
     /// `post-archive-process.sh`. Idempotent; safe alongside reads.
+    ///
+    /// Legacy path: hard-wires `experimental = false` (the `JsonCompatCodec`)
+    /// so this zero-arg method's bytes never change. Callers that want the
+    /// flag honoured use [`export_json_for_sync_with`].
     pub fn export_json_for_sync(&self) -> Result<()> {
-        self.export_json_to_file(DEFAULT_JSON_MIRROR_PATH)
+        self.export_json_for_sync_with(false)
+    }
+
+    /// Codec-aware variant of [`export_json_for_sync`]. `experimental`
+    /// selects the codec via [`crate::store_codec::select_codec`]; `false`
+    /// is the legacy `JsonCompatCodec` and is byte-for-byte identical to the
+    /// zero-arg method. The api crate reads `SENTRYUSB_EXPERIMENTAL` and
+    /// passes the bool in — this crate never reads the flag itself.
+    pub fn export_json_for_sync_with(&self, experimental: bool) -> Result<()> {
+        self.export_json_to_file_with(DEFAULT_JSON_MIRROR_PATH, experimental)
     }
 
     /// Import a drive-data.json file into the store. Thin wrapper around
@@ -671,6 +684,16 @@ impl DriveStore {
         self.import_json_file_with_progress(path, |_| {})
     }
 
+    /// Codec-aware variant of [`import_json_file`]. `experimental` selects
+    /// the codec; `false` is the legacy path.
+    pub fn import_json_file_with(
+        &self,
+        path: &str,
+        experimental: bool,
+    ) -> Result<crate::json_compat::ImportStats> {
+        self.import_json_file_with_progress_with(path, |_| {}, experimental)
+    }
+
     /// Like [`import_json_file`] but invokes `on_progress(routes_seen)`
     /// once the decoder knows the total route count. Used by the
     /// upload handler to forward `drive_import` WebSocket broadcasts
@@ -681,10 +704,43 @@ impl DriveStore {
         path: &str,
         on_progress: F,
     ) -> Result<crate::json_compat::ImportStats> {
+        // Legacy path: hard-wire experimental=false (JsonCompatCodec).
+        self.import_json_file_with_progress_codec(
+            path,
+            on_progress,
+            crate::store_codec::select_codec(false).as_ref(),
+        )
+    }
+
+    /// Codec-aware variant of [`import_json_file_with_progress`].
+    /// `experimental` selects the codec; `false` is the legacy
+    /// `JsonCompatCodec` and behaves identically to the non-`_with` method.
+    pub fn import_json_file_with_progress_with<F: Fn(usize)>(
+        &self,
+        path: &str,
+        on_progress: F,
+        experimental: bool,
+    ) -> Result<crate::json_compat::ImportStats> {
+        self.import_json_file_with_progress_codec(
+            path,
+            on_progress,
+            crate::store_codec::select_codec(experimental).as_ref(),
+        )
+    }
+
+    /// Lowest-level import: drive the import through an explicit
+    /// [`StoreCodec`]. Locks the shared connection, persists import history,
+    /// refreshes counts — identical bookkeeping regardless of codec.
+    pub fn import_json_file_with_progress_codec<F: Fn(usize)>(
+        &self,
+        path: &str,
+        on_progress: F,
+        codec: &dyn crate::store_codec::StoreCodec,
+    ) -> Result<crate::json_compat::ImportStats> {
         let existing_before = self.route_count.load(Ordering::Relaxed);
         let (stats, diag) = {
             let mut conn = self.conn.lock().unwrap();
-            let s = crate::json_compat::import_json(&mut conn, path, on_progress)?;
+            let s = codec.import(&mut conn, path, &on_progress)?;
             let _ = conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
             // Persist the diagnostics record while we still hold the writer
             // lock. Best-effort — a failure here is logged but not fatal,
@@ -736,6 +792,26 @@ impl DriveStore {
     /// connection, since you can't open a second handle to an
     /// in-memory DB.
     pub fn export_json_to_file(&self, path: &str) -> Result<()> {
+        // Legacy path: hard-wire experimental=false (JsonCompatCodec).
+        self.export_json_to_file_with(path, false)
+    }
+
+    /// Codec-aware variant of [`export_json_to_file`]. `experimental`
+    /// selects the codec; `false` is the legacy `JsonCompatCodec` and
+    /// produces byte-for-byte identical output to the zero-arg method.
+    /// All the read-only-handle / atomic-rename machinery is shared.
+    pub fn export_json_to_file_with(&self, path: &str, experimental: bool) -> Result<()> {
+        self.export_json_to_file_codec(path, crate::store_codec::select_codec(experimental).as_ref())
+    }
+
+    /// Lowest-level export: write through an explicit [`StoreCodec`].
+    /// Used by the `_with` overload; exposed so a caller that already holds
+    /// a codec can avoid re-selecting one.
+    pub fn export_json_to_file_codec(
+        &self,
+        path: &str,
+        codec: &dyn crate::store_codec::StoreCodec,
+    ) -> Result<()> {
         if let Some(dir) = Path::new(path).parent() {
             if !dir.as_os_str().is_empty() && dir != Path::new("/") {
                 std::fs::create_dir_all(dir)?;
@@ -744,11 +820,11 @@ impl DriveStore {
         let tmp = format!("{}.tmp", path);
         if self.path == ":memory:" {
             let conn = self.conn.lock().unwrap();
-            write_export_json(&conn, &tmp)?;
+            write_export_json(&conn, &tmp, codec)?;
         } else {
             let conn = open_readonly_connection(&self.path)
                 .with_context(|| format!("export_json_to_file: open read-only {}", self.path))?;
-            write_export_json(&conn, &tmp)?;
+            write_export_json(&conn, &tmp, codec)?;
         }
         if let Err(e) = std::fs::rename(&tmp, path) {
             let _ = std::fs::remove_file(&tmp);
@@ -925,10 +1001,14 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn write_export_json(conn: &Connection, tmp_path: &str) -> Result<()> {
+fn write_export_json(
+    conn: &Connection,
+    tmp_path: &str,
+    codec: &dyn crate::store_codec::StoreCodec,
+) -> Result<()> {
     use std::io::Write;
     let mut f = std::fs::File::create(tmp_path)?;
-    crate::json_compat::export_json(conn, &mut f).context("export_json")?;
+    codec.export(conn, &mut f).context("export_json")?;
     f.flush()?;
     f.sync_all()?;
     Ok(())

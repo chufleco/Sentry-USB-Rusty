@@ -78,7 +78,14 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Also: `software_version` columns on both tables are kept for
 /// forward-compat but no longer written — Tesla doesn't expose
 /// `car_version` over BLE state queries.
-pub const CURRENT_SCHEMA_VERSION: i32 = 12;
+///
+/// v12 -> v13: index-only, additive, downgrade-inert. No columns, no data
+/// rewrites — just `CREATE INDEX IF NOT EXISTS` statements (see
+/// [`V13_INDEXES`]). Reverting `SENTRYUSB_EXPERIMENTAL` after a v13 open
+/// requires no DB fix: the indexes are invisible to queries that don't use
+/// them and an older binary simply ignores them. This is deliberately the
+/// safest possible migration so flag toggles never need a schema repair.
+pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly —
@@ -288,6 +295,24 @@ pub const V12_TELEMETRY_GPS_COLUMNS: &[(&str, &str)] = &[
     ("longitude", "REAL"),
 ];
 
+/// v13 additive indexes. `CREATE INDEX IF NOT EXISTS` only — no columns,
+/// no data movement — so applying them is cheap and re-running them is a
+/// no-op, and an older binary that opens a v13 DB just ignores them
+/// (downgrade-inert). Chosen for real query patterns:
+///
+/// * `idx_routes_source` — the drive-list rebuild splits routes into SEI vs
+///   Tessie (`WHERE source != 'tessie'` / `source IS NULL`) for FSD-only
+///   analytics; an index on `routes(source)` lets that filter skip the
+///   Tessie rows without a full table walk on a large store.
+/// * `idx_telemetry_source` — the charging view (and any source-filtered
+///   telemetry query) selects by `telemetry_samples(source)`; `ts` is
+///   already the PK so range scans are covered, but `source` was not
+///   indexed. This pairs the source filter with the existing `ts` ordering.
+pub const V13_INDEXES: &[&str] = &[
+    "CREATE INDEX IF NOT EXISTS idx_routes_source ON routes(source)",
+    "CREATE INDEX IF NOT EXISTS idx_telemetry_source ON telemetry_samples(source)",
+];
+
 /// v10 per-clip location-name rollups on `routes`. Populated by
 /// the aggregator from the first / last non-null sample in the
 /// clip's 60s window.
@@ -376,6 +401,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // v3 partial index. Idempotent.
     conn.execute(V3_CLOUD_PENDING_INDEX, [])
         .context("migrate: creating idx_routes_cloud_pending")?;
+
+    // v13 additive indexes. `CREATE INDEX IF NOT EXISTS` — idempotent,
+    // applied unconditionally on every open (no version gate needed since
+    // the IF NOT EXISTS makes re-runs free). Runs after V6_NEW_TABLES has
+    // ensured `telemetry_samples` exists.
+    for stmt in V13_INDEXES {
+        conn.execute(stmt, [])
+            .with_context(|| format!("migrate: applying v13 index {:?}", truncate(stmt, 60)))?;
+    }
 
     // v5 data cleanup: purge SavedClips/SentryClips routes that pre-v5
     // scans wrote. Gated on the stored schema_version so we only pay the
@@ -538,7 +572,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10"),
+            Some("13"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -576,7 +610,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -608,7 +642,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -642,7 +676,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -749,7 +783,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -800,7 +834,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -853,7 +887,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
@@ -896,7 +930,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("13")
         );
     }
 
