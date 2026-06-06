@@ -1,7 +1,15 @@
 //! USB gadget control via Linux configfs.
 //!
-//! Replaces `enable_gadget.sh` and `disable_gadget.sh` with native Rust
-//! operations on `/sys/kernel/config/usb_gadget/sentryusb`.
+//! The RUNTIME enable/disable path replaces `enable_gadget.sh` /
+//! `disable_gadget.sh` with native Rust operations on
+//! `/sys/kernel/config/usb_gadget/sentryusb`.
+//!
+//! Note the scope boundary: the cold-boot early-bind path in
+//! [`early_bind`] is NOT native Rust — it *renders* `#!/bin/sh` hook +
+//! bind scripts (as string constants) to be staged into the initramfs.
+//! So "native Rust gadget" describes the runtime lifecycle only; the
+//! initramfs early-bind remains shell rendered from Rust (and is inert
+//! scaffold today — see that module).
 
 pub mod board;
 pub mod early_bind;

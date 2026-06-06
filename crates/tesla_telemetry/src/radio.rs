@@ -33,15 +33,15 @@
 //! Even when the experimental flag is ON, the daemon's actor path is a
 //! structural clone of today's loop (see `main()`); the flag-OFF path is
 //! byte-for-byte the existing `select!`.
-
-// This module is inert scaffold: the arbitration surface (`Priority`,
-// `PollKind`/`LEGACY_ORDER`, `RadioHandle::submit` / `request_phone_link`,
-// `PhoneLease::release`) is fully unit-tested but not yet driven by the
-// binary's inert flag-on loop, which still samples inline via the
-// unchanged `tick()`. Every item here is exercised by the tests below, so
-// this relaxation only silences the non-test bin build; it is removed the
-// moment live preemption routes the sampler through the actor on-vehicle.
-#![allow(dead_code)]
+// NOTE on `#[allow(dead_code)]` below: a handful of items here form the
+// arbitration surface for live phone-preemption (slice 5). They are fully
+// unit-tested but not yet called by the binary's inert flag-on loop, which
+// still samples inline via the unchanged `tick()`. Rather than a blanket
+// module-level allow (which would also hide *real* future dead code), each
+// such item is annotated individually with this note. They lose the
+// annotation the moment live preemption routes the sampler through the
+// actor on-vehicle. (A `--no-default-features` stock build can also
+// compile this module out entirely; see the consolidation follow-up.)
 
 use std::time::Duration;
 
@@ -81,6 +81,7 @@ const _: () = {
 /// by declaration order (later variant = greater), so a phone job always
 /// sorts ahead of a sampler job in the actor's biased arbitration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
 pub enum Priority {
     /// Background telemetry sampling — the default, lowest priority.
     Sampler,
@@ -94,6 +95,7 @@ pub enum Priority {
 /// The golden-output test pins this equivalence so the actor can never
 /// silently reorder the existing scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
 pub enum PollKind {
     /// `state drive` — shiftState + locationName + odometer (priority).
     Drive,
@@ -112,6 +114,7 @@ impl PollKind {
     /// of `if schedule.<x>_due(...)` blocks in `tick()` and the
     /// `.min()` chain in `Schedule::next_due`. The golden test asserts
     /// this constant matches the legacy order byte-for-byte.
+    #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
     pub const LEGACY_ORDER: [PollKind; 5] = [
         PollKind::Drive,
         PollKind::Climate,
@@ -152,6 +155,7 @@ pub enum RadioJob {
 
 impl RadioJob {
     /// Arbitration priority of this job.
+    #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
     pub fn priority(&self) -> Priority {
         match self {
             RadioJob::PhonePreempt { .. } => Priority::Phone,
@@ -182,6 +186,7 @@ impl PhoneLease {
 
     /// Explicitly release the lease early (idempotent). Equivalent to
     /// dropping the guard.
+    #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
     pub fn release(mut self) {
         if let Some(tx) = self.release.take() {
             let _ = tx.send(());
@@ -204,11 +209,13 @@ impl Drop for PhoneLease {
 /// and exit.
 #[derive(Clone)]
 pub struct RadioHandle {
+    #[allow(dead_code)] // written by spawn; read only via submit() (slice-5)
     tx: mpsc::Sender<RadioJob>,
 }
 
 impl RadioHandle {
     /// Submit a job. Errors only if the actor task has stopped.
+    #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
     pub async fn submit(&self, job: RadioJob) -> Result<(), &'static str> {
         self.tx
             .send(job)
@@ -222,6 +229,7 @@ impl RadioHandle {
     /// STRUCTURE ONLY: with the live preempt gated off, the actor grants
     /// the lease without actually suspending the car link. The clamp and
     /// the guard plumbing are real and tested.
+    #[allow(dead_code)] // slice-5 arbitration surface; tested, not yet bin-driven
     pub async fn request_phone_link(
         &self,
         lease: Duration,

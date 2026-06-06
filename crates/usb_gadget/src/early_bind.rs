@@ -1,4 +1,11 @@
-//! Initramfs early-bind scaffolding — HARDWARE-GATED, NOT ACTIVE.
+//! Initramfs early-bind: shell scripts RENDERED FROM RUST — HARDWARE-GATED, NOT ACTIVE.
+//!
+//! This is NOT a native-Rust initramfs binder. It renders `#!/bin/sh`
+//! hook + bind scripts (as Rust string constants) that a caller stages
+//! into the initramfs; the actual early bind is done by those shell
+//! scripts at boot, not by Rust. Porting the bind to a Rust binary that
+//! runs in initramfs is a possible future step, but today this only
+//! emits + removes shell.
 //!
 //! On dwc3 SBCs the gadget must be bound at `+0s` of the dwc3 probe (rather
 //! than ~+48s once userspace runs) or the Tesla port can be "poisoned" on cold

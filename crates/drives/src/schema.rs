@@ -79,12 +79,24 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// forward-compat but no longer written — Tesla doesn't expose
 /// `car_version` over BLE state queries.
 ///
-/// v12 -> v13: index-only, additive, downgrade-inert. No columns, no data
-/// rewrites — just `CREATE INDEX IF NOT EXISTS` statements (see
-/// [`V13_INDEXES`]). Reverting `SENTRYUSB_EXPERIMENTAL` after a v13 open
-/// requires no DB fix: the indexes are invisible to queries that don't use
-/// them and an older binary simply ignores them. This is deliberately the
-/// safest possible migration so flag toggles never need a schema repair.
+/// Migration from the released baseline (v10) up to v13 — applied in a
+/// single `migrate()` on the first open of this build, regardless of the
+/// `SENTRYUSB_EXPERIMENTAL` flag (the flag gates *writes* into these
+/// columns, not their creation). All three steps are additive and
+/// downgrade-safe:
+///   * v10 -> v11: nullable charging-detail columns on `telemetry_samples`
+///     ([`V11_TELEMETRY_CHARGE_COLUMNS`]) — `ALTER TABLE ADD COLUMN`, no
+///     rewrites, NULL until a flag-on sample populates them.
+///   * v11 -> v12: nullable GPS lat/lon columns on `telemetry_samples`
+///     ([`V12_TELEMETRY_GPS_COLUMNS`]) — same shape.
+///   * v12 -> v13: additive indexes only ([`V13_INDEXES`]) —
+///     `CREATE INDEX IF NOT EXISTS`, no columns, no rewrites.
+/// Reverting the flag (or downgrading the binary) needs no DB fix: an
+/// older binary ignores the extra columns and indexes, and the new
+/// columns simply stay NULL. NOTE: on a large existing `telemetry_samples`
+/// table the v13 index build runs once on first open and can take real
+/// wall-clock + I/O — see [`V13_INDEXES`] and measure on production-sized
+/// data before relying on it on a tight power budget.
 pub const CURRENT_SCHEMA_VERSION: i32 = 13;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
