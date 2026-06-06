@@ -526,7 +526,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10"),
+            Some("11"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -564,7 +564,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -596,7 +596,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -630,7 +630,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -737,7 +737,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -788,7 +788,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -841,7 +841,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
@@ -884,7 +884,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("10")
+            Some("11")
         );
     }
 
