@@ -200,6 +200,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/telemetry/tire-history",
             get(crate::drives_handler::tire_history),
         )
+        // Charging — sessions derived on-demand from the per-sample
+        // charge columns. Empty unless the experimental flag is on.
+        .route("/api/charging", get(crate::charging::list_charging))
+        .route("/api/charging/{id}", get(crate::charging::single_charging))
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))
