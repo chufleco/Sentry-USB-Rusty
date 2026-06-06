@@ -1,62 +1,73 @@
-import { useCallback, useEffect, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
-import {
-  BatteryCharging,
-  ChevronRight,
-  Loader2,
-  MapPin,
-  RefreshCw,
-  Zap,
-} from "lucide-react"
+import { BatteryCharging, ChevronRight, Loader2, MapPin, Zap } from "lucide-react"
 import { fetchChargeSessions } from "@/api/charging"
 import type { ChargeSessionSummary } from "@/types/charging"
+import { DatePopover } from "@/components/drives/DatePopover"
+import {
+  ChargingSummaryStrip,
+  type ChargingStats,
+} from "@/components/charging/ChargingSummaryStrip"
+import { rangeBounds, type DateRange } from "@/hooks/useDrivesList"
 import { fmtDuration, fmtEnergy, fmtSoc } from "@/lib/charge-format"
 
 export default function Charging() {
   const [sessions, setSessions] = useState<ChargeSessionSummary[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  // Charge sessions are infrequent, so default to All time rather than
+  // the Drives default of Last 7 days (which would usually be empty).
+  const [range, setRange] = useState<DateRange>({ kind: "preset", preset: "all" })
 
-  const load = useCallback(() => {
+  useEffect(() => {
+    let cancelled = false
     setLoading(true)
     setError(null)
     fetchChargeSessions()
-      .then((s) => setSessions(s))
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoading(false))
+      .then((s) => {
+        if (!cancelled) setSessions(s)
+      })
+      .catch((e) => {
+        if (!cancelled) setError(e instanceof Error ? e.message : String(e))
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false)
+      })
+    return () => {
+      cancelled = true
+    }
   }, [])
 
-  useEffect(() => {
-    load()
-  }, [load])
+  const visible = useMemo(() => {
+    const { from, to } = rangeBounds(range, new Date())
+    return sessions.filter((s) => {
+      const t = new Date(s.startMs)
+      if (from && t < from) return false
+      if (to && t >= to) return false
+      return true
+    })
+  }, [sessions, range])
 
-  const totalEnergy = sessions.reduce(
-    (sum, s) => sum + (s.energyAddedKwh ?? 0),
-    0,
+  const stats: ChargingStats = useMemo(
+    () => ({
+      count: visible.length,
+      totalEnergyKwh: visible.reduce((sum, s) => sum + (s.energyAddedKwh ?? 0), 0),
+      totalDurationSecs: visible.reduce((sum, s) => sum + s.durationSecs, 0),
+    }),
+    [visible],
   )
 
   return (
     <div className="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
       <div className="mb-4 flex flex-wrap items-center justify-between gap-3 sm:mb-6">
-        <div>
-          <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">
-            Charging
-          </h1>
-          {sessions.length > 0 && (
-            <p className="mt-1 text-sm text-slate-500">
-              {sessions.length} session{sessions.length === 1 ? "" : "s"} ·{" "}
-              {fmtEnergy(totalEnergy)} added
-            </p>
-          )}
-        </div>
-        <button
-          type="button"
-          onClick={load}
-          className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 bg-white/[0.03] px-3 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/[0.06]"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-          Refresh
-        </button>
+        <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">
+          Charging
+        </h1>
+      </div>
+
+      <div className="mb-4 flex flex-wrap items-center gap-x-4 gap-y-3">
+        <DatePopover range={range} onChange={setRange} />
+        <ChargingSummaryStrip stats={stats} loading={loading} />
       </div>
 
       <div className="flex flex-col gap-3">
@@ -71,15 +82,16 @@ export default function Charging() {
             Failed to load charging history: {error}
           </div>
         )}
-        {!loading && !error && sessions.length === 0 && (
+        {!loading && !error && visible.length === 0 && (
           <div className="rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-center text-sm text-slate-400">
             <BatteryCharging className="mx-auto mb-3 h-8 w-8 text-slate-600" />
-            No charging sessions recorded yet. Sessions appear here once the
-            car charges while the Pi is sampling.
+            {sessions.length === 0
+              ? "No charging sessions recorded yet. Sessions appear here once the car charges while the Pi is sampling."
+              : "No charging sessions in this date range."}
           </div>
         )}
         {!loading &&
-          sessions.map((s) => <ChargeRow key={s.id} session={s} />)}
+          visible.map((s) => <ChargeRow key={s.id} session={s} />)}
       </div>
     </div>
   )
@@ -88,7 +100,7 @@ export default function Charging() {
 function ChargeRow({ session }: { session: ChargeSessionSummary }) {
   const start = new Date(session.startMs)
   // "19% (40 mi) → 90% (193 mi)" when range is known, else just the
-  // SoC pair, matching how TeslaScope labels a session.
+  // SoC pair.
   const socPart = (
     pct: number | null,
     mi: number | null,
