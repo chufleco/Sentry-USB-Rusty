@@ -102,23 +102,6 @@ struct ChargeSessionDetail {
     points: Vec<ChargePoint>,
 }
 
-/// Whether the master experimental opt-in is set. Mirrors how the
-/// telemetry sampler reads the same key, so both sides agree on what
-/// "on" means. Read fresh per request — config changes without a
-/// daemon restart and these endpoints are low-traffic.
-fn experimental_enabled() -> bool {
-    let path = sentryusb_config::find_config_path();
-    match sentryusb_config::parse_file(path) {
-        Ok((active, commented)) => {
-            match sentryusb_config::get_config_value(&active, &commented, "SENTRYUSB_EXPERIMENTAL") {
-                Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
-                None => false,
-            }
-        }
-        Err(_) => false,
-    }
-}
-
 /// Mean of an iterator of values, or None when it yields nothing. Used
 /// for the detail view's average power / current / voltage / temp stats.
 fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
@@ -234,15 +217,10 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
 
 /// GET /api/charging
 ///
-/// Charge sessions newest-first. Empty when the experimental flag is off
-/// or no charging has been sampled.
+/// Charge sessions newest-first. Empty when no charging has been sampled.
 pub async fn list_charging(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !experimental_enabled() {
-        return (StatusCode::OK, Json(serde_json::json!({ "sessions": [] })));
-    }
-
     let result = state
         .drives
         .store
@@ -272,10 +250,6 @@ pub async fn single_charging(
     State(state): State<AppState>,
     Path(id): Path<i64>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    if !experimental_enabled() {
-        return crate::json_error(StatusCode::NOT_FOUND, "charging history not enabled");
-    }
-
     // Bound the scan so a session that never closes can't read the whole
     // table. One plug-in can't plausibly exceed this; the gap split ends
     // the session well before the bound in practice.
