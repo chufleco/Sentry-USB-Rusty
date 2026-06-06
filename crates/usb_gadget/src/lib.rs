@@ -3,8 +3,13 @@
 //! Replaces `enable_gadget.sh` and `disable_gadget.sh` with native Rust
 //! operations on `/sys/kernel/config/usb_gadget/sentryusb`.
 
+pub mod board;
+pub mod early_bind;
+pub mod flag;
 pub mod snapshot;
 pub mod space;
+
+pub use board::{select_board, BoardId, GadgetBoard, UdcFamily};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -118,9 +123,25 @@ fn gadget_dir_is_complete(gadget: &Path) -> bool {
     }
 }
 
-/// Enable the USB gadget by setting up configfs.
-/// This is equivalent to `enable_gadget.sh`.
+/// Enable the USB gadget.
+///
+/// FACADE: when the master experimental flag is on, dispatch to the native
+/// per-board path ([`enable_with`] with the detected board). Otherwise run the
+/// legacy hardcoded path ([`legacy_enable`]) byte-for-byte. The flag is read
+/// fresh per call, so reverting it instantly restores legacy behaviour.
 pub fn enable() -> Result<()> {
+    if flag::experimental_enabled() {
+        let board = select_board();
+        info!("USB gadget: native per-board path (board: {})", board.name());
+        enable_with(&*board)
+    } else {
+        legacy_enable()
+    }
+}
+
+/// Legacy hardcoded enable — equivalent to `enable_gadget.sh`. Preserved
+/// byte-for-byte as the flag-off path; do NOT alter its behaviour.
+fn legacy_enable() -> Result<()> {
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
 
@@ -249,6 +270,214 @@ pub fn enable() -> Result<()> {
     bind_udc(&gadget)
 }
 
+/// Native per-board enable. Structurally identical to [`legacy_enable`], but
+/// every board-specific constant — `MaxPower`, the module set, the LUN settle
+/// duration, and the UDC selection / max-speed / soft-connect at bind time —
+/// is read from `board` instead of being hardcoded. For [`board::GenericBoard`]
+/// (and any board that overrides nothing) the resulting behaviour is identical
+/// to the legacy path, so a flag flip is never worse than today.
+fn enable_with(board: &dyn GadgetBoard) -> Result<()> {
+    let configfs = find_configfs_root()?;
+    let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
+
+    let _ = std::process::Command::new("modprobe")
+        .args(["-q", "-r", "g_mass_storage"])
+        .status();
+
+    // Reuse-or-rebuild, mirroring legacy_enable's defensive stance. Teardown of
+    // an incomplete dir routes through disable_with so the same board context
+    // (module set) is used.
+    if gadget.exists() {
+        if gadget_dir_is_complete(&gadget) {
+            let func_dir = gadget.join("functions/mass_storage.0");
+            for (i, (image_path, _)) in DISK_IMAGES.iter().enumerate() {
+                let lun_file = func_dir.join(format!("lun.{}/file", i));
+                if lun_file.exists() && Path::new(image_path).exists() {
+                    let _ = fs::write(&lun_file, "\n");
+                    std::thread::sleep(std::time::Duration::from_secs(1));
+                    let _ = fs::write(&lun_file, image_path);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(board.lun_settle_ms()));
+            return bind_udc_with(board, &gadget);
+        }
+        info!("USB gadget dir exists but is incomplete — tearing down and rebuilding");
+        disable_with(board)?;
+    }
+
+    // Load the board's module set, one modprobe per module (the combined-args
+    // form is misparsed as a module parameter on kernel 6.18+).
+    for module in board.load_modules() {
+        let _ = std::process::Command::new("modprobe").arg(module).status();
+    }
+
+    let cfg_dir = gadget.join(format!("configs/{}.1", CFG));
+    fs::create_dir_all(&cfg_dir)
+        .with_context(|| format!("failed to create {}", cfg_dir.display()))?;
+
+    write_file(&gadget.join("idVendor"), "0x1d6b")?;
+    write_file(&gadget.join("idProduct"), "0x0104")?;
+    write_file(&gadget.join("bcdDevice"), "0x0100")?;
+    write_file(&gadget.join("bcdUSB"), "0x0200")?;
+
+    let strings_dir = gadget.join(format!("strings/{}", LANG));
+    fs::create_dir_all(&strings_dir)
+        .with_context(|| format!("failed to create {}", strings_dir.display()))?;
+    let cfg_strings = gadget.join(format!("configs/{}.1/strings/{}", CFG, LANG));
+    fs::create_dir_all(&cfg_strings)
+        .with_context(|| format!("failed to create {}", cfg_strings.display()))?;
+
+    write_file(&strings_dir.join("serialnumber"), &get_machine_serial())?;
+    write_file(&strings_dir.join("manufacturer"), "SentryUSB")?;
+    write_file(&strings_dir.join("product"), "SentryUSB Composite Gadget")?;
+    write_file(&cfg_strings.join("configuration"), "SentryUSB Config")?;
+
+    // Per-board MaxPower instead of the Pi-only ladder.
+    write_file(&cfg_dir.join("MaxPower"), &board.max_power_ma().to_string())?;
+
+    let func_dir = gadget.join("functions/mass_storage.0");
+    fs::create_dir_all(&func_dir)
+        .with_context(|| format!("failed to create {}", func_dir.display()))?;
+
+    let mut lun = 0;
+    for (image_path, label) in DISK_IMAGES {
+        if Path::new(image_path).exists() {
+            let lun_dir = func_dir.join(format!("lun.{}", lun));
+            fs::create_dir_all(&lun_dir)
+                .with_context(|| format!("failed to create lun.{} at {}", lun, lun_dir.display()))?;
+            write_file(&lun_dir.join("file"), image_path)?;
+
+            let size = fs::metadata(image_path)
+                .map(|m| format_size(m.len()))
+                .unwrap_or_else(|_| "?".to_string());
+            write_file(
+                &lun_dir.join("inquiry_string"),
+                &format!("SentryUSB {} {}", label, size),
+            )?;
+
+            lun += 1;
+        }
+    }
+
+    ensure_symlink(&func_dir, &cfg_dir.join("mass_storage.0"))?;
+
+    info!(
+        "USB gadget configured with {} LUN(s) for board {}",
+        lun,
+        board.name()
+    );
+
+    std::thread::sleep(std::time::Duration::from_millis(board.lun_settle_ms()));
+
+    bind_udc_with(board, &gadget)
+}
+
+/// Board-aware UDC bind. Picks the UDC via the board's `select_udc` policy
+/// (sole-entry by default; peripheral-role on multi-controller dwc3 boards),
+/// optionally writes the board's `max_speed` cap before binding, and issues a
+/// `soft_connect` pull-up afterward when the board requires it. The bind /
+/// retry / readback loop is identical to [`bind_udc`].
+fn bind_udc_with(board: &dyn GadgetBoard, gadget: &Path) -> Result<()> {
+    let udc_names = list_udc_names_for_bind()?;
+    let udc = board.select_udc(&udc_names).ok_or_else(|| {
+        anyhow::anyhow!(
+            "board {} could not select a UDC among {:?}",
+            board.name(),
+            udc_names
+        )
+    })?;
+
+    // dwc3 HS cap: write the controller's maximum_speed before binding. The
+    // attribute lives under the UDC's device node; best-effort because not all
+    // controllers expose it and the kernel default is acceptable when absent.
+    if let Some(speed) = board.max_speed() {
+        let max_speed_path = Path::new("/sys/class/udc").join(&udc).join("device/maximum_speed");
+        match fs::write(&max_speed_path, speed) {
+            Ok(()) => info!("UDC {} max_speed capped to {}", udc, speed),
+            Err(e) => info!("UDC {} max_speed cap skipped ({})", udc, e),
+        }
+    }
+
+    let udc_path = gadget.join("UDC");
+    let _ = fs::write(&udc_path, "");
+
+    for attempt in 1..=5 {
+        match fs::write(&udc_path, &udc) {
+            Ok(()) => match fs::read_to_string(&udc_path) {
+                Ok(s) if s.trim() == udc.trim() => {
+                    info!("USB gadget bound to UDC: {}", udc);
+                    maybe_soft_connect(board, &udc);
+                    return Ok(());
+                }
+                Ok(other) if attempt < 5 => {
+                    info!(
+                        "UDC bind attempt {} wrote {:?} but sysfs reads back {:?}; retrying",
+                        attempt,
+                        udc,
+                        other.trim()
+                    );
+                    let _ = fs::write(&udc_path, "");
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                }
+                Ok(other) => {
+                    return Err(anyhow::anyhow!(
+                        "UDC bind silently rejected: wrote {:?}, readback {:?}",
+                        udc,
+                        other.trim()
+                    ));
+                }
+                Err(_) => {
+                    info!("USB gadget bound to UDC: {} (readback failed)", udc);
+                    maybe_soft_connect(board, &udc);
+                    return Ok(());
+                }
+            },
+            Err(e) if attempt < 5 => {
+                info!("UDC bind attempt {} failed ({}), retrying", attempt, e);
+                let _ = fs::write(&udc_path, "");
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to bind UDC {}: {}", udc, e));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Issue an explicit `soft_connect` pull-up if the board needs one (dwc3).
+/// Best-effort: the attribute is absent on dwc2 and on controllers that
+/// auto-connect, where the write simply fails and is logged.
+fn maybe_soft_connect(board: &dyn GadgetBoard, udc: &str) {
+    if !board.needs_soft_connect() {
+        return;
+    }
+    let path = Path::new("/sys/class/udc").join(udc).join("device/soft_connect");
+    match fs::write(&path, "connect") {
+        Ok(()) => info!("UDC {} soft_connect issued", udc),
+        Err(e) => info!("UDC {} soft_connect skipped ({})", udc, e),
+    }
+}
+
+/// Enumerate `/sys/class/udc` entry names (sorted) for board UDC selection.
+/// Errors when the directory is unreadable, matching `find_udc`'s "no UDC"
+/// failure contract.
+fn list_udc_names_for_bind() -> Result<Vec<String>> {
+    let udc_dir = Path::new("/sys/class/udc");
+    let mut names: Vec<String> = match fs::read_dir(udc_dir) {
+        Ok(rd) => rd
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect(),
+        Err(_) => bail!("no UDC found in /sys/class/udc"),
+    };
+    names.sort();
+    if names.is_empty() {
+        bail!("no UDC found in /sys/class/udc");
+    }
+    Ok(names)
+}
+
 /// Bind (or rebind) the UDC for an already-configured gadget dir. If the UDC
 /// is busy, blank the UDC slot, wait briefly, and retry so stale bindings
 /// clear. Returns the underlying error if the final attempt fails.
@@ -309,9 +538,87 @@ fn bind_udc(gadget: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Disable the USB gadget by tearing down configfs.
-/// This is equivalent to `disable_gadget.sh`.
+/// Disable the USB gadget.
+///
+/// FACADE: native per-board path when the experimental flag is on, else the
+/// legacy hardcoded teardown byte-for-byte. Flag read fresh per call.
 pub fn disable() -> Result<()> {
+    if flag::experimental_enabled() {
+        disable_with(&*select_board())
+    } else {
+        legacy_disable()
+    }
+}
+
+/// Native per-board disable. The configfs teardown cascade is hardware-agnostic
+/// and identical to [`legacy_disable`]; the only board-derived input is the
+/// module set unloaded at the end (so a board that loaded a different set tears
+/// the same ones down). All other steps are reproduced exactly so a flag flip
+/// mid-session tears down a legacy-built gadget correctly.
+fn disable_with(board: &dyn GadgetBoard) -> Result<()> {
+    let _ = std::process::Command::new("modprobe")
+        .args(["-q", "-r", "g_mass_storage"])
+        .status();
+
+    let configfs = find_configfs_root()?;
+    let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
+
+    if !gadget.exists() {
+        info!("USB gadget already disabled");
+        return Ok(());
+    }
+
+    let _ = fs::write(gadget.join("UDC"), "\n");
+
+    let cfg_dir = gadget.join(format!("configs/{}.1", CFG));
+    let _ = fs::remove_file(cfg_dir.join("mass_storage.0"));
+    let cfg_strings = cfg_dir.join(format!("strings/{}", LANG));
+    let _ = fs::remove_dir(&cfg_strings);
+    let _ = fs::remove_dir(cfg_dir.join("strings/0x0409"));
+
+    let func_dir = gadget.join("functions/mass_storage.0");
+    for i in 0..=4 {
+        let _ = fs::write(func_dir.join(format!("lun.{}/file", i)), "\n");
+    }
+    for i in 1..=4 {
+        let _ = fs::remove_dir(func_dir.join(format!("lun.{}", i)));
+    }
+    let _ = fs::remove_dir(&func_dir);
+
+    let _ = fs::remove_dir(&cfg_dir);
+    let _ = fs::remove_dir(gadget.join(format!("strings/{}", LANG)));
+    let _ = fs::remove_dir(gadget.join("strings/0x0409"));
+    let _ = fs::remove_dir(&gadget);
+
+    // Unload the board's module set plus the legacy networking functions the
+    // teardown has always swept (harmless when absent). libcomposite goes last.
+    let mut rm: Vec<&str> = board.load_modules();
+    for extra in ["g_ether", "usb_f_ecm", "usb_f_rndis", "libcomposite"] {
+        if !rm.contains(&extra) {
+            rm.push(extra);
+        }
+    }
+    // Ensure libcomposite is last so dependent function modules drop first.
+    rm.retain(|m| *m != "libcomposite");
+    rm.push("libcomposite");
+    let mut args: Vec<&str> = vec!["-r"];
+    args.extend(rm);
+    let _ = std::process::Command::new("modprobe").args(&args).status();
+
+    if gadget.exists() {
+        tracing::warn!(
+            "disable_with() completed but {} still present (incomplete teardown)",
+            gadget.display()
+        );
+    }
+
+    info!("USB gadget disabled (board: {})", board.name());
+    Ok(())
+}
+
+/// Legacy hardcoded disable — equivalent to `disable_gadget.sh`. Preserved
+/// byte-for-byte as the flag-off path; do NOT alter its behaviour.
+fn legacy_disable() -> Result<()> {
     // Unload g_mass_storage FIRST so it releases the UDC before we try to
     // deactivate it. If we leave this for the end, the kernel may keep the
     // UDC bound, the `echo "" > UDC` below silently no-ops, and the next
@@ -421,6 +728,36 @@ pub fn disable() -> Result<()> {
 /// Requiring both signals means a partially-torn-down gadget correctly
 /// reports as inactive so the next enable call reconstructs it.
 pub fn is_active() -> bool {
+    // FACADE: dispatches like enable/disable, but BOTH branches MUST evaluate
+    // the identical two-signal contract (UDC bound + lun.0/file non-empty).
+    // is_active is the gate the idempotent enable handler checks; if the native
+    // and legacy answers ever diverged, a flag flip mid-session could
+    // false-trigger a needless rebuild (or skip a needed one). is_active_with
+    // is therefore the SAME logic as legacy_is_active — the board argument does
+    // not influence the result; it exists only for symmetry with the lifecycle.
+    if flag::experimental_enabled() {
+        is_active_with(&*select_board())
+    } else {
+        legacy_is_active()
+    }
+}
+
+/// Native-path liveness check. Identical two-signal contract to
+/// [`legacy_is_active`]; `board` is unused on purpose (the signals are
+/// hardware-agnostic) so the answer can never diverge between paths.
+fn is_active_with(_board: &dyn GadgetBoard) -> bool {
+    gadget_two_signal_active()
+}
+
+/// Legacy-path liveness check — byte-for-byte the original `is_active` body.
+fn legacy_is_active() -> bool {
+    gadget_two_signal_active()
+}
+
+/// The two-signal liveness contract shared by both paths: the gadget is active
+/// iff it is bound to a UDC AND has a populated `lun.0/file`. Single source of
+/// truth so legacy and native answers are provably identical.
+fn gadget_two_signal_active() -> bool {
     let root = Path::new("/sys/kernel/config/usb_gadget/sentryusb");
     let udc_bound = fs::read_to_string(root.join("UDC"))
         .map(|s| !s.trim().is_empty())

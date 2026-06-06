@@ -11,6 +11,9 @@ ring = "0.17"
 hex = "0.4"
 
 sentryusb-shell = { path = "../shell", package = "sentryusb-shell" }
+# Read SENTRYUSB_EXPERIMENTAL via the config crate's canonical reader. Do NOT
+# depend on the api crate — api depends on this crate, so that would cycle.
+sentryusb-config = { path = "../config", package = "sentryusb-config" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
