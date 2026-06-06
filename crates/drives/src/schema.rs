@@ -34,12 +34,12 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// via `state tire-pressure` in PSI. Per-route columns store the
 /// latest non-null reading per tire within each clip's 60s window;
 /// per-drive rollup takes the latest across the drive's clips.
-/// All nullable — cars without TPMS or pre-TPMS-sampler drives
+/// All nullable â€” cars without TPMS or pre-TPMS-sampler drives
 /// simply stay NULL and the UI hides the row.
 ///
 /// v7 -> v8: TPMS unit fix. v7 sampler stored raw `state
 /// tire-pressure` values as `tire_*_psi` but Tesla actually returns
-/// BAR — typical readings showed up as 3.0 instead of the expected
+/// BAR â€” typical readings showed up as 3.0 instead of the expected
 /// ~43 PSI. v8 multiplies any historically-stored value < 5 by
 /// 14.5038 in both `telemetry_samples` and `routes`. The bound is
 /// safe because a real PSI reading can't be < 5 on a drivable tire,
@@ -53,35 +53,35 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// at a 15-min throttle so we don't waste BLE air time on a field
 /// that changes once per OTA. The per-drive rollup uses
 /// `software_version` to map to a FSD release (via a hardcoded
-/// lookup) — but only displayed on drives where FSD was actually
+/// lookup) â€” but only displayed on drives where FSD was actually
 /// engaged at some point.
 ///
 /// `idx_routes_start_ts` cleanup (version-agnostic): the index over
-/// `routes.start_ts` — shipped by every V1_SCHEMA from v1 through v9
-/// — indexed an always-NULL column (start_ts is bound to SQL NULL on
+/// `routes.start_ts` â€” shipped by every V1_SCHEMA from v1 through v9
+/// â€” indexed an always-NULL column (start_ts is bound to SQL NULL on
 /// every insert). V1_SCHEMA no longer ships it; `migrate()` runs an
 /// unconditional `DROP INDEX IF EXISTS` near the top so every cohort
 /// (pre-v6 / v6 / v7 / v8 / v9 / fresh) ends up without the dead
 /// index in one pass. `IF EXISTS` makes the call a no-op on fresh
 /// DBs and on any subsequent open.
 ///
-/// v9 -> v10: add `location_name` (TEXT) to `telemetry_samples` —
+/// v9 -> v10: add `location_name` (TEXT) to `telemetry_samples` â€”
 /// Tesla's reverse-geocoded address string from `state drive`'s
 /// `locationState.locationName` field. Per-clip rollups
 /// `location_name_start` / `location_name_end` added to `routes`,
 /// populated by the aggregator from the first / last non-null
 /// sample in each clip's 60s window. The per-drive rollup chains
 /// these across clips so each drive in the list gets a friendly
-/// start → end label without needing to call an external
+/// start â†’ end label without needing to call an external
 /// reverse-geocoding API.
 ///
 /// Also: `software_version` columns on both tables are kept for
-/// forward-compat but no longer written — Tesla doesn't expose
+/// forward-compat but no longer written â€” Tesla doesn't expose
 /// `car_version` over BLE state queries.
 pub const CURRENT_SCHEMA_VERSION: i32 = 12;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
-/// is safe on every startup. Column shapes and names match Go exactly —
+/// is safe on every startup. Column shapes and names match Go exactly â€”
 /// cross-binary DBs must not diverge.
 const V1_SCHEMA: &[&str] = &[
     "CREATE TABLE IF NOT EXISTS meta (
@@ -110,7 +110,7 @@ const V1_SCHEMA: &[&str] = &[
     ) WITHOUT ROWID",
 
     "CREATE INDEX IF NOT EXISTS idx_routes_date_dir ON routes(date_dir)",
-    // Note: idx_routes_start_ts is intentionally NOT created here — see
+    // Note: idx_routes_start_ts is intentionally NOT created here â€” see
     // the `idx_routes_start_ts cleanup` paragraph above CURRENT_SCHEMA_VERSION
     // for the reasoning. migrate() drops any pre-existing copy
     // unconditionally on every open.
@@ -164,7 +164,7 @@ pub const V3_ROUTE_CLOUD_COLUMNS: &[(&str, &str)] = &[
     ("cloud_route_id", "TEXT"),
 ];
 
-/// Partial index on `cloud_uploaded_at IS NULL` rows only — keeps the
+/// Partial index on `cloud_uploaded_at IS NULL` rows only â€” keeps the
 /// steady-state size near zero (uploaded rows aren't indexed). Drives the
 /// uploader's `SELECT file FROM routes WHERE cloud_uploaded_at IS NULL`
 /// hot path.
@@ -183,7 +183,7 @@ pub const V4_ROUTE_TESSIE_COLUMNS: &[(&str, &str)] = &[
 
 /// v6 telemetry rollups on `routes`. Populated by the aggregator from
 /// `telemetry_samples` rows whose `ts` falls in `[start_ts, end_ts]`.
-/// All nullable — a drive that ran before telemetry was enabled, or one
+/// All nullable â€” a drive that ran before telemetry was enabled, or one
 /// where the sampler missed every window, simply has NULLs here. The
 /// drives-tab UI reads these directly so the hot path never joins the
 /// samples table at render time.
@@ -199,7 +199,7 @@ pub const V6_ROUTE_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
 
 /// v6 standalone tables. `telemetry_samples` is keyed on `ts` (unix
 /// seconds) and uses WITHOUT ROWID so the PK doubles as the storage
-/// order — range scans on `ts` for the aggregator's per-route joins
+/// order â€” range scans on `ts` for the aggregator's per-route joins
 /// are then a B-tree slice with no separate index needed. Every
 /// telemetry column is nullable because the sampler uses two source
 /// paths: `state climate/charge` (full data) and `body-controller-state`
@@ -234,7 +234,7 @@ pub const V7_TELEMETRY_TPMS_COLUMNS: &[(&str, &str)] = &[
 /// v7 TPMS rollup columns on `routes`. Latest non-null reading per
 /// tire within the clip's 60s window. Tire pressure changes slowly
 /// (minutes-to-hours) so "latest" is a sensible single-value
-/// representative — drive-level rollup takes the latest across all
+/// representative â€” drive-level rollup takes the latest across all
 /// the drive's clips.
 pub const V7_ROUTE_TPMS_COLUMNS: &[(&str, &str)] = &[
     ("tire_fl_psi", "REAL"),
@@ -247,14 +247,14 @@ pub const V7_ROUTE_TPMS_COLUMNS: &[(&str, &str)] = &[
 /// `odometer_mi` is Tesla's native unit. `software_version` is the
 /// Tesla OS version string (e.g. "2026.2.9.10"). The sampler only
 /// re-fetches software_version every ~15 min, so most sample rows
-/// will have it NULL — the per-route aggregator picks the latest
+/// will have it NULL â€” the per-route aggregator picks the latest
 /// non-null in each window.
 pub const V9_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
     ("odometer_mi", "REAL"),
     ("software_version", "TEXT"),
 ];
 
-/// v10 `location_name` column on `telemetry_samples` — Tesla's
+/// v10 `location_name` column on `telemetry_samples` â€” Tesla's
 /// reverse-geocoded address from `state drive`. Free human-readable
 /// drive start/end labels without needing to call a geocoder.
 pub const V10_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
@@ -263,7 +263,7 @@ pub const V10_TELEMETRY_COLUMNS: &[(&str, &str)] = &[
 
 /// v11 charging-detail columns on `telemetry_samples`. Decoded from the
 /// BLE `ChargeState` message and written only when the experimental
-/// sampler flag is on (SENTRYUSB_EXPERIMENTAL) — NULL otherwise, so a
+/// sampler flag is on (SENTRYUSB_EXPERIMENTAL) â€” NULL otherwise, so a
 /// normal install is unaffected. Columns are added for everyone (cheap,
 /// nullable) so flipping the flag needs no schema change. Powers the
 /// charging view under "Driving".
@@ -281,7 +281,7 @@ pub const V11_TELEMETRY_CHARGE_COLUMNS: &[(&str, &str)] = &[
 /// already decoded from the bundled `LocationState` (they feed the
 /// keep-accessory geofence); persisting them lets a parked-and-charging
 /// sample carry the charger's location so the charging view can pin it
-/// on a map. Written only when the experimental flag is on — NULL
+/// on a map. Written only when the experimental flag is on â€” NULL
 /// otherwise, so a normal install is unaffected.
 pub const V12_TELEMETRY_GPS_COLUMNS: &[(&str, &str)] = &[
     ("latitude", "REAL"),
@@ -307,7 +307,7 @@ pub const V9_ROUTE_COLUMNS: &[(&str, &str)] = &[
     ("software_version", "TEXT"),
 ];
 
-/// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open —
+/// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V1_SCHEMA {
@@ -317,12 +317,12 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // Drop the legacy `idx_routes_start_ts` index that every V1_SCHEMA
     // through v9 shipped. `routes.start_ts` has only ever been written
-    // NULL (see `db.rs::insert_or_update_route` — start_ts is bound to
+    // NULL (see `db.rs::insert_or_update_route` â€” start_ts is bound to
     // SQL NULL), so the index has nothing to index but charges B-tree
     // maintenance on every insert. Unconditional + `IF EXISTS` handles
     // every cohort in one shot: fresh DBs (no-op, V1_SCHEMA no longer
     // ships the CREATE), and every upgraded DB (pre-v6 / v6 / v7 / v8
-    // / v9 — all inherited the index from the old V1_SCHEMA). The
+    // / v9 â€” all inherited the index from the old V1_SCHEMA). The
     // `routes.start_ts` column itself stays.
     conn.execute("DROP INDEX IF EXISTS idx_routes_start_ts", [])?;
 
@@ -356,7 +356,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // v7 upgrade: add TPMS columns to existing telemetry_samples
     // tables. Fresh DBs land via V6_NEW_TABLES which doesn't include
-    // them — caught here on the first migrate after the v7 bump.
+    // them â€” caught here on the first migrate after the v7 bump.
     let existing_tele = list_telemetry_columns(conn)?;
     for (name, typ) in V7_TELEMETRY_TPMS_COLUMNS
         .iter()
@@ -410,7 +410,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
     // v7 -> v8: scrub TPMS values that were stored in BAR rather
     // than PSI by the v7 sampler. Idempotent + gated on a stored
-    // version < 8 marker — if the column is already in PSI (>= 5)
+    // version < 8 marker â€” if the column is already in PSI (>= 5)
     // the WHERE clause matches nothing and the UPDATE is a no-op
     // anyway, but the version gate keeps us from re-running on
     // every open in steady state.
@@ -435,7 +435,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     // schema_version handling:
     //   * first-ever migrate: seed to CURRENT_SCHEMA_VERSION.
     //   * upgrading from an older version: bump up to current.
-    //   * downgrades (future-version marker): preserve — never clobber
+    //   * downgrades (future-version marker): preserve â€” never clobber
     //     a marker we don't understand.
     match meta_get(conn, "schema_version")? {
         None => {
@@ -538,7 +538,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11"),
+            Some("12"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -576,7 +576,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -608,7 +608,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -642,7 +642,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -749,7 +749,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -760,7 +760,7 @@ mod tests {
         // After the first migrate, schema_version is "5", so a second
         // migrate must NOT re-run the cleanup. Seed an event-folder row
         // AFTER the version is set, and confirm the second migrate leaves
-        // it alone — proves the cleanup is gated on schema_version.
+        // it alone â€” proves the cleanup is gated on schema_version.
         conn.execute(
             "INSERT INTO routes (file, date_dir, points_blob, updated_at) VALUES (?1, ?2, X'', 0)",
             params!["SavedClips/x/y-front.mp4", "SavedClips"],
@@ -773,7 +773,7 @@ mod tests {
     #[test]
     fn migrate_v5_skips_cleanup_on_fresh_db() {
         // A fresh DB (no stored schema_version) shouldn't even attempt
-        // the DELETE — there's nothing to clean. Verify by inserting an
+        // the DELETE â€” there's nothing to clean. Verify by inserting an
         // event-folder row after we manually create the schema but before
         // calling migrate, and observe that the row survives because
         // schema_version is None on entry.
@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -853,7 +853,7 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
@@ -896,14 +896,14 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("11")
+            Some("12")
         );
     }
 
     #[test]
     fn migrate_v8_converts_bar_tpms_to_psi() {
         // Stand up a v7 DB with mixed-unit tpms values: some still in
-        // BAR (the bug — values < 5) and some that happen to be in
+        // BAR (the bug â€” values < 5) and some that happen to be in
         // PSI already. v8 should convert the bar values and leave
         // the PSI ones alone.
         let conn = open();
@@ -911,7 +911,7 @@ mod tests {
         // Pretend the DB came from v7 by rolling the marker back.
         meta_set(&conn, "schema_version", "7").unwrap();
 
-        // Bar (typical: 3.0 = 43.5 PSI) — should be converted.
+        // Bar (typical: 3.0 = 43.5 PSI) â€” should be converted.
         conn.execute(
             "INSERT INTO telemetry_samples \
              (ts, source, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
@@ -919,7 +919,7 @@ mod tests {
             params![1_700_000_000_i64, "state", 3.0_f64, 3.1_f64, 2.9_f64, 3.0_f64],
         )
         .unwrap();
-        // Already-correct PSI — should pass through untouched.
+        // Already-correct PSI â€” should pass through untouched.
         conn.execute(
             "INSERT INTO telemetry_samples \
              (ts, source, tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi) \
@@ -927,7 +927,7 @@ mod tests {
             params![1_700_000_100_i64, "state", 42.0_f64, 43.0_f64, 41.5_f64, 42.5_f64],
         )
         .unwrap();
-        // Mixed NULL row — should stay all NULL.
+        // Mixed NULL row â€” should stay all NULL.
         conn.execute(
             "INSERT INTO telemetry_samples (ts, source) VALUES (?1, ?2)",
             params![1_700_000_200_i64, "body_controller"],
