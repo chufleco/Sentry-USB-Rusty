@@ -27,6 +27,8 @@ pub mod cloud;
 pub mod snapshots;
 pub mod keep_accessory;
 pub mod charging;
+pub mod flags;
+pub mod command;
 
 pub use auth::{AuthState, init_auth};
 pub use router::build_router;

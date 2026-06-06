@@ -82,6 +82,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/gadget-enable", post(crate::system::gadget_enable))
         .route("/api/system/gadget-disable", post(crate::system::gadget_disable))
         .route("/api/system/trigger-sync", post(crate::system::trigger_sync))
+        // Unified command surface (experimental). One typed Command enum
+        // dispatches here; the future BLE broker reuses the same enum so
+        // web/BLE parity can't drift. Gated by SENTRYUSB_EXPERIMENTAL —
+        // returns 404 with the flag off.
+        .route("/api/command", post(crate::command::command_endpoint))
         .route("/api/system/ble-pair", post(crate::system::ble_pair))
         .route("/api/system/ble-status", get(crate::system::ble_status))
         .route("/api/system/ble-enabled", get(crate::ble::ble_enabled_get))

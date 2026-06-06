@@ -99,22 +99,7 @@ struct ChargeSessionDetail {
     points: Vec<ChargePoint>,
 }
 
-/// Whether the master experimental opt-in is set. Mirrors how the
-/// telemetry sampler reads the same key, so both sides agree on what
-/// "on" means. Read fresh per request — config changes without a
-/// daemon restart and these endpoints are low-traffic.
-fn experimental_enabled() -> bool {
-    let path = sentryusb_config::find_config_path();
-    match sentryusb_config::parse_file(path) {
-        Ok((active, commented)) => {
-            match sentryusb_config::get_config_value(&active, &commented, "SENTRYUSB_EXPERIMENTAL") {
-                Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "yes" | "true" | "1"),
-                None => false,
-            }
-        }
-        Err(_) => false,
-    }
-}
+use crate::flags::experimental_enabled;
 
 /// Mean of an iterator of values, or None when it yields nothing. Used
 /// for the detail view's average power / current / voltage / temp stats.
