@@ -153,6 +153,24 @@ pub struct DriveResult {
     pub lat: Option<f64>,
     pub lon: Option<f64>,
     pub meta: ResponseMeta,
+    /// Live speed / power / active-route detail. Decoded only when the
+    /// experimental flag is on; inert otherwise.
+    pub detail: DriveDetail,
+}
+
+/// Live driving + navigation detail from the BLE `DriveState` message.
+#[derive(Debug, Clone, Default)]
+pub struct DriveDetail {
+    /// Instantaneous speed, mph.
+    pub speed_mph: Option<f32>,
+    /// Instantaneous drive power, kW (negative = regen).
+    pub power_kw: Option<i32>,
+    /// Active-route destination label, if navigating.
+    pub route_destination: Option<String>,
+    /// Estimated minutes to arrival on the active route.
+    pub route_minutes_to_arrival: Option<f32>,
+    /// Miles remaining to arrival on the active route.
+    pub route_miles_to_arrival: Option<f32>,
 }
 
 /// Result of a successful `sample_climate` call. Slow-changing —
@@ -162,6 +180,24 @@ pub struct ClimateResult {
     pub exterior_temp_c: Option<f64>,
     pub hvac_on: Option<bool>,
     pub meta: ResponseMeta,
+    /// Setpoints / fan / defroster / seat-heater / preconditioning detail.
+    /// Decoded only when the experimental flag is on; inert otherwise.
+    pub detail: ClimateDetail,
+}
+
+/// Extended climate detail from the BLE `ClimateState` message.
+/// Temperatures are Celsius; seat-heater / fan levels are Tesla's raw
+/// integer steps (0 = off).
+#[derive(Debug, Clone, Default)]
+pub struct ClimateDetail {
+    pub driver_setpoint_c: Option<f32>,
+    pub passenger_setpoint_c: Option<f32>,
+    pub fan_status: Option<i32>,
+    pub front_defroster_on: Option<bool>,
+    pub rear_defroster_on: Option<bool>,
+    pub preconditioning: Option<bool>,
+    pub seat_heater_left: Option<i32>,
+    pub seat_heater_right: Option<i32>,
 }
 
 // LocationResult was removed: standalone `state location` queries
@@ -368,6 +404,9 @@ pub async fn sample_drive(vin: &str, adapter: &str) -> Result<DriveResult> {
         lat: pick_f64(&drive, &["latitude", "nativeLatitude", "native_latitude"]),
         lon: pick_f64(&drive, &["longitude", "nativeLongitude", "native_longitude"]),
         meta,
+        // Expanded detail is decoded only on the in-process BLE path; the
+        // legacy shell-out path leaves it empty.
+        detail: DriveDetail::default(),
     })
 }
 
@@ -399,6 +438,9 @@ pub async fn sample_climate(vin: &str, adapter: &str) -> Result<ClimateResult> {
             &["isClimateOn", "is_climate_on", "hvacAuto", "climateKeeperMode"],
         ),
         meta,
+        // Expanded detail is decoded only on the in-process BLE path; the
+        // legacy shell-out path leaves it empty.
+        detail: ClimateDetail::default(),
     })
 }
 

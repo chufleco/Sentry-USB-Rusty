@@ -653,6 +653,9 @@ async fn tick(
             if presence_now == Some(true) {
                 match sample_ble::sample_drive_ble(session).await {
                     Ok(d) => {
+                        if cfg.experimental {
+                            sample_ble::log_drive_detail(&d);
+                        }
                         // Self-correct the Pi's clock if it's
                         // significantly off — uses Tesla's
                         // GPS-derived timestamp from the response.
@@ -727,6 +730,9 @@ async fn tick(
                     if refresh_due {
                         match sample_ble::sample_climate_ble(session).await {
                             Ok(c) => {
+                                if cfg.experimental {
+                                    sample_ble::log_climate_detail(&c);
+                                }
                                 try_sync_clock(c.meta);
                                 refresh.interior_temp_c = c.interior_temp_c;
                                 refresh.exterior_temp_c = c.exterior_temp_c;
@@ -855,6 +861,9 @@ async fn tick(
         if schedule.drive_due(tick_now) {
             let success = match sample_ble::sample_drive_ble(session).await {
                 Ok(d) => {
+                    if cfg.experimental {
+                        sample_ble::log_drive_detail(&d);
+                    }
                     try_sync_clock(d.meta);
                     sample.odometer_mi = d.odometer_mi;
                     sample.location_name = d.location_name;
@@ -923,6 +932,9 @@ async fn tick(
         if schedule.climate_due(tick_now) {
             let success = match sample_ble::sample_climate_ble(session).await {
                 Ok(c) => {
+                    if cfg.experimental {
+                        sample_ble::log_climate_detail(&c);
+                    }
                     try_sync_clock(c.meta);
                     sample.interior_temp_c = c.interior_temp_c;
                     sample.exterior_temp_c = c.exterior_temp_c;

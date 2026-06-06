@@ -15,9 +15,9 @@ use sentryusb_tesla_ble::{
 use tracing::{info, warn};
 
 use crate::sample::{
-    BodyControllerSample, ChargeDetail, ChargeResult, ChargingState, ClimateResult,
-    ClosuresDetail, ClosuresResult, DriveResult, ResponseMeta, Sample, SentryMode, ShiftState,
-    TiresResult, now_secs,
+    BodyControllerSample, ChargeDetail, ChargeResult, ChargingState, ClimateDetail, ClimateResult,
+    ClosuresDetail, ClosuresResult, DriveDetail, DriveResult, ResponseMeta, Sample, SentryMode,
+    ShiftState, TiresResult, now_secs,
 };
 
 /// 1 bar = 14.5038 psi (NIST). Tesla reports TPMS in bar on the wire.
@@ -167,6 +167,33 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
         ),
     }
 
+    use car_server::drive_state as ds;
+    let detail = DriveDetail {
+        speed_mph: drive.optional_speed_float.as_ref().map(|v| {
+            let ds::OptionalSpeedFloat::SpeedFloat(n) = v;
+            *n
+        }),
+        power_kw: drive.optional_power.as_ref().map(|v| {
+            let ds::OptionalPower::Power(n) = v;
+            *n
+        }),
+        route_destination: drive.optional_active_route_destination.as_ref().map(|v| {
+            let ds::OptionalActiveRouteDestination::ActiveRouteDestination(s) = v;
+            s.clone()
+        }),
+        route_minutes_to_arrival: drive
+            .optional_active_route_minutes_to_arrival
+            .as_ref()
+            .map(|v| {
+                let ds::OptionalActiveRouteMinutesToArrival::ActiveRouteMinutesToArrival(n) = v;
+                *n
+            }),
+        route_miles_to_arrival: drive.optional_active_route_miles_to_arrival.as_ref().map(|v| {
+            let ds::OptionalActiveRouteMilesToArrival::ActiveRouteMilesToArrival(n) = v;
+            *n
+        }),
+    };
+
     Ok(DriveResult {
         location_name,
         odometer_mi,
@@ -174,7 +201,25 @@ pub async fn sample_drive_ble(session: &PersistentSession) -> Result<DriveResult
         lat,
         lon,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of live drive + navigation detail. Logged only
+/// when the experimental flag is on. The route destination is treated as
+/// PII (it is a place name), so the log reports only whether a route is
+/// active plus the ETA / distance, never the destination string.
+pub fn log_drive_detail(c: &DriveResult) {
+    let d = &c.detail;
+    info!(
+        "drive-detail [experimental]: speed_mph={:?} power_kw={:?} navigating={} \
+         eta_min={:?} miles_to_arrival={:?}",
+        d.speed_mph,
+        d.power_kw,
+        d.route_destination.is_some(),
+        d.route_minutes_to_arrival,
+        d.route_miles_to_arrival,
+    );
 }
 
 /// `state climate` over BLE. Interior/exterior temps + HVAC on/off.
@@ -207,12 +252,68 @@ pub async fn sample_climate_ble(session: &PersistentSession) -> Result<ClimateRe
         });
     let meta = build_meta(climate.timestamp.as_ref(), started);
 
+    use car_server::climate_state as cls;
+    let detail = ClimateDetail {
+        driver_setpoint_c: climate.optional_driver_temp_setting.as_ref().map(|v| {
+            let cls::OptionalDriverTempSetting::DriverTempSetting(n) = v;
+            *n
+        }),
+        passenger_setpoint_c: climate.optional_passenger_temp_setting.as_ref().map(|v| {
+            let cls::OptionalPassengerTempSetting::PassengerTempSetting(n) = v;
+            *n
+        }),
+        fan_status: climate.optional_fan_status.as_ref().map(|v| {
+            let cls::OptionalFanStatus::FanStatus(n) = v;
+            *n
+        }),
+        front_defroster_on: climate.optional_is_front_defroster_on.as_ref().map(|v| {
+            let cls::OptionalIsFrontDefrosterOn::IsFrontDefrosterOn(b) = v;
+            *b
+        }),
+        rear_defroster_on: climate.optional_is_rear_defroster_on.as_ref().map(|v| {
+            let cls::OptionalIsRearDefrosterOn::IsRearDefrosterOn(b) = v;
+            *b
+        }),
+        preconditioning: climate.optional_is_preconditioning.as_ref().map(|v| {
+            let cls::OptionalIsPreconditioning::IsPreconditioning(b) = v;
+            *b
+        }),
+        seat_heater_left: climate.optional_seat_heater_left.as_ref().map(|v| {
+            let cls::OptionalSeatHeaterLeft::SeatHeaterLeft(n) = v;
+            *n
+        }),
+        seat_heater_right: climate.optional_seat_heater_right.as_ref().map(|v| {
+            let cls::OptionalSeatHeaterRight::SeatHeaterRight(n) = v;
+            *n
+        }),
+    };
+
     Ok(ClimateResult {
         interior_temp_c,
         exterior_temp_c,
         hvac_on,
         meta,
+        detail,
     })
+}
+
+/// Emit a one-line summary of extended climate detail. Logged only when
+/// the experimental flag is on; lets a tester confirm the `ClimateState`
+/// fields decode correctly off a real car before they reach the UI.
+pub fn log_climate_detail(c: &ClimateResult) {
+    let d = &c.detail;
+    info!(
+        "climate-detail [experimental]: setpoint[drv={:?} pass={:?}] fan={:?} \
+         defrost[front={:?} rear={:?}] precond={:?} seat[l={:?} r={:?}]",
+        d.driver_setpoint_c,
+        d.passenger_setpoint_c,
+        d.fan_status,
+        d.front_defroster_on,
+        d.rear_defroster_on,
+        d.preconditioning,
+        d.seat_heater_left,
+        d.seat_heater_right,
+    );
 }
 
 /// `state charge` over BLE. Battery percent (usable preferred,
