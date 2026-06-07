@@ -60,7 +60,11 @@ When `disabled` is set, the card renders:
 - The body is rendered inside a `<div class="relative">` so the overlay can
   absolutely-position over it.
 - The body's children wrapper gets:
-  `blur-[2px] opacity-40 pointer-events-none select-none transition-all`.
+  `blur-[2px] opacity-40 select-none transition-all` AND the `inert`
+  attribute. The `inert` attribute removes the subtree from the focus order
+  and assistive tech — `pointer-events: none` alone only blocks mouse, not
+  keyboard tab focus. `inert` is supported in Chrome 102+, Firefox 112+, and
+  Safari 15.5+ (fine for the Pi-served UI).
 - The overlay sits absolutely positioned over the body:
   `absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center`.
 - Reason text: `text-xs text-slate-300 max-w-[28ch]`.
@@ -95,18 +99,34 @@ is omitted — graceful degradation.
 **b) `web/src/pages/settings/NetworkTab.tsx`**
 
 Today (lines 89-115): the Away Mode AP `<PrefCard>` is wrapped in
-`{awayStatus.state === "active" && (...)}`.
+`{awayStatus.state === "active" && (...)}` with the badge hardcoded to
+`<Pill kind="sky"><LiveDot /> Live</Pill>`.
 
-After: drop the conditional wrapper. Render the `PrefCard` unconditionally.
-When `awayStatus.state !== "active"`:
+After: drop the conditional wrapper. Render the `PrefCard` unconditionally
+with the badge conditioned on active state, and the `disabled` prop set when
+not active:
 
 ```tsx
-disabled={{
-  reason: "Away Mode is off — enable it above to see the AP details.",
-}}
+<PrefCard
+  icon={<Wifi className="h-3.5 w-3.5" />}
+  halo="blue"
+  title="Away Mode AP"
+  badge={
+    awayStatus.state === "active"
+      ? <Pill kind="sky"><LiveDot /> Live</Pill>
+      : null
+  }
+  disabled={
+    awayStatus.state !== "active"
+      ? { reason: "Away Mode is off — enable it above to see the AP details." }
+      : undefined
+  }
+>
 ```
 
-No CTA — the `AwayModeControl` card sits directly above and is the toggle.
+Conditioning the badge prevents the header from misleadingly saying "Live"
+when the feature is off. No CTA — the `AwayModeControl` card sits directly
+above and is the toggle.
 
 **c) `AdapterPicker` (inside `BlePairButton.tsx`)**
 
@@ -125,8 +145,9 @@ would hide the VIN input behind blur — a regression.
 - Re-enabling a card: when the gating condition flips from disabled → enabled,
   Tailwind's `transition-all` on the body wrapper produces a smooth blur fade
   rather than a jarring snap.
-- Focus: with `pointer-events: none` on the children wrapper, Tab-focus skips
-  the controls underneath. The overlay's CTA button (if present) is the only
+- Focus: the children wrapper carries the `inert` attribute, which removes
+  it from the focus order and assistive tech entirely. Tab-focus skips the
+  controls underneath; the overlay's CTA button (if present) is the only
   focusable element in the body area.
 - Screen readers: `aria-disabled="true"` on the root signals the card is
   inactive. The reason text inside the overlay is a regular text node and
