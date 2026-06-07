@@ -13,12 +13,22 @@ export interface ChargeSessionSummary {
   locationLat: number | null
   locationLon: number | null
   energyAddedKwh: number | null
+  // Energy drawn from the charger (wall-side), kWh. >= energyAddedKwh;
+  // the gap is charging loss. efficiencyPct = added / used.
+  energyUsedKwh: number | null
+  efficiencyPct: number | null
   peakPowerKw: number | null
   startSoc: number | null
   endSoc: number | null
   startRangeMi: number | null
   endRangeMi: number | null
   chargeLimitSoc: number | null
+  // User-assigned tags + the cost the backend derived from them (charged
+  // on energy used). `cost`/`rate` are null until a rate is configured.
+  tags: string[]
+  cost: number | null
+  rate: number | null
+  currency: string
 }
 
 export interface ChargePoint {
@@ -30,9 +40,6 @@ export interface ChargePoint {
   soc: number | null
   rangeMi: number | null
   energyAddedKwh: number | null
-  batteryTempC: number | null
-  interiorTempC: number | null
-  exteriorTempC: number | null
 }
 
 export interface ChargeSessionDetail extends ChargeSessionSummary {
@@ -42,7 +49,6 @@ export interface ChargeSessionDetail extends ChargeSessionSummary {
   peakVoltageV: number | null
   avgVoltageV: number | null
   peakRateMph: number | null
-  avgBatteryTempC: number | null
   points: ChargePoint[]
 }
 

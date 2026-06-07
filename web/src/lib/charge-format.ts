@@ -17,9 +17,36 @@ export function fmtPower(kw: number | null | undefined): string {
   return `${Math.round(kw)} kW`
 }
 
-export function fmtRange(mi: number | null | undefined): string {
+// Range in the configured distance unit. Input is miles (the car's
+// native unit); metric converts to km.
+export function fmtRangeUnit(
+  mi: number | null | undefined,
+  metric: boolean,
+): string {
   if (mi == null) return "—"
-  return `${Math.round(mi)} mi`
+  return metric ? `${Math.round(mi * 1.609344)} km` : `${Math.round(mi)} mi`
+}
+
+// "~3h 45m to full" / "~45m to full". null/0 → null.
+export function fmtToFull(mins: number | null | undefined): string | null {
+  if (mins == null || mins <= 0) return null
+  const h = Math.floor(mins / 60)
+  const m = mins % 60
+  return h > 0 ? `~${h}h ${m}m to full` : `~${m}m to full`
+}
+
+export function fmtMoney(
+  amount: number | null | undefined,
+  currency: string | null | undefined,
+): string {
+  if (amount == null) return "—"
+  const sym = currency || "$"
+  return `${sym}${amount.toFixed(2)}`
+}
+
+export function fmtPercent(pct: number | null | undefined): string {
+  if (pct == null) return "—"
+  return `${Math.round(pct)}%`
 }
 
 export function fmtDuration(secs: number | null | undefined): string {

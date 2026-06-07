@@ -1,10 +1,15 @@
-import { BatteryCharging, Clock, Gauge, Zap } from "lucide-react"
-import { fmtDuration } from "@/lib/charge-format"
+import { BatteryCharging, Clock, DollarSign, Gauge, Leaf, Zap } from "lucide-react"
+import { fmtDuration, fmtMoney, fmtPercent } from "@/lib/charge-format"
 
 export interface ChargingStats {
   count: number
   totalEnergyKwh: number
   totalDurationSecs: number
+  // Null when no session in the set has a cost (no rate configured) /
+  // a computable efficiency. `currency` decorates the cost cell.
+  totalCost: number | null
+  currency: string
+  avgEfficiency: number | null
 }
 
 // Compact stats strip for the Charging page, mirroring the Drives
@@ -60,6 +65,26 @@ export function ChargingSummaryStrip({
             icon={<Gauge className="h-3.5 w-3.5" />}
             label="Avg / session"
             value={`${avgKwh.toFixed(1)} kWh`}
+          />
+        </>
+      )}
+      {stats.avgEfficiency != null && (
+        <>
+          <Divider />
+          <StatCell
+            icon={<Leaf className="h-3.5 w-3.5 text-emerald-300" />}
+            label="Avg efficiency"
+            value={fmtPercent(stats.avgEfficiency)}
+          />
+        </>
+      )}
+      {stats.totalCost != null && (
+        <>
+          <Divider />
+          <StatCell
+            icon={<DollarSign className="h-3.5 w-3.5 text-emerald-300" />}
+            label="Total cost"
+            value={fmtMoney(stats.totalCost, stats.currency)}
           />
         </>
       )}

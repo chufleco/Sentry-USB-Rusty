@@ -18,6 +18,7 @@ export default defineConfig({
         // moved. Each library lives in its own content-hashed file.
         // Vite 8 / Rolldown removed object-form manualChunks; this is
         // the codeSplitting equivalent (matched by node_modules path).
+        // @ts-expect-error rolldown's codeSplitting isn't in rolldown-vite's OutputOptions types yet; valid at runtime.
         codeSplitting: {
           groups: [
             { name: 'vendor-react', test: /[\\/]node_modules[\\/](react|react-dom|react-router|react-router-dom)[\\/]/ },

@@ -22,7 +22,8 @@ import { api } from "@/lib/api"
 import { useKeepAwake } from "@/hooks/useKeepAwake"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { useUpdateAvailable } from "@/hooks/useUpdateAvailable"
-import ChargingBanner from "@/components/charging/ChargingBanner"
+import { fetchCurrentCharge } from "@/api/charging"
+import type { CurrentCharge } from "@/types/charging"
 import type { PiStatus, DriveStats, StorageBreakdown } from "@/lib/api"
 import { wsClient } from "@/lib/ws"
 import { formatUptime, formatBytes, formatTemp } from "@/lib/utils"
@@ -139,6 +140,8 @@ export default function Dashboard() {
   // Polled at 30s — the BLE sampler itself runs once a minute while
   // parked + awake, so anything faster on the UI side is wasted.
   const [carStatusSample, setCarStatusSample] = useState<CarStatusSample | null>(null)
+  // Live charge status for the CarStatusCard battery chip.
+  const [currentCharge, setCurrentCharge] = useState<CurrentCharge | null>(null)
   // ISO end-time of the latest drive on record — used to derive the
   // "Parked Xh Ym" duration. One-shot fetch on mount + a refresh
   // when a drive-process WebSocket completion comes in.
@@ -315,10 +318,21 @@ export default function Dashboard() {
       }
     }
 
+    async function fetchChargeStatus() {
+      try {
+        const c = await fetchCurrentCharge()
+        if (mounted) setCurrentCharge(c)
+      } catch {
+        /* non-critical */
+      }
+    }
+
     fetchCarStatusSample()
     fetchLatestDrive()
     fetchActiveChime()
+    fetchChargeStatus()
     const carStatusInterval = setInterval(fetchCarStatusSample, 30_000)
+    const chargeInterval = setInterval(fetchChargeStatus, 30_000)
     const chimeInterval = setInterval(fetchActiveChime, 300_000)
 
     // Status drives the live-tile values (CPU, mem, temp). 2s is fast
@@ -358,6 +372,7 @@ export default function Dashboard() {
       clearInterval(storageInterval)
       clearInterval(uptimeInterval)
       clearInterval(carStatusInterval)
+      clearInterval(chargeInterval)
       clearInterval(chimeInterval)
       unsubscribe()
     }
@@ -448,8 +463,6 @@ export default function Dashboard() {
         <p className="mt-0.5 text-sm text-slate-500">System overview and status</p>
       </div>
 
-      <ChargingBanner />
-
       <BannerStack banners={banners} />
 
       <CloudStatusBar />
@@ -490,13 +503,15 @@ export default function Dashboard() {
           the car summary on its own row constrained to ~2 tile
           widths so on wide monitors it doesn't stretch into a long
           horizontal strip. */}
-      {carStatusSample && carStatusSample.ts != null && (
+      {(carStatusSample?.ts != null || currentCharge?.soc != null) && (
         <div className="max-w-[640px]">
           <CarStatusCard
             sample={carStatusSample}
             latestDriveEnd={latestDriveEnd}
             tireHistory={tireHistory ?? undefined}
             useFahrenheit={useFahrenheit}
+            metric={metric}
+            currentCharge={currentCharge}
             lockChimeName={activeChimeName}
           />
         </div>

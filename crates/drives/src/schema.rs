@@ -328,6 +328,21 @@ pub const V9_ROUTE_COLUMNS: &[(&str, &str)] = &[
     ("software_version", "TEXT"),
 ];
 
+/// Charging-session tags. Mirrors `drive_tags` but keyed on the charge
+/// session id: its start timestamp in unix seconds, the stable id the
+/// /api/charging endpoints group sessions by. Standalone table created
+/// idempotently on every open, so it needs no `CURRENT_SCHEMA_VERSION`
+/// bump: presence is guaranteed by the `IF NOT EXISTS` itself, and it is
+/// unrelated to the route cache the version key invalidates.
+pub const CHARGE_TAGS_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS charge_tags (
+        session_ts INTEGER NOT NULL,
+        tag        TEXT NOT NULL,
+        PRIMARY KEY (session_ts, tag)
+    ) WITHOUT ROWID",
+    "CREATE INDEX IF NOT EXISTS idx_charge_tags_tag ON charge_tags(tag)",
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -352,6 +367,15 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in V6_NEW_TABLES {
         conn.execute(stmt, [])
             .with_context(|| format!("migrate: applying v6 DDL {:?}", truncate(stmt, 60)))?;
+    }
+
+    // Charging-session tags. Idempotent standalone table; see the
+    // CHARGE_TAGS_TABLE const docs for why it rides outside the version
+    // gate.
+    for stmt in CHARGE_TAGS_TABLE {
+        conn.execute(stmt, []).with_context(|| {
+            format!("migrate: applying charge_tags DDL {:?}", truncate(stmt, 60))
+        })?;
     }
 
     // v2/v3/v4/v6/v7 upgrade: add columns to existing routes tables.

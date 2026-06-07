@@ -204,7 +204,12 @@ pub fn build_router(state: AppState) -> Router {
         // charge columns. Empty unless the experimental flag is on.
         .route("/api/charging", get(crate::charging::list_charging))
         .route("/api/charging/current", get(crate::charging::current_charging))
+        .route("/api/charging/tags", get(crate::charging::list_charge_tags))
         .route("/api/charging/{id}", get(crate::charging::single_charging))
+        .route(
+            "/api/charging/{id}/tags",
+            put(crate::charging::set_charge_tags),
+        )
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))

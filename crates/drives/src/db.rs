@@ -581,6 +581,78 @@ impl DriveStore {
         Ok(tags)
     }
 
+    // ── Charge-session tags ────────────────────────────────────────────
+    // Keyed on the session's start timestamp (unix seconds), the stable
+    // id the /api/charging endpoints group by. No `drive_cache_dirty`
+    // flag: charge tags don't feed the route cache.
+
+    /// Replace the tags for charge session `session_ts`. Empty `tags`
+    /// drops the entry entirely.
+    pub fn set_charge_tags(&self, session_ts: i64, tags: &[String]) -> Result<()> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM charge_tags WHERE session_ts = ?1",
+            params![session_ts],
+        )?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR IGNORE INTO charge_tags(session_ts, tag) VALUES(?1, ?2)",
+            )?;
+            for t in tags {
+                if t.is_empty() {
+                    continue;
+                }
+                stmt.execute(params![session_ts, t])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Tags for one charge session, or an empty vec.
+    pub fn get_charge_tags(&self, session_ts: i64) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT tag FROM charge_tags WHERE session_ts = ?1 ORDER BY tag",
+        )?;
+        let out = stmt
+            .query_map(params![session_ts], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(out)
+    }
+
+    /// Full session_ts → tags map for charge sessions.
+    pub fn get_all_charge_tags(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, Vec<String>>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare_cached(
+            "SELECT session_ts, tag FROM charge_tags ORDER BY session_ts, tag",
+        )?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out = std::collections::HashMap::<i64, Vec<String>>::new();
+        for r in rows {
+            let (k, t) = r?;
+            out.entry(k).or_default().push(t);
+        }
+        Ok(out)
+    }
+
+    /// Every charge tag name in use, sorted and deduplicated.
+    pub fn get_all_charge_tag_names(&self) -> Result<Vec<String>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("SELECT DISTINCT tag FROM charge_tags ORDER BY tag")?;
+        let tags = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        Ok(tags)
+    }
+
     /// Empty `processed_files` so every clip becomes eligible for
     /// re-extraction. Routes and drive_tags are preserved.
     pub fn clear_processed_for_reprocess(&self) -> Result<()> {
@@ -1870,6 +1942,38 @@ mod tests {
             .unwrap();
         let tags = store.get_drive_tags("drive1").unwrap();
         assert_eq!(tags, vec!["Commute".to_string(), "Work".to_string()]);
+    }
+
+    #[test]
+    fn charge_tags_set_get_and_replace() {
+        let store = DriveStore::open_memory().unwrap();
+        // Keyed on the session start-ts; sorted on read.
+        store
+            .set_charge_tags(1700, &["Public".to_string(), "Home".to_string()])
+            .unwrap();
+        assert_eq!(
+            store.get_charge_tags(1700).unwrap(),
+            vec!["Home".to_string(), "Public".to_string()],
+        );
+
+        // A second session is independent.
+        store
+            .set_charge_tags(1800, &["Work".to_string()])
+            .unwrap();
+
+        // Replace semantics: set overwrites, empty drops the entry.
+        store
+            .set_charge_tags(1700, &["Home".to_string()])
+            .unwrap();
+        assert_eq!(store.get_charge_tags(1700).unwrap(), vec!["Home".to_string()]);
+        store.set_charge_tags(1700, &[]).unwrap();
+        assert!(store.get_charge_tags(1700).unwrap().is_empty());
+
+        // The map + name list reflect only what remains (session 1800).
+        let map = store.get_all_charge_tags().unwrap();
+        assert_eq!(map.get(&1800), Some(&vec!["Work".to_string()]));
+        assert!(!map.contains_key(&1700));
+        assert_eq!(store.get_all_charge_tag_names().unwrap(), vec!["Work".to_string()]);
     }
 
     /// End-to-end contract for the `drive_tags` join key.

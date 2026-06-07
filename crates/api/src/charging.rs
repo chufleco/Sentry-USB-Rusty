@@ -16,7 +16,7 @@
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::router::AppState;
 
@@ -38,9 +38,6 @@ struct ChargeRow {
     limit_soc: Option<i64>,
     range_mi: Option<f64>,
     battery_pct: Option<f64>,
-    battery_temp_c: Option<f64>,
-    interior_temp_c: Option<f64>,
-    exterior_temp_c: Option<f64>,
     location: Option<String>,
     lat: Option<f64>,
     lon: Option<f64>,
@@ -65,12 +62,25 @@ struct ChargeSessionSummary {
     location_lat: Option<f64>,
     location_lon: Option<f64>,
     energy_added_kwh: Option<f64>,
+    /// Energy drawn from the charger (wall-side), kWh. Derived by
+    /// integrating charger power; always >= `energy_added_kwh`.
+    energy_used_kwh: Option<f64>,
+    /// Charging efficiency, percent = added / used, clamped to [0, 100].
+    efficiency_pct: Option<f64>,
     peak_power_kw: Option<i64>,
     start_soc: Option<f64>,
     end_soc: Option<f64>,
     start_range_mi: Option<f64>,
     end_range_mi: Option<f64>,
     charge_limit_soc: Option<i64>,
+    /// User-assigned tags + the cost derived from them. Filled per-session
+    /// by `apply_rates`; empty/None until then.
+    tags: Vec<String>,
+    cost: Option<f64>,
+    /// Resolved price-per-kWh used for `cost` (for UI transparency).
+    rate: Option<f64>,
+    /// Currency symbol for `cost` (from prefs, default "$").
+    currency: String,
 }
 
 /// One point on the detail charts. Carries every per-sample series the
@@ -87,9 +97,6 @@ struct ChargePoint {
     soc: Option<f64>,
     range_mi: Option<f64>,
     energy_added_kwh: Option<f64>,
-    battery_temp_c: Option<f64>,
-    interior_temp_c: Option<f64>,
-    exterior_temp_c: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -103,7 +110,6 @@ struct ChargeSessionDetail {
     peak_voltage_v: Option<i64>,
     avg_voltage_v: Option<f64>,
     peak_rate_mph: Option<f64>,
-    avg_battery_temp_c: Option<f64>,
     points: Vec<ChargePoint>,
 }
 
@@ -117,6 +123,101 @@ fn avg(it: impl Iterator<Item = f64>) -> Option<f64> {
         n += 1;
     }
     if n == 0 { None } else { Some(sum / n as f64) }
+}
+
+/// Trapezoidal integral of charger power (kW) over a session's samples,
+/// in kWh. `None` with fewer than two power readings. In-session samples
+/// are <= `SESSION_GAP_SECS` apart by construction, so no gap guard is
+/// needed beyond skipping non-positive dt.
+fn integrate_power_kwh(rows: &[ChargeRow]) -> Option<f64> {
+    let pts: Vec<(i64, f64)> = rows
+        .iter()
+        .filter_map(|r| r.power_kw.map(|p| (r.ts, p as f64)))
+        .collect();
+    if pts.len() < 2 {
+        return None;
+    }
+    let mut kwh = 0.0;
+    for w in pts.windows(2) {
+        let dt_h = (w[1].0 - w[0].0) as f64 / 3600.0;
+        if dt_h > 0.0 {
+            kwh += (w[0].1 + w[1].1) / 2.0 * dt_h;
+        }
+    }
+    if kwh > 0.0 { Some(kwh) } else { None }
+}
+
+/// Electricity-rate config for charge cost, read from user preferences:
+/// `charging_currency` (symbol, default "$"), `charging_default_rate`
+/// (price per kWh), and `charging_tag_rates` (a `{ tag: price-per-kWh }`
+/// map). Each numeric pref may arrive as a JSON number or a numeric
+/// string (the web inputs send strings).
+struct RateConfig {
+    currency: String,
+    default_rate: Option<f64>,
+    tag_rates: std::collections::HashMap<String, f64>,
+}
+
+impl RateConfig {
+    fn load() -> Self {
+        let prefs = crate::preferences::load_prefs();
+        let currency = prefs
+            .get("charging_currency")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("$")
+            .to_string();
+        let default_rate = prefs.get("charging_default_rate").and_then(num_from_json);
+        let tag_rates = prefs
+            .get("charging_tag_rates")
+            .and_then(|v| v.as_object())
+            .map(|m| {
+                m.iter()
+                    .filter_map(|(k, v)| num_from_json(v).map(|r| (k.clone(), r)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            currency,
+            default_rate,
+            tag_rates,
+        }
+    }
+
+    /// Resolved price-per-kWh for a session carrying `tags`: the highest
+    /// rate among its rate-bearing tags, else the global default. Highest
+    /// (not first) so the result is independent of tag order.
+    fn rate_for(&self, tags: &[String]) -> Option<f64> {
+        let tagged = tags
+            .iter()
+            .filter_map(|t| self.tag_rates.get(t).copied())
+            .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))));
+        tagged.or(self.default_rate)
+    }
+}
+
+/// Parse a preference value (JSON number or numeric string) into a
+/// non-negative rate. Negative / non-finite / unparseable → `None`.
+fn num_from_json(v: &serde_json::Value) -> Option<f64> {
+    let n = v
+        .as_f64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<f64>().ok()))?;
+    (n.is_finite() && n >= 0.0).then_some(n)
+}
+
+/// Fill a summary's tag + cost fields. Cost is charged on energy used
+/// (wall-side), so it includes charging loss. `None` cost when no rate
+/// resolves or "used" couldn't be computed.
+fn apply_rates(s: &mut ChargeSessionSummary, tags: Vec<String>, rates: &RateConfig) {
+    let rate = rates.rate_for(&tags);
+    s.cost = match (rate, s.energy_used_kwh) {
+        (Some(r), Some(used)) => Some(r * used),
+        _ => None,
+    };
+    s.rate = rate;
+    s.currency = rates.currency.clone();
+    s.tags = tags;
 }
 
 /// Heuristic "is this row charging?" for pre-v14 rows that don't carry a
@@ -192,8 +293,7 @@ fn load_charge_rows(
     let mut stmt = conn.prepare(
         "SELECT ts, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
                 charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, \
-                battery_range_mi, battery_pct, \
-                battery_temp_c, interior_temp_c, exterior_temp_c, location_name, \
+                battery_range_mi, battery_pct, location_name, \
                 latitude, longitude, charging_state \
          FROM telemetry_samples \
          WHERE ts BETWEEN ?1 AND ?2 \
@@ -213,13 +313,10 @@ fn load_charge_rows(
             limit_soc: r.get(6)?,
             range_mi: r.get(7)?,
             battery_pct: r.get(8)?,
-            battery_temp_c: r.get(9)?,
-            interior_temp_c: r.get(10)?,
-            exterior_temp_c: r.get(11)?,
-            location: r.get(12)?,
-            lat: r.get(13)?,
-            lon: r.get(14)?,
-            charging_state: r.get(15)?,
+            location: r.get(9)?,
+            lat: r.get(10)?,
+            lon: r.get(11)?,
+            charging_state: r.get(12)?,
         })
     })?;
     let mut out = Vec::new();
@@ -260,6 +357,22 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         _ => None,
     };
 
+    // Energy drawn from the charger ("used", wall-side): trapezoidal
+    // integral of charger power over the session. Always >= energy added
+    // (battery-side); the gap is charging loss. Power is integer kW, so
+    // this is an estimate — fine for a badge.
+    let energy_used_kwh = integrate_power_kwh(rows);
+
+    // Charging efficiency = added / used. Clamp to [0, 100]: integer-kW
+    // "used" can dip just under "added" on a short steady charge and
+    // yield a >100% artifact that reads as broken.
+    let efficiency_pct = match (energy_added_kwh, energy_used_kwh) {
+        (Some(added), Some(used)) if used > 0.0 => {
+            Some((added / used * 100.0).clamp(0.0, 100.0))
+        }
+        _ => None,
+    };
+
     ChargeSessionSummary {
         id: first.ts,
         start_ms: first.ts * 1000,
@@ -269,12 +382,19 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         location_lat: rows.iter().find_map(|r| r.lat),
         location_lon: rows.iter().find_map(|r| r.lon),
         energy_added_kwh,
+        energy_used_kwh,
+        efficiency_pct,
         peak_power_kw: rows.iter().filter_map(|r| r.power_kw).max(),
         start_soc: rows.iter().find_map(|r| r.battery_pct),
         end_soc: rows.iter().rev().find_map(|r| r.battery_pct),
         start_range_mi: rows.iter().find_map(|r| r.range_mi),
         end_range_mi: rows.iter().rev().find_map(|r| r.range_mi),
         charge_limit_soc: rows.iter().rev().find_map(|r| r.limit_soc),
+        // Filled by `apply_rates` once tags + the rate config are known.
+        tags: Vec::new(),
+        cost: None,
+        rate: None,
+        currency: String::new(),
     }
 }
 
@@ -291,8 +411,17 @@ pub async fn list_charging(
 
     match result {
         Ok(rows) => {
-            let mut sessions: Vec<ChargeSessionSummary> =
-                group_sessions(rows).iter().map(|s| summarize(s)).collect();
+            let rates = RateConfig::load();
+            let tag_map = state.drives.store.get_all_charge_tags().unwrap_or_default();
+            let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
+                .iter()
+                .map(|s| {
+                    let mut summary = summarize(s);
+                    let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                    apply_rates(&mut summary, tags, &rates);
+                    summary
+                })
+                .collect();
             sessions.sort_by(|a, b| b.id.cmp(&a.id));
             (
                 StatusCode::OK,
@@ -332,7 +461,14 @@ pub async fn single_charging(
         None => return crate::json_error(StatusCode::NOT_FOUND, "charge session not found"),
     };
 
-    let summary = summarize(&session);
+    let mut summary = summarize(&session);
+    let tags = state
+        .drives
+        .store
+        .get_charge_tags(summary.id)
+        .unwrap_or_default();
+    apply_rates(&mut summary, tags, &RateConfig::load());
+
     let points: Vec<ChargePoint> = session
         .iter()
         .map(|r| ChargePoint {
@@ -344,9 +480,6 @@ pub async fn single_charging(
             soc: r.battery_pct,
             range_mi: r.range_mi,
             energy_added_kwh: r.energy_added_kwh,
-            battery_temp_c: r.battery_temp_c,
-            interior_temp_c: r.interior_temp_c,
-            exterior_temp_c: r.exterior_temp_c,
         })
         .collect();
 
@@ -360,7 +493,6 @@ pub async fn single_charging(
             .iter()
             .filter_map(|r| r.rate_mph)
             .fold(None, |acc: Option<f64>, v| Some(acc.map_or(v, |a| a.max(v)))),
-        avg_battery_temp_c: avg(session.iter().filter_map(|r| r.battery_temp_c)),
         summary,
         points,
     };
@@ -484,6 +616,38 @@ pub async fn current_charging(
     (StatusCode::OK, Json(serde_json::to_value(cur).unwrap()))
 }
 
+#[derive(Deserialize)]
+pub struct SetChargeTagsRequest {
+    pub tags: Vec<String>,
+}
+
+/// GET /api/charging/tags — every charge tag in use, sorted.
+pub async fn list_charge_tags(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.drives.store.get_all_charge_tag_names() {
+        Ok(tags) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(tags).unwrap_or_default()),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+/// PUT /api/charging/{id}/tags — set tags for a charge session. `id` is
+/// the session's start timestamp (its stable id), so unlike drives it
+/// needs no resolution to a canonical key.
+pub async fn set_charge_tags(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SetChargeTagsRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match state.drives.store.set_charge_tags(id, &body.tags) {
+        Ok(()) => crate::json_ok(),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -499,9 +663,6 @@ mod tests {
             limit_soc: None,
             range_mi: None,
             battery_pct: None,
-            battery_temp_c: None,
-            interior_temp_c: None,
-            exterior_temp_c: None,
             location: None,
             lat: None,
             lon: None,
@@ -647,14 +808,92 @@ mod tests {
             soc: Some(1.0),
             range_mi: Some(1.0),
             energy_added_kwh: Some(1.0),
-            battery_temp_c: None,
-            interior_temp_c: None,
-            exterior_temp_c: None,
         };
         let jp = serde_json::to_string(&p).unwrap();
         for key in ["powerKw", "currentA", "voltageV", "rateMph", "rangeMi", "energyAddedKwh"] {
             assert!(jp.contains(&format!("\"{key}\"")), "point must emit {key}: {jp}");
         }
         assert!(!jp.contains("\"power_kw\""), "point must NOT emit snake_case: {jp}");
+    }
+
+    // ── Cost + efficiency ──────────────────────────────────────────────
+
+    fn rates(default: Option<f64>, tags: &[(&str, f64)]) -> RateConfig {
+        RateConfig {
+            currency: "$".into(),
+            default_rate: default,
+            tag_rates: tags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+        }
+    }
+
+    #[test]
+    fn rate_for_prefers_highest_tag_rate_then_default() {
+        let r = rates(Some(0.10), &[("Home", 0.12), ("Public", 0.40)]);
+        // No tags, or a tag with no configured rate → default.
+        assert_eq!(r.rate_for(&[]), Some(0.10));
+        assert_eq!(r.rate_for(&["Work".into()]), Some(0.10));
+        // One rate-bearing tag → its rate.
+        assert_eq!(r.rate_for(&["Home".into()]), Some(0.12));
+        // Multiple → highest, independent of order.
+        assert_eq!(r.rate_for(&["Home".into(), "Public".into()]), Some(0.40));
+        assert_eq!(r.rate_for(&["Public".into(), "Home".into()]), Some(0.40));
+    }
+
+    #[test]
+    fn rate_for_is_none_without_default_or_tag_rate() {
+        let r = rates(None, &[]);
+        assert_eq!(r.rate_for(&["Home".into()]), None);
+    }
+
+    #[test]
+    fn num_from_json_accepts_number_or_string_rejects_negative() {
+        assert_eq!(num_from_json(&serde_json::json!(0.30)), Some(0.30));
+        assert_eq!(num_from_json(&serde_json::json!("0.30")), Some(0.30));
+        assert_eq!(num_from_json(&serde_json::json!(0)), Some(0.0));
+        assert_eq!(num_from_json(&serde_json::json!(-1.0)), None);
+        assert_eq!(num_from_json(&serde_json::json!("abc")), None);
+    }
+
+    #[test]
+    fn energy_used_is_trapezoidal_integral_of_power() {
+        // Steady 10 kW across one hour (two samples 3600s apart) = 10 kWh.
+        let used = integrate_power_kwh(&[
+            row(0, Some(10), Some(30.0), Some(0.0)),
+            row(3600, Some(10), Some(30.0), Some(9.0)),
+        ])
+        .unwrap();
+        assert!((used - 10.0).abs() < 1e-9, "expected 10 kWh, got {used}");
+        // Fewer than two power samples → None.
+        assert_eq!(integrate_power_kwh(&[row(0, Some(10), None, None)]), None);
+    }
+
+    #[test]
+    fn summarize_computes_used_and_efficiency_then_apply_rates_costs_on_used() {
+        let session = [
+            row(0, Some(10), Some(30.0), Some(0.0)),
+            row(3600, Some(10), Some(30.0), Some(9.0)),
+        ];
+        let mut s = summarize(&session);
+        assert_eq!(s.energy_added_kwh, Some(9.0)); // battery-side
+        assert_eq!(s.energy_used_kwh, Some(10.0)); // wall-side
+        assert_eq!(s.efficiency_pct.map(|p| p.round()), Some(90.0));
+
+        // Cost is rate × used (not added): 0.30 × 10.0 = 3.00.
+        apply_rates(&mut s, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        assert_eq!(s.tags, vec!["Home".to_string()]);
+        assert_eq!(s.rate, Some(0.30));
+        assert_eq!(s.cost, Some(3.0));
+        assert_eq!(s.currency, "$");
+    }
+
+    #[test]
+    fn apply_rates_leaves_cost_none_when_no_rate() {
+        let mut s = summarize(&[
+            row(0, Some(10), Some(30.0), Some(0.0)),
+            row(3600, Some(10), Some(30.0), Some(9.0)),
+        ]);
+        apply_rates(&mut s, vec![], &rates(None, &[]));
+        assert_eq!(s.cost, None);
+        assert_eq!(s.rate, None);
     }
 }

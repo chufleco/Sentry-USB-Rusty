@@ -1,6 +1,7 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react"
 import { Link } from "react-router-dom"
 import {
+  BatteryCharging,
   BatteryMedium,
   Car,
   ChevronDown,
@@ -11,6 +12,8 @@ import {
   Thermometer,
 } from "lucide-react"
 import type { TireHistoryResponse } from "./TirePressureCard"
+import type { CurrentCharge } from "@/types/charging"
+import { fmtRangeUnit, fmtToFull } from "@/lib/charge-format"
 
 // Lazy-load the chart only when the user expands the Tires chip —
 // recharts (380 KB) stays out of the dashboard's initial bundle for
@@ -40,6 +43,12 @@ interface CarStatusCardProps {
   // the Tires chip's expand affordance entirely (e.g. no telemetry).
   tireHistory?: TireHistoryResponse
   useFahrenheit: boolean
+  // Distance unit for the battery drop-down's range row (true = km).
+  metric: boolean
+  // Live charge status. When the car is charging the Battery chip turns
+  // green and pulses; expanding it shows range, time-to-full and power.
+  // null/undefined hides the chip's expand affordance.
+  currentCharge?: CurrentCharge | null
   // Name of the currently-active lock-chime sound, if the feature
   // is configured. null/undefined hides the indicator entirely so
   // users who don't use lock chimes don't see a confusing chip.
@@ -108,9 +117,12 @@ export function CarStatusCard({
   latestDriveEnd,
   tireHistory,
   useFahrenheit,
+  metric,
+  currentCharge,
   lockChimeName,
 }: CarStatusCardProps) {
   const [tiresOpen, setTiresOpen] = useState(false)
+  const [batteryOpen, setBatteryOpen] = useState(false)
   // Now tick — drives the parked-duration counter forward without
   // needing to re-render the whole dashboard. 1-minute cadence
   // matches the granularity of the displayed value ("5h 31m") so
@@ -137,6 +149,13 @@ export function CarStatusCard({
   const tireStatus = deriveTireStatus(sample)
   const haveTireData =
     !!tireHistory && tireHistory.points.length > 0 && tireStatus.kind !== "none"
+
+  const charging = !!currentCharge?.charging
+  // Prefer the live charge SoC over the last BLE sample's battery_pct.
+  const batterySoc = currentCharge?.soc ?? sample?.battery_pct
+  const haveChargeDetail =
+    currentCharge != null &&
+    (currentCharge.charging || currentCharge.rangeMi != null)
 
   return (
     <div className="glass-card relative p-4">
@@ -178,12 +197,26 @@ export function CarStatusCard({
       {/* Chip row — battery / interior / exterior / tires */}
       <div className="mt-4 flex flex-wrap items-stretch gap-3">
         <StatusChip
-          icon={<BatteryMedium className="h-3.5 w-3.5" />}
-          label="Battery"
-          value={
-            sample?.battery_pct !== undefined && sample?.battery_pct !== null
-              ? `${Math.round(sample.battery_pct)}%`
-              : "—"
+          icon={
+            charging ? (
+              <BatteryCharging className="h-3.5 w-3.5 animate-pulse" />
+            ) : (
+              <BatteryMedium className="h-3.5 w-3.5" />
+            )
+          }
+          label={charging ? "Charging" : "Battery"}
+          value={batterySoc != null ? `${Math.round(batterySoc)}%` : "—"}
+          accent={charging}
+          valueClass={charging ? "text-emerald-300" : undefined}
+          onClick={haveChargeDetail ? () => setBatteryOpen((o) => !o) : undefined}
+          trailing={
+            haveChargeDetail ? (
+              batteryOpen ? (
+                <ChevronUp className="h-3.5 w-3.5 text-slate-500" />
+              ) : (
+                <ChevronDown className="h-3.5 w-3.5 text-slate-500" />
+              )
+            ) : null
           }
         />
         <StatusChip
@@ -214,6 +247,35 @@ export function CarStatusCard({
         />
       </div>
 
+      {/* Battery drop-down — range / time-to-full / power, shown when the
+          chip is expanded. Only the range row appears when idle. */}
+      {batteryOpen && haveChargeDetail && currentCharge && (
+        <div className="mt-4 border-t border-white/[0.06] pt-4">
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            <MiniStat label="Range" value={fmtRangeUnit(currentCharge.rangeMi, metric)} />
+            {charging && (
+              <MiniStat
+                label="Time to full"
+                value={fmtToFull(currentCharge.minutesToFull) ?? "—"}
+              />
+            )}
+            {charging && currentCharge.powerKw != null && (
+              <MiniStat label="Power" value={`${currentCharge.powerKw} kW`} />
+            )}
+            {charging && currentCharge.limitSoc != null && (
+              <MiniStat label="Charge limit" value={`${currentCharge.limitSoc}%`} />
+            )}
+          </div>
+          <Link
+            to="/charging"
+            className="mt-3 inline-flex items-center gap-1 text-xs font-medium text-emerald-300 hover:text-emerald-200"
+          >
+            View charging history
+            <ChevronRight className="h-3.5 w-3.5" />
+          </Link>
+        </div>
+      )}
+
       {/* Expandable chart — only mounts when the user clicks Tires.
           Lazy-loaded so users who don't expand never pull recharts. */}
       {tiresOpen && haveTireData && tireHistory && (
@@ -241,6 +303,8 @@ interface StatusChipProps {
   label: string
   value: string
   valueClass?: string
+  // Green-tinted chip + icon ring, used for the charging state.
+  accent?: boolean
   onClick?: () => void
   trailing?: React.ReactNode
 }
@@ -250,6 +314,7 @@ function StatusChip({
   label,
   value,
   valueClass,
+  accent,
   onClick,
   trailing,
 }: StatusChipProps) {
@@ -259,12 +324,24 @@ function StatusChip({
     <Wrapper
       {...(isButton ? { type: "button", onClick } : {})}
       className={
-        "flex flex-1 min-w-[140px] items-center gap-2.5 rounded-xl border border-white/[0.06] bg-white/[0.025] px-3 py-2 text-left transition-colors " +
-        (isButton ? "hover:bg-white/[0.05] cursor-pointer" : "")
+        "flex flex-1 min-w-[140px] items-center gap-2.5 rounded-xl border px-3 py-2 text-left transition-colors " +
+        (accent
+          ? "border-emerald-400/30 bg-emerald-500/10 "
+          : "border-white/[0.06] bg-white/[0.025] ") +
+        (isButton
+          ? accent
+            ? "hover:bg-emerald-500/15 cursor-pointer"
+            : "hover:bg-white/[0.05] cursor-pointer"
+          : "")
       }
     >
       <span
-        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white/[0.04] ring-1 ring-inset ring-white/10 text-slate-300"
+        className={
+          "flex h-7 w-7 shrink-0 items-center justify-center rounded-full ring-1 ring-inset " +
+          (accent
+            ? "bg-emerald-500/15 ring-emerald-400/30 text-emerald-300"
+            : "bg-white/[0.04] ring-white/10 text-slate-300")
+        }
         aria-hidden
       >
         {icon}
@@ -284,5 +361,18 @@ function StatusChip({
       </div>
       {trailing}
     </Wrapper>
+  )
+}
+
+function MiniStat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[9px] font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </div>
+      <div className="mt-0.5 text-sm font-semibold tabular-nums leading-tight text-slate-100">
+        {value}
+      </div>
+    </div>
   )
 }
