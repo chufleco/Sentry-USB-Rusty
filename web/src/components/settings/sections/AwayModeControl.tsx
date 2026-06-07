@@ -4,6 +4,7 @@ import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Pill, LiveDot } from "@/components/ui/Pill"
+import { Row } from "@/components/ui/StatusTile"
 
 const AWAY_PRESETS = [
   { value: 60, label: "1h" },
@@ -217,6 +218,37 @@ export function AwayModeControl() {
           )}
         </>
       )}
+
+      {/* AP details — folded into the Away Mode card so users see the
+          control and the access-point address together. While inactive,
+          this is a one-line placeholder; while active, it shows the SSID
+          and IP to join from inside the car. */}
+      <div className="space-y-1.5 border-t border-white/5 pt-3">
+        <p className="text-xs font-medium text-slate-400">Access point</p>
+        {isActive ? (
+          status.ap_ssid || status.ap_ip ? (
+            <>
+              {status.ap_ssid && <Row label="SSID" value={status.ap_ssid} />}
+              {status.ap_ip && (
+                <Row
+                  label="IP"
+                  value={<span className="t-mono">{status.ap_ip}</span>}
+                />
+              )}
+              <p className="text-xs text-slate-500">
+                Connect to this network to reach the UI from inside the car.
+              </p>
+            </>
+          ) : (
+            <p className="text-xs text-slate-600">Bringing up the access point…</p>
+          )
+        ) : (
+          <p className="text-xs text-slate-600">
+            Once Away Mode is on, the Pi broadcasts its own WiFi network. The SSID
+            and IP to join will appear here.
+          </p>
+        )}
+      </div>
     </PrefCard>
   )
 }

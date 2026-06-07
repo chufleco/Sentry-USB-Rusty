@@ -1,12 +1,11 @@
 import { Wifi, Cable } from "lucide-react"
 import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
 import { Row } from "@/components/ui/StatusTile"
-import { Pill, LiveDot } from "@/components/ui/Pill"
+import { Pill } from "@/components/ui/Pill"
 import CloudPairingSection from "@/components/CloudPairingSection"
 import { AwayModeControl } from "@/components/settings/sections/AwayModeControl"
 import { BleEnableToggle } from "@/components/settings/sections/BleEnableToggle"
 import { BlePairButton } from "@/components/settings/sections/BlePairButton"
-import { useAwayMode } from "@/hooks/useAwayMode"
 import type { PiStatus } from "@/lib/api"
 
 interface Props {
@@ -14,7 +13,6 @@ interface Props {
 }
 
 export function NetworkTab({ status }: Props) {
-  const { status: awayStatus } = useAwayMode()
   const wifiConnected = !!status?.wifi_ssid
   const ethConnected =
     !!status?.ether_speed && status.ether_speed !== "Unknown!"
@@ -80,51 +78,11 @@ export function NetworkTab({ status }: Props) {
         <BlePairButton />
       </PrefGrid>
 
-      {/* Away Mode — both the control and the active-AP reconnect info now
-          live on this (Network) tab. The control card was previously on the
-          Device tab while only the AP status showed here, which split one
-          feature across two tabs. */}
+      {/* Away Mode — single card owning both the toggle/duration controls
+          and the active-AP details. The AP info used to live in a separate
+          card below; it's now a sub-section inside this card so the user
+          sees one cohesive thing. */}
       <AwayModeControl />
-
-      {/* Away Mode AP — always rendered so the settings layout stays stable.
-          When Away Mode is off, the body is blurred and an overlay explains
-          how to turn it on. The "Live" badge only shows while actually
-          active to avoid claiming liveness when the feature is off. */}
-      <PrefCard
-        icon={<Wifi className="h-3.5 w-3.5" />}
-        halo="blue"
-        title="Away Mode AP"
-        badge={
-          awayStatus.state === "active" ? (
-            <Pill kind="sky">
-              <LiveDot /> Live
-            </Pill>
-          ) : null
-        }
-        disabled={
-          awayStatus.state !== "active"
-            ? {
-                reason:
-                  "Away Mode is off — enable it above to see the AP details.",
-              }
-            : undefined
-        }
-      >
-        <div className="grid items-start gap-2.5 sm:grid-cols-2">
-          <div>
-            {awayStatus.ap_ssid && <Row label="SSID" value={awayStatus.ap_ssid} />}
-            {awayStatus.ap_ip && (
-              <Row
-                label="IP"
-                value={<span className="t-mono">{awayStatus.ap_ip}</span>}
-              />
-            )}
-          </div>
-          <p className="t-xs">
-            Connect to this network to reach the UI while Away Mode is active.
-          </p>
-        </div>
-      </PrefCard>
 
       {/* SentryCloud spans the full width — it has 4 stat boxes + pairing
           input that need room to breathe. */}
