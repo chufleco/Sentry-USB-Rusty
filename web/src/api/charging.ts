@@ -46,3 +46,25 @@ export async function setChargeTags(
   })
   if (!res.ok) throw new Error(`set charge tags ${id}: ${res.status}`)
 }
+
+export interface BulkDeleteChargesResult {
+  deleted: number
+  sessions: number
+}
+
+/// Delete charge sessions by id (their start timestamps). The backend
+/// removes each session's charge-bearing telemetry samples + tags.
+export async function bulkDeleteCharges(
+  ids: Array<string | number>,
+): Promise<BulkDeleteChargesResult> {
+  const res = await fetch("/api/charging/bulk-delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: ids.map(String) }),
+  })
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}))
+    throw new Error(body.error || `bulk-delete: ${res.status}`)
+  }
+  return res.json()
+}

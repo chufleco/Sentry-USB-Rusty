@@ -1,13 +1,23 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { Link } from "react-router-dom"
-import { BatteryCharging, ChevronRight, Loader2, MapPin, Zap } from "lucide-react"
+import { useNavigate } from "react-router-dom"
 import {
+  BatteryCharging,
+  CheckSquare,
+  ChevronRight,
+  Loader2,
+  MapPin,
+  Trash2,
+  Zap,
+} from "lucide-react"
+import {
+  bulkDeleteCharges,
   fetchChargeSessions,
   fetchChargeTags,
   fetchCurrentCharge,
   setChargeTags,
 } from "@/api/charging"
 import type { ChargeSessionSummary, CurrentCharge } from "@/types/charging"
+import { cn } from "@/lib/utils"
 import { DatePopover } from "@/components/drives/DatePopover"
 import { TagPopover } from "@/components/drives/TagPopover"
 import {
@@ -37,9 +47,16 @@ export default function Charging() {
   // the Drives default of Last 7 days (which would usually be empty).
   const [range, setRange] = useState<DateRange>({ kind: "preset", preset: "all" })
 
-  // Refresh sessions + tags + live status. Used after a tag edit or a
-  // rate change so server-computed cost and the tag vocabulary stay in
-  // sync.
+  const [selectMode, setSelectMode] = useState(false)
+  const [selected, setSelected] = useState<Set<number>>(new Set())
+  const [confirmingBulkDelete, setConfirmingBulkDelete] = useState<{
+    ids: number[]
+  } | null>(null)
+  const [deletingBulk, setDeletingBulk] = useState(false)
+  const [bulkDeleteError, setBulkDeleteError] = useState<string | null>(null)
+
+  // Refresh sessions + tags + live status. Used after a tag edit, a rate
+  // change, or a delete so server-computed values stay in sync.
   const reload = useCallback(async () => {
     const [s, t, c] = await Promise.all([
       fetchChargeSessions(),
@@ -113,6 +130,22 @@ export default function Charging() {
     [reload],
   )
 
+  const toggleSelectMode = () => {
+    setSelectMode((s) => {
+      if (s) setSelected(new Set())
+      return !s
+    })
+  }
+
+  const onToggleSelected = useCallback((id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev)
+      if (next.has(id)) next.delete(id)
+      else next.add(id)
+      return next
+    })
+  }, [])
+
   // The newest session is the in-progress one while the car reports
   // charging (sessions come back newest-first).
   const activeId = current?.charging ? (sessions[0]?.id ?? null) : null
@@ -131,6 +164,33 @@ export default function Charging() {
       return true
     })
   }, [sessions, range, selectedTags])
+
+  const onSelectAll = useCallback(() => {
+    setSelected(new Set(visible.map((s) => s.id)))
+  }, [visible])
+
+  const onDeleteSelected = useCallback(() => {
+    if (selected.size === 0) return
+    setBulkDeleteError(null)
+    setConfirmingBulkDelete({ ids: Array.from(selected) })
+  }, [selected])
+
+  const confirmBulkDelete = useCallback(async () => {
+    if (!confirmingBulkDelete) return
+    setDeletingBulk(true)
+    setBulkDeleteError(null)
+    try {
+      await bulkDeleteCharges(confirmingBulkDelete.ids)
+      setConfirmingBulkDelete(null)
+      setSelected(new Set())
+      setSelectMode(false)
+      await reload()
+    } catch (e) {
+      setBulkDeleteError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setDeletingBulk(false)
+    }
+  }, [confirmingBulkDelete, reload])
 
   const stats: ChargingStats = useMemo(() => {
     const costs = visible
@@ -159,7 +219,7 @@ export default function Charging() {
         </h1>
       </div>
 
-      <div className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <DatePopover range={range} onChange={setRange} />
         <ChargingTagFilter
           tags={tags}
@@ -167,10 +227,34 @@ export default function Charging() {
           onChange={setSelectedTags}
         />
         <ChargingRatesButton tags={tags} onSaved={reload} />
-        <ChargingSummaryStrip stats={stats} loading={loading} />
+        {!selectMode && (
+          <div className="ml-3 min-w-0 flex-1">
+            <ChargingSummaryStrip stats={stats} loading={loading} />
+          </div>
+        )}
+        <div className="ml-auto flex flex-wrap items-center gap-2">
+          {selectMode ? (
+            <ChargingSelectBar
+              selectedCount={selected.size}
+              totalCount={visible.length}
+              onSelectAll={onSelectAll}
+              onDelete={onDeleteSelected}
+              onCancel={toggleSelectMode}
+            />
+          ) : (
+            <button
+              type="button"
+              onClick={toggleSelectMode}
+              className="inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.03] px-3.5 py-1.5 text-sm font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
+            >
+              <CheckSquare className="h-4 w-4" />
+              Select
+            </button>
+          )}
+        </div>
       </div>
 
-      <div className="flex flex-col gap-3">
+      <div className="mt-4 flex flex-col gap-3">
         {loading && (
           <div className="flex items-center justify-center gap-2 rounded-2xl border border-white/[0.06] bg-white/[0.025] p-10 text-sm text-slate-400">
             <Loader2 className="h-4 w-4 animate-spin" />
@@ -198,10 +282,106 @@ export default function Charging() {
               metric={metric}
               active={s.id === activeId}
               livePowerKw={s.id === activeId ? (current?.powerKw ?? null) : null}
+              selectMode={selectMode}
+              selected={selected.has(s.id)}
+              onToggleSelected={onToggleSelected}
               onTagsChange={onTagsChange}
             />
           ))}
       </div>
+
+      {confirmingBulkDelete && (
+        <div className="fixed inset-0 z-[2000] flex items-center justify-center bg-black/60 backdrop-blur-sm">
+          <div className="w-full max-w-sm rounded-2xl border border-white/10 bg-slate-950 p-6 shadow-2xl">
+            <h3 className="text-base font-semibold text-slate-100">
+              {confirmingBulkDelete.ids.length === 1
+                ? "Delete 1 charge?"
+                : `Delete ${confirmingBulkDelete.ids.length} charges?`}
+            </h3>
+            <p className="mt-2 text-xs leading-relaxed text-slate-400">
+              This removes the selected charge session
+              {confirmingBulkDelete.ids.length === 1 ? "" : "s"} and their
+              telemetry samples from the database. The action cannot be undone.
+            </p>
+            {bulkDeleteError && (
+              <p className="mt-3 text-xs text-rose-300">{bulkDeleteError}</p>
+            )}
+            <div className="mt-5 flex items-center justify-end gap-2">
+              <button
+                type="button"
+                disabled={deletingBulk}
+                onClick={() => setConfirmingBulkDelete(null)}
+                className="rounded-lg border border-white/10 bg-white/[0.03] px-4 py-1.5 text-xs font-medium text-slate-300 hover:bg-white/[0.06] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                disabled={deletingBulk}
+                onClick={confirmBulkDelete}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-rose-600 px-4 py-1.5 text-xs font-medium text-white transition-colors hover:bg-rose-500 disabled:opacity-50"
+              >
+                {deletingBulk ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="h-3.5 w-3.5" />
+                )}
+                {deletingBulk
+                  ? "Deleting…"
+                  : confirmingBulkDelete.ids.length === 1
+                    ? "Delete charge"
+                    : `Delete ${confirmingBulkDelete.ids.length} charges`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function ChargingSelectBar({
+  selectedCount,
+  totalCount,
+  onSelectAll,
+  onDelete,
+  onCancel,
+}: {
+  selectedCount: number
+  totalCount: number
+  onSelectAll: () => void
+  onDelete: () => void
+  onCancel: () => void
+}) {
+  const hasSelection = selectedCount > 0
+  return (
+    <div className="flex items-center gap-2">
+      <span className="mr-1 text-sm text-slate-400">
+        {selectedCount} of {totalCount} selected
+      </span>
+      <button
+        type="button"
+        disabled={!hasSelection}
+        onClick={onDelete}
+        className="inline-flex items-center gap-1.5 rounded-full bg-rose-500/95 px-3 py-1 text-xs font-medium text-white transition-colors hover:bg-rose-400 disabled:opacity-50"
+      >
+        <Trash2 className="h-3.5 w-3.5" />
+        Delete
+      </button>
+      <button
+        type="button"
+        onClick={onSelectAll}
+        className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
+      >
+        Select all
+      </button>
+      <button
+        type="button"
+        onClick={onCancel}
+        className="inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.03] px-3 py-1 text-xs font-medium text-slate-200 transition-colors hover:bg-white/[0.06]"
+      >
+        Cancel
+      </button>
     </div>
   )
 }
@@ -211,15 +391,30 @@ function ChargeRow({
   metric,
   active,
   livePowerKw,
+  selectMode,
+  selected,
+  onToggleSelected,
   onTagsChange,
 }: {
   session: ChargeSessionSummary
   metric: boolean
   active: boolean
   livePowerKw: number | null
+  selectMode: boolean
+  selected: boolean
+  onToggleSelected: (id: number) => void
   onTagsChange: (id: number, tags: string[]) => Promise<void> | void
 }) {
+  const navigate = useNavigate()
   const start = new Date(session.startMs)
+  const onRowClick = () => {
+    if (selectMode) {
+      onToggleSelected(session.id)
+      return
+    }
+    navigate(`/charging/${session.id}`)
+  }
+
   // Two forms so the SoC range degrades instead of vanishing when the
   // row is tight: `socShort` is always shown ("62% → 79%"); the range
   // ("62% (132 mi) → …") only appears when there's room (sm+).
@@ -243,15 +438,46 @@ function ChargeRow({
         : "—"
 
   return (
-    <Link
-      to={`/charging/${session.id}`}
-      className={
-        "group flex items-center gap-3 rounded-2xl border p-3 transition-colors sm:gap-4 sm:p-4 " +
-        (active
-          ? "border-emerald-400/30 bg-emerald-500/10 hover:bg-emerald-500/15"
-          : "border-white/[0.06] bg-white/[0.025] hover:border-white/10 hover:bg-white/[0.04]")
-      }
+    <div
+      role="button"
+      tabIndex={0}
+      onClick={onRowClick}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault()
+          onRowClick()
+        }
+      }}
+      className={cn(
+        "group flex cursor-pointer items-center gap-3 rounded-2xl border p-3 transition-colors sm:gap-4 sm:p-4",
+        selected
+          ? "border-emerald-400/40 bg-emerald-400/[0.06]"
+          : active
+            ? "border-emerald-400/30 bg-emerald-500/10 hover:bg-emerald-500/15"
+            : "border-white/[0.06] bg-white/[0.025] hover:border-white/10 hover:bg-white/[0.04]",
+      )}
     >
+      {selectMode && (
+        <span
+          aria-hidden
+          className={cn(
+            "flex h-5 w-5 shrink-0 items-center justify-center rounded border-2 transition-colors",
+            selected ? "border-emerald-400 bg-emerald-400" : "border-white/30",
+          )}
+        >
+          {selected && (
+            <svg viewBox="0 0 12 12" className="h-3 w-3 text-slate-950">
+              <path
+                d="M2 6.5 L5 9.5 L10 3.5"
+                stroke="currentColor"
+                strokeWidth="2"
+                fill="none"
+              />
+            </svg>
+          )}
+        </span>
+      )}
+
       <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-500/10 text-emerald-300 ring-1 ring-inset ring-emerald-500/20">
         <BatteryCharging className={"h-5 w-5" + (active ? " animate-pulse" : "")} />
       </span>
@@ -316,7 +542,7 @@ function ChargeRow({
         )}
       </div>
 
-      <div onClick={(e) => e.preventDefault()}>
+      <div onClick={(e) => e.stopPropagation()}>
         <TagPopover
           tags={session.tags}
           onChange={(t) => onTagsChange(session.id, t)}
@@ -332,7 +558,7 @@ function ChargeRow({
       )}
 
       <ChevronRight className="h-4 w-4 shrink-0 text-slate-600 transition-colors group-hover:text-slate-400" />
-    </Link>
+    </div>
   )
 }
 

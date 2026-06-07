@@ -22,12 +22,42 @@ const LEFT_MARGIN = 4
 const RIGHT_MARGIN = 8
 const YAXIS_WIDTH = 40
 
-export default function ChargePowerChart({ points }: { points: ChargePoint[] }) {
+type ChartPoint = ChargePoint & { socProjected?: number | null }
+
+export default function ChargePowerChart({
+  points,
+  projection,
+}: {
+  points: ChargePoint[]
+  // Dashed SoC continuation from the last sample to the charge limit,
+  // shown while a charge is in progress. Omit for completed sessions.
+  projection?: { ts: number; soc: number }[]
+}) {
+  const hasProjection = !!projection && projection.length > 0
+  // The last actual point carries `socProjected` too, so the dashed line
+  // joins the solid one instead of starting from a gap.
+  const data: ChartPoint[] = [
+    ...points.map((p, i) => ({
+      ...p,
+      socProjected: hasProjection && i === points.length - 1 ? p.soc : null,
+    })),
+    ...(projection ?? []).map((pp) => ({
+      ts: pp.ts,
+      powerKw: null,
+      currentA: null,
+      voltageV: null,
+      rateMph: null,
+      soc: null,
+      rangeMi: null,
+      energyAddedKwh: null,
+      socProjected: pp.soc,
+    })),
+  ]
   return (
     <div className="h-56 w-full" aria-label="Charging power and state-of-charge chart">
       <ResponsiveContainer minHeight={0} minWidth={0}>
         <LineChart
-          data={points}
+          data={data}
           margin={{ top: 10, right: RIGHT_MARGIN, bottom: 24, left: LEFT_MARGIN }}
         >
           <CartesianGrid stroke="#1e242f" strokeDasharray="3 3" vertical={false} />
@@ -69,7 +99,7 @@ export default function ChargePowerChart({ points }: { points: ChargePoint[] }) 
           <Tooltip
             content={({ active, payload }) => {
               if (!active || !payload || payload.length === 0) return null
-              const p = payload[0].payload as ChargePoint
+              const p = payload[0].payload as ChartPoint
               return (
                 <div className="rounded-md border border-white/10 bg-slate-900/95 px-2 py-1.5 text-xs text-slate-200 shadow-xl">
                   <div className="mb-1 text-[10px] text-slate-500 tabular-nums">
@@ -80,6 +110,13 @@ export default function ChargePowerChart({ points }: { points: ChargePoint[] }) 
                   )}
                   {p.soc != null && (
                     <Row color={SOC_COLOR} label="Battery" value={`${Math.round(p.soc)}%`} />
+                  )}
+                  {p.soc == null && p.socProjected != null && (
+                    <Row
+                      color={SOC_COLOR}
+                      label="Projected"
+                      value={`${Math.round(p.socProjected)}%`}
+                    />
                   )}
                   {/* Range intentionally omitted here — it has its own chart
                       below and just duplicates the battery curve in miles. */}
@@ -115,6 +152,20 @@ export default function ChargePowerChart({ points }: { points: ChargePoint[] }) 
             isAnimationActive={false}
             connectNulls
           />
+          {hasProjection && (
+            <Line
+              yAxisId="soc"
+              type="monotone"
+              name="Projected"
+              dataKey="socProjected"
+              stroke={SOC_COLOR}
+              strokeWidth={2}
+              strokeDasharray="4 4"
+              dot={false}
+              isAnimationActive={false}
+              connectNulls
+            />
+          )}
         </LineChart>
       </ResponsiveContainer>
     </div>

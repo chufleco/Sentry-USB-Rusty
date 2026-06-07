@@ -648,6 +648,70 @@ pub async fn set_charge_tags(
     }
 }
 
+#[derive(Deserialize)]
+pub struct BulkDeleteChargesRequest {
+    pub ids: Vec<String>,
+}
+
+/// POST /api/charging/bulk-delete — delete charge sessions by id (their
+/// start timestamps). A session isn't a stored row; deleting it means
+/// removing the charge-bearing telemetry samples in its window (and its
+/// tags). The session is derived from those samples, so it disappears
+/// once they're gone; non-charge samples in the window are preserved.
+pub async fn bulk_delete_charges(
+    State(state): State<AppState>,
+    Json(body): Json<BulkDeleteChargesRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if body.ids.is_empty() {
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": 0, "sessions": 0 })),
+        );
+    }
+    let ids: Vec<i64> = body.ids.iter().filter_map(|s| s.parse::<i64>().ok()).collect();
+
+    let result = state
+        .drives
+        .store
+        .with_locked_conn(|conn| -> anyhow::Result<(usize, usize)> {
+            let mut deleted = 0usize;
+            let mut sessions = 0usize;
+            for id in &ids {
+                // Re-derive the session window from its start id (bounded
+                // scan, same as single_charging), then drop its samples.
+                let window_end = *id + 7 * 24 * 60 * 60;
+                let rows = load_charge_rows(conn, *id, Some(window_end))?;
+                let session = match group_sessions(rows).into_iter().next() {
+                    Some(s) if !s.is_empty() => s,
+                    _ => continue,
+                };
+                let start = session.first().unwrap().ts;
+                let end = session.last().unwrap().ts;
+                deleted += conn.execute(
+                    "DELETE FROM telemetry_samples WHERE ts BETWEEN ?1 AND ?2 \
+                     AND (charging_state IS NOT NULL \
+                          OR charger_power_kw IS NOT NULL \
+                          OR charge_rate_mph IS NOT NULL)",
+                    rusqlite::params![start, end],
+                )?;
+                conn.execute(
+                    "DELETE FROM charge_tags WHERE session_ts = ?1",
+                    rusqlite::params![start],
+                )?;
+                sessions += 1;
+            }
+            Ok((deleted, sessions))
+        });
+
+    match result {
+        Ok((deleted, sessions)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "deleted": deleted, "sessions": sessions })),
+        ),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useMemo, useState } from "react"
 import { Link, useParams } from "react-router-dom"
 import {
   ArrowLeft,
@@ -11,8 +11,12 @@ import {
   Plug,
   Zap,
 } from "lucide-react"
-import { fetchChargeSession, setChargeTags } from "@/api/charging"
-import type { ChargeSessionDetail } from "@/types/charging"
+import {
+  fetchChargeSession,
+  fetchCurrentCharge,
+  setChargeTags,
+} from "@/api/charging"
+import type { ChargeSessionDetail, CurrentCharge } from "@/types/charging"
 import { SectionHeading, StatTile } from "@/components/drives/StatTile"
 import { TagPopover } from "@/components/drives/TagPopover"
 import ChargePowerChart from "@/components/charging/ChargePowerChart"
@@ -35,6 +39,10 @@ export default function ChargeSessionDetailPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const metric = useDistanceUnit()
+  const [current, setCurrent] = useState<CurrentCharge | null>(null)
+  // `nowMs` ticks from the poll below so the in-progress check doesn't
+  // read Date.now() during render (React 19 rule).
+  const [nowMs, setNowMs] = useState(() => Date.now())
 
   useEffect(() => {
     if (!id) return
@@ -74,6 +82,34 @@ export default function ChargeSessionDetailPage() {
     [id],
   )
 
+  // Live status: refresh the in-progress charge + drive its projection.
+  useEffect(() => {
+    if (!id) return
+    let cancelled = false
+    const tick = async () => {
+      const c = await fetchCurrentCharge().catch(() => null)
+      if (cancelled) return
+      setNowMs(Date.now())
+      if (c) setCurrent(c)
+      if (c?.charging) {
+        try {
+          const s = await fetchChargeSession(id)
+          if (!cancelled) setSession(s)
+        } catch {
+          /* keep the current view on a transient error */
+        }
+      }
+    }
+    tick()
+    const interval = setInterval(() => {
+      if (!document.hidden) tick()
+    }, 30_000)
+    return () => {
+      cancelled = true
+      clearInterval(interval)
+    }
+  }, [id])
+
   const rangeAdded =
     session?.startRangeMi != null && session?.endRangeMi != null
       ? session.endRangeMi - session.startRangeMi
@@ -91,6 +127,37 @@ export default function ChargeSessionDetailPage() {
         rangeMi: p.rangeMi == null ? null : p.rangeMi * 1.609344,
       }))
     : (session?.points ?? [])
+
+  const lastPoint = session?.points[session.points.length - 1]
+  // In progress when the live status says charging and this session's
+  // last sample is recent — so viewing an old session during a different
+  // ongoing charge doesn't wrongly show a projection.
+  const inProgress =
+    !!current?.charging &&
+    session != null &&
+    nowMs - session.endMs < 15 * 60 * 1000
+  const projMins = inProgress ? (current?.minutesToFull ?? null) : null
+  // Dashed projection from the last sample to the charge limit over the
+  // reported time-to-full.
+  const projection = useMemo(() => {
+    if (!inProgress || projMins == null || projMins <= 0 || !lastPoint) {
+      return undefined
+    }
+    const limit = current?.limitSoc ?? 100
+    const lastSoc = lastPoint.soc ?? current?.soc ?? null
+    if (lastSoc == null || limit <= lastSoc) return undefined
+    return [{ ts: lastPoint.ts + projMins * 60_000, soc: limit }]
+  }, [inProgress, projMins, lastPoint, current])
+  const remaining =
+    projMins != null && projMins > 0
+      ? projMins >= 60
+        ? `${Math.floor(projMins / 60)}h ${projMins % 60}m`
+        : `${projMins}m`
+      : null
+  const etaLabel =
+    projMins != null && projMins > 0
+      ? formatEndLabel(nowMs, nowMs + projMins * 60_000)
+      : null
 
   return (
     <div className="mx-auto w-full max-w-3xl px-4 py-6 sm:px-6 sm:py-8">
@@ -135,6 +202,31 @@ export default function ChargeSessionDetailPage() {
             <TagPopover tags={session.tags} onChange={onTagsChange} />
           </div>
 
+          {inProgress && (
+            <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-2.5 text-sm text-emerald-200 tabular-nums">
+              <BatteryCharging className="h-4 w-4 shrink-0 animate-pulse" />
+              <span className="font-medium text-emerald-100">Charging</span>
+              {remaining && (
+                <>
+                  <span className="text-emerald-400/50">·</span>
+                  <span>{remaining} left</span>
+                </>
+              )}
+              {etaLabel && (
+                <>
+                  <span className="text-emerald-400/50">·</span>
+                  <span>full by {etaLabel}</span>
+                </>
+              )}
+              {current?.powerKw != null && (
+                <>
+                  <span className="text-emerald-400/50">·</span>
+                  <span>{current.powerKw} kW</span>
+                </>
+              )}
+            </div>
+          )}
+
           {session.locationLat != null && session.locationLon != null && (
             <MiniPinMap
               lat={session.locationLat}
@@ -146,88 +238,96 @@ export default function ChargeSessionDetailPage() {
 
           <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-5">
             <SectionHeading>Session</SectionHeading>
-            <div className="grid grid-cols-2 gap-4 sm:grid-cols-3">
-              <StatTile
-                label="Energy added"
-                value={fmtEnergy(session.energyAddedKwh)}
-                icon={<BatteryCharging className="h-4 w-4" />}
-                info="Energy added to the battery this session (reported by the car)."
-              />
-              <StatTile
-                label="Energy used"
-                value={fmtEnergy(session.energyUsedKwh)}
-                icon={<Zap className="h-4 w-4" />}
-                info="Energy drawn from the charger (wall-side), estimated by integrating charging power. Higher than energy added — the difference is charging loss."
-              />
-              <StatTile
-                label="Efficiency"
-                value={fmtPercent(session.efficiencyPct)}
-                icon={<Leaf className="h-4 w-4" />}
-                info="Energy added to the battery divided by energy drawn from the charger."
-              />
-              <StatTile
-                label="Cost"
-                value={
-                  session.cost != null
-                    ? fmtMoney(session.cost, session.currency)
-                    : "—"
-                }
-                icon={<DollarSign className="h-4 w-4" />}
-                info={
-                  session.rate != null
-                    ? `Charged on energy used at ${fmtMoney(session.rate, session.currency)}/kWh. Set rates from the Charging page.`
-                    : "Set an electricity rate from the Charging page to see cost."
-                }
-              />
-              <StatTile
-                label="Peak power"
-                value={fmtPower(session.peakPowerKw)}
-                icon={<Zap className="h-4 w-4" />}
-                info={
-                  session.avgPowerKw != null
-                    ? `Highest charging power seen this session. Average ${Math.round(session.avgPowerKw)} kW.`
-                    : "Highest charging power seen this session."
-                }
-              />
-              <StatTile
-                label="Battery"
-                value={
-                  session.startSoc != null && session.endSoc != null
-                    ? `${fmtSoc(session.startSoc)} → ${fmtSoc(session.endSoc)}`
-                    : fmtSoc(session.endSoc)
-                }
-                icon={<BatteryCharging className="h-4 w-4" />}
-                info="State of charge at start and end."
-              />
-              <StatTile
-                label="Range added"
-                value={rangeAdded != null ? fmtRangeUnit(rangeAdded, metric) : "—"}
-                icon={<Gauge className="h-4 w-4" />}
-                info="Rated range gained this session."
-              />
-              <StatTile
-                label="Peak current"
-                value={session.peakCurrentA != null ? `${session.peakCurrentA} A` : "—"}
-                icon={<Plug className="h-4 w-4" />}
-              />
-              <StatTile
-                label="Voltage"
-                value={session.peakVoltageV != null ? `${session.peakVoltageV} V` : "—"}
-                icon={<Zap className="h-4 w-4" />}
-              />
-              <StatTile
-                label="Charge limit"
-                value={fmtSoc(session.chargeLimitSoc)}
-                icon={<BatteryCharging className="h-4 w-4" />}
-                info="Target state of charge for this session."
-              />
+            <div className="space-y-5">
+              <StatGroup label="Energy">
+                <StatTile
+                  label="Energy added"
+                  value={fmtEnergy(session.energyAddedKwh)}
+                  icon={<BatteryCharging className="h-4 w-4" />}
+                  info="Energy added to the battery this session (reported by the car)."
+                />
+                <StatTile
+                  label="Energy used"
+                  value={fmtEnergy(session.energyUsedKwh)}
+                  icon={<Zap className="h-4 w-4" />}
+                  info="Energy drawn from the charger (wall-side), estimated by integrating charging power. Higher than energy added — the difference is charging loss."
+                />
+                <StatTile
+                  label="Efficiency"
+                  value={fmtPercent(session.efficiencyPct)}
+                  icon={<Leaf className="h-4 w-4" />}
+                  info="Energy added to the battery divided by energy drawn from the charger."
+                />
+                <StatTile
+                  label="Cost"
+                  value={
+                    session.cost != null
+                      ? fmtMoney(session.cost, session.currency)
+                      : "—"
+                  }
+                  icon={<DollarSign className="h-4 w-4" />}
+                  info={
+                    session.rate != null
+                      ? `Charged on energy used at ${fmtMoney(session.rate, session.currency)}/kWh. Set rates from the Charging page.`
+                      : "Set an electricity rate from the Charging page to see cost."
+                  }
+                />
+              </StatGroup>
+
+              <StatGroup label="Battery & range">
+                <StatTile
+                  label="Battery"
+                  value={
+                    session.startSoc != null && session.endSoc != null
+                      ? `${fmtSoc(session.startSoc)} → ${fmtSoc(session.endSoc)}`
+                      : fmtSoc(session.endSoc)
+                  }
+                  icon={<BatteryCharging className="h-4 w-4" />}
+                  info="State of charge at start and end."
+                />
+                <StatTile
+                  label="Range added"
+                  value={rangeAdded != null ? fmtRangeUnit(rangeAdded, metric) : "—"}
+                  icon={<Gauge className="h-4 w-4" />}
+                  info="Rated range gained this session."
+                />
+                <StatTile
+                  label="Charge limit"
+                  value={fmtSoc(session.chargeLimitSoc)}
+                  icon={<BatteryCharging className="h-4 w-4" />}
+                  info="Target state of charge for this session."
+                />
+              </StatGroup>
+
+              <StatGroup label="Power">
+                <StatTile
+                  label="Peak power"
+                  value={fmtPower(session.peakPowerKw)}
+                  icon={<Zap className="h-4 w-4" />}
+                  info={
+                    session.avgPowerKw != null
+                      ? `Highest charging power seen this session. Average ${Math.round(session.avgPowerKw)} kW.`
+                      : "Highest charging power seen this session."
+                  }
+                />
+                <StatTile
+                  label="Peak current"
+                  value={session.peakCurrentA != null ? `${session.peakCurrentA} A` : "—"}
+                  icon={<Plug className="h-4 w-4" />}
+                />
+                <StatTile
+                  label="Voltage"
+                  value={session.peakVoltageV != null ? `${session.peakVoltageV} V` : "—"}
+                  icon={<Zap className="h-4 w-4" />}
+                />
+              </StatGroup>
             </div>
           </div>
 
           {session.points.length > 1 && (
             <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-5">
               <SectionHeading>Power &amp; battery</SectionHeading>
-              <ChargePowerChart points={session.points} />
+              <ChargePowerChart points={session.points} projection={projection} />
             </div>
           )}
 
@@ -264,7 +364,6 @@ export default function ChargeSessionDetailPage() {
               />
             </div>
           )}
-
         </div>
       )}
     </div>
@@ -299,5 +398,26 @@ function formatEndLabel(startMs: number, endMs: number): string {
           hour: "numeric",
           minute: "2-digit",
         },
+  )
+}
+
+// Labelled cluster of stat tiles, so the Session card reads as a few
+// small groups instead of one dense block.
+function StatGroup({
+  label,
+  children,
+}: {
+  label: string
+  children: React.ReactNode
+}) {
+  return (
+    <div>
+      <div className="mb-3 text-[11px] font-semibold uppercase tracking-wider text-slate-500">
+        {label}
+      </div>
+      <div className="grid grid-cols-2 gap-x-4 gap-y-4 sm:grid-cols-3">
+        {children}
+      </div>
+    </div>
   )
 }

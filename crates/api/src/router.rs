@@ -205,6 +205,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/charging", get(crate::charging::list_charging))
         .route("/api/charging/current", get(crate::charging::current_charging))
         .route("/api/charging/tags", get(crate::charging::list_charge_tags))
+        .route(
+            "/api/charging/bulk-delete",
+            post(crate::charging::bulk_delete_charges),
+        )
         .route("/api/charging/{id}", get(crate::charging::single_charging))
         .route(
             "/api/charging/{id}/tags",

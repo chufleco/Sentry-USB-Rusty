@@ -81,10 +81,12 @@ export function MiniPinMap({
     }
   }, [visible, lat, lon, zoom])
 
+  // `isolate` contains Leaflet's pane z-indexes (up to ~700) within this
+  // box so they can't paint over page UI like the tag popover.
   return (
     <div
       ref={containerRef}
-      className={`relative shrink-0 overflow-hidden rounded-lg bg-slate-900/60 ring-1 ring-inset ring-white/5 ${className}`}
+      className={`relative isolate shrink-0 overflow-hidden rounded-lg bg-slate-900/60 ring-1 ring-inset ring-white/5 ${className}`}
       role="img"
       aria-label="Charge location"
     />
