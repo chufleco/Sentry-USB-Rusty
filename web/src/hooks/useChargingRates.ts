@@ -1,24 +1,37 @@
 import { useCallback, useEffect, useState } from "react"
 
 // Electricity rates used to cost charge sessions. Persisted in the
-// generic preference store (/api/config/preference) under three keys the
+// generic preference store (/api/config/preference) under the keys the
 // backend reads in crates/api/src/charging.rs (RateConfig):
 //   charging_currency      — symbol string, default "$"
 //   charging_default_rate  — price per kWh for untagged / fallback
 //   charging_tag_rates     — { tag: price-per-kWh } overrides
+//   charging_tou_enabled   — use the time-of-use schedule below
+//   charging_tou_periods   — [{ label, start, end, rate }] (local HH:MM)
 // The session cost itself is computed server-side and returned on each
 // session; this hook only reads/writes the inputs.
+
+export interface TouPeriod {
+  label: string
+  start: string // local "HH:MM"
+  end: string // local "HH:MM"; an end before start wraps past midnight
+  rate: number
+}
 
 export interface ChargingRates {
   currency: string
   defaultRate: number | null
   tagRates: Record<string, number>
+  touEnabled: boolean
+  touPeriods: TouPeriod[]
 }
 
 const DEFAULT_RATES: ChargingRates = {
   currency: "$",
   defaultRate: null,
   tagRates: {},
+  touEnabled: false,
+  touPeriods: [],
 }
 
 async function getPref<T>(key: string): Promise<T | null> {
@@ -55,6 +68,28 @@ function toRate(v: unknown): number | null {
   return Number.isFinite(n) && n >= 0 ? n : null
 }
 
+const TIME_RE = /^\d{1,2}:\d{2}$/
+
+function parsePeriods(raw: unknown): TouPeriod[] {
+  if (!Array.isArray(raw)) return []
+  const out: TouPeriod[] = []
+  for (const p of raw) {
+    if (!p || typeof p !== "object") continue
+    const o = p as Record<string, unknown>
+    const rate = toRate(o.rate)
+    const start = typeof o.start === "string" ? o.start : ""
+    const end = typeof o.end === "string" ? o.end : ""
+    if (rate == null || !TIME_RE.test(start) || !TIME_RE.test(end)) continue
+    out.push({
+      label: typeof o.label === "string" ? o.label : "",
+      start,
+      end,
+      rate,
+    })
+  }
+  return out
+}
+
 export function useChargingRates() {
   const [rates, setRates] = useState<ChargingRates>(DEFAULT_RATES)
   const [loading, setLoading] = useState(true)
@@ -68,7 +103,9 @@ export function useChargingRates() {
       getPref<string>("charging_currency"),
       getPref<number | string>("charging_default_rate"),
       getPref<Record<string, unknown>>("charging_tag_rates"),
-    ]).then(([currency, defaultRate, tagRates]) => {
+      getPref<boolean | string>("charging_tou_enabled"),
+      getPref<unknown[]>("charging_tou_periods"),
+    ]).then(([currency, defaultRate, tagRates, touEnabled, touPeriods]) => {
       if (cancelled) return
       const cleanTagRates: Record<string, number> = {}
       if (tagRates && typeof tagRates === "object") {
@@ -81,6 +118,8 @@ export function useChargingRates() {
         currency: currency && currency.trim() ? currency.trim() : "$",
         defaultRate: toRate(defaultRate),
         tagRates: cleanTagRates,
+        touEnabled: touEnabled === true || touEnabled === "true",
+        touPeriods: parsePeriods(touPeriods),
       })
       setLoading(false)
     })
@@ -94,6 +133,8 @@ export function useChargingRates() {
       putPref("charging_currency", next.currency || "$"),
       putPref("charging_default_rate", next.defaultRate),
       putPref("charging_tag_rates", next.tagRates),
+      putPref("charging_tou_enabled", next.touEnabled),
+      putPref("charging_tou_periods", next.touPeriods),
     ])
     setRates(next)
   }, [])

@@ -1,12 +1,21 @@
 import { useEffect, useRef, useState } from "react"
-import { Settings2 } from "lucide-react"
-import { useChargingRates } from "@/hooks/useChargingRates"
+import { Plus, Settings2, X } from "lucide-react"
+import { useChargingRates, type TouPeriod } from "@/hooks/useChargingRates"
+
+interface PeriodDraft {
+  label: string
+  start: string
+  end: string
+  rate: string
+}
+
+const TIME_RE = /^\d{1,2}:\d{2}$/
 
 // Opens an editor for the electricity rates used to cost charge
-// sessions: a currency symbol, a default price-per-kWh, and an optional
-// per-tag override for each known charging tag. Saving persists the
-// prefs and calls `onSaved` so the page can refetch sessions (cost is
-// computed server-side from these values).
+// sessions: a currency symbol, a default price-per-kWh, an optional
+// per-tag override, and an optional time-of-use schedule. Saving
+// persists the prefs and calls `onSaved` so the page can refetch
+// sessions (cost is computed server-side from these values).
 export function ChargingRatesButton({
   tags,
   onSaved,
@@ -21,6 +30,8 @@ export function ChargingRatesButton({
   const [currency, setCurrency] = useState("$")
   const [defaultRate, setDefaultRate] = useState("")
   const [tagRates, setTagRates] = useState<Record<string, string>>({})
+  const [touEnabled, setTouEnabled] = useState(false)
+  const [touDraft, setTouDraft] = useState<PeriodDraft[]>([])
   const [busy, setBusy] = useState(false)
 
   // Seed the draft from the loaded rates + known tags, then open. The
@@ -39,6 +50,15 @@ export function ChargingRatesButton({
       if (!(k in draft)) draft[k] = String(v)
     }
     setTagRates(draft)
+    setTouEnabled(rates.touEnabled)
+    setTouDraft(
+      rates.touPeriods.map((p) => ({
+        label: p.label,
+        start: p.start,
+        end: p.end,
+        rate: String(p.rate),
+      })),
+    )
     setOpen(true)
   }
 
@@ -51,19 +71,38 @@ export function ChargingRatesButton({
     return () => document.removeEventListener("mousedown", onDoc)
   }, [open])
 
+  const updatePeriod = (i: number, field: keyof PeriodDraft, value: string) =>
+    setTouDraft((d) => d.map((p, idx) => (idx === i ? { ...p, [field]: value } : p)))
+  const addPeriod = () =>
+    setTouDraft((d) => [
+      ...d,
+      { label: "", start: "22:00", end: "06:00", rate: "" },
+    ])
+  const removePeriod = (i: number) =>
+    setTouDraft((d) => d.filter((_, idx) => idx !== i))
+
   const onSave = async () => {
     setBusy(true)
     try {
-      const parsedDefault = parseRate(defaultRate)
       const cleanTagRates: Record<string, number> = {}
       for (const [k, v] of Object.entries(tagRates)) {
         const n = parseRate(v)
         if (n != null) cleanTagRates[k] = n
       }
+      const touPeriods: TouPeriod[] = []
+      for (const p of touDraft) {
+        const rate = parseRate(p.rate)
+        if (rate == null || !TIME_RE.test(p.start) || !TIME_RE.test(p.end)) {
+          continue
+        }
+        touPeriods.push({ label: p.label.trim(), start: p.start, end: p.end, rate })
+      }
       await save({
         currency: currency.trim() || "$",
-        defaultRate: parsedDefault,
+        defaultRate: parseRate(defaultRate),
         tagRates: cleanTagRates,
+        touEnabled,
+        touPeriods,
       })
       setOpen(false)
       onSaved?.()
@@ -73,6 +112,8 @@ export function ChargingRatesButton({
   }
 
   const tagEntries = Object.keys(tagRates).sort((a, b) => a.localeCompare(b))
+  const timeClass =
+    "rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 [color-scheme:dark] focus:border-emerald-400/40 focus:outline-none"
 
   return (
     <div ref={wrapRef} className="relative">
@@ -86,7 +127,7 @@ export function ChargingRatesButton({
         Rates
       </button>
       {open && (
-        <div className="absolute right-0 top-full z-50 mt-2 w-72 rounded-xl border border-white/10 bg-slate-900/95 p-3 shadow-2xl backdrop-blur">
+        <div className="absolute right-0 top-full z-50 mt-2 max-h-[80vh] w-80 overflow-y-auto rounded-xl border border-white/10 bg-slate-900/95 p-3 shadow-2xl backdrop-blur">
           <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-slate-400">
             Electricity rates
           </div>
@@ -152,6 +193,88 @@ export function ChargingRatesButton({
               ))}
             </div>
           )}
+
+          <div className="mb-3 border-t border-white/[0.06] pt-3">
+            <label className="flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={touEnabled}
+                onChange={(e) => setTouEnabled(e.target.checked)}
+                className="h-4 w-4 accent-emerald-500"
+              />
+              <span className="text-[10px] font-semibold uppercase tracking-wide text-slate-400">
+                Time-of-use pricing
+              </span>
+            </label>
+
+            {touEnabled && (
+              <div className="mt-2 flex flex-col gap-2">
+                {touDraft.length === 0 && (
+                  <p className="rounded-md bg-white/[0.02] px-2 py-1.5 text-xs text-slate-500">
+                    Add periods like off-peak 22:00–06:00. Hours not covered
+                    use the default rate; tagged charges keep their tag rate.
+                  </p>
+                )}
+                {touDraft.map((p, i) => (
+                  <div
+                    key={i}
+                    className="rounded-md border border-white/10 bg-white/[0.02] p-2"
+                  >
+                    <div className="flex items-center gap-1.5">
+                      <input
+                        type="text"
+                        value={p.label}
+                        onChange={(e) => updatePeriod(i, "label", e.target.value)}
+                        placeholder="Label (e.g. Off-peak)"
+                        className="min-w-0 flex-1 rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 focus:border-emerald-400/40 focus:outline-none"
+                      />
+                      <button
+                        type="button"
+                        aria-label="Remove period"
+                        onClick={() => removePeriod(i)}
+                        className="shrink-0 rounded-md p-1 text-slate-500 hover:bg-white/5 hover:text-slate-300"
+                      >
+                        <X className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
+                    <div className="mt-1.5 flex items-center gap-1.5">
+                      <input
+                        type="time"
+                        value={p.start}
+                        onChange={(e) => updatePeriod(i, "start", e.target.value)}
+                        className={timeClass}
+                      />
+                      <span className="text-xs text-slate-500">to</span>
+                      <input
+                        type="time"
+                        value={p.end}
+                        onChange={(e) => updatePeriod(i, "end", e.target.value)}
+                        className={timeClass}
+                      />
+                      <input
+                        type="number"
+                        inputMode="decimal"
+                        step="0.01"
+                        min="0"
+                        placeholder="/ kWh"
+                        value={p.rate}
+                        onChange={(e) => updatePeriod(i, "rate", e.target.value)}
+                        className="w-20 rounded-md border border-white/10 bg-slate-950/60 px-2 py-1 text-sm text-slate-100 placeholder:text-slate-600 focus:border-emerald-400/40 focus:outline-none"
+                      />
+                    </div>
+                  </div>
+                ))}
+                <button
+                  type="button"
+                  onClick={addPeriod}
+                  className="inline-flex items-center justify-center gap-1 rounded-md border border-white/10 bg-white/[0.03] px-2 py-1 text-xs font-medium text-slate-300 transition-colors hover:bg-white/[0.06]"
+                >
+                  <Plus className="h-3.5 w-3.5" />
+                  Add period
+                </button>
+              </div>
+            )}
+          </div>
 
           <button
             type="button"
