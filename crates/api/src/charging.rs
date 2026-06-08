@@ -672,6 +672,38 @@ fn group_sessions(rows: Vec<ChargeRow>) -> Vec<Vec<ChargeRow>> {
     sessions
 }
 
+/// The session's representative GPS fix for the map pin: the most
+/// frequently reported `(lat, lon)` across its samples, ties broken toward
+/// the one seen latest.
+///
+/// Not the first non-null fix — at arrival the reverse-geocoded address
+/// (from `state drive`) updates a poll or two before the raw GPS (from the
+/// slower `state location` poll), so the first charge sample can carry the
+/// new charger's address but the *previous* location's coordinates (a
+/// just-left home pin on a Supercharge). Taking the mode pins the charger
+/// where the bulk of the session actually sat, and returning lat+lon
+/// together stops them coming from different fixes. Coordinates are stamped
+/// from a held value and repeat bit-for-bit, so grouping on exact bits is
+/// safe.
+fn session_coord(rows: &[ChargeRow]) -> (Option<f64>, Option<f64>) {
+    use std::collections::HashMap;
+    // (lat bits, lon bits) → (count, last index seen, lat, lon).
+    let mut seen: HashMap<(u64, u64), (usize, usize, f64, f64)> = HashMap::new();
+    for (i, r) in rows.iter().enumerate() {
+        if let (Some(lat), Some(lon)) = (r.lat, r.lon) {
+            let slot = seen
+                .entry((lat.to_bits(), lon.to_bits()))
+                .or_insert((0, i, lat, lon));
+            slot.0 += 1;
+            slot.1 = i;
+        }
+    }
+    seen.values()
+        .max_by_key(|(count, last_idx, _, _)| (*count, *last_idx))
+        .map(|(_, _, lat, lon)| (Some(*lat), Some(*lon)))
+        .unwrap_or((None, None))
+}
+
 /// Reduce one session's rows to a summary. `rows` is non-empty and
 /// time-ordered.
 fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
@@ -706,6 +738,10 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
     };
 
     let peak_power_kw = rows.iter().filter_map(|r| r.power_kw).max();
+    // Map-pin coordinate: the session's dominant fix, not the first
+    // non-null one (which can be a stale arrival reading — see
+    // `session_coord`).
+    let (location_lat, location_lon) = session_coord(rows);
 
     ChargeSessionSummary {
         id: first.ts,
@@ -713,8 +749,8 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         end_ms: last.ts * 1000,
         duration_secs: last.ts - first.ts,
         location: rows.iter().find_map(|r| r.location.clone()),
-        location_lat: rows.iter().find_map(|r| r.lat),
-        location_lon: rows.iter().find_map(|r| r.lon),
+        location_lat,
+        location_lon,
         energy_added_kwh,
         energy_used_kwh,
         efficiency_pct,
@@ -1453,6 +1489,35 @@ mod tests {
             row(60, Some(22), Some(80.0), Some(1.0)),
         ]);
         assert!(!edge.fast_charging);
+    }
+
+    #[test]
+    fn session_coord_uses_dominant_fix_not_stale_leading_sample() {
+        // Regression for the "Supercharge pinned at home" bug. At arrival
+        // the address updates a poll before the GPS, so the first charge
+        // sample carries the new charger's address but the previous
+        // location's coordinates. The pin must sit at the dominant fix, not
+        // that single stale leading sample. Coordinates here are synthetic.
+        let mut rows = vec![
+            row(0, Some(150), Some(600.0), Some(0.0)),
+            row(60, Some(150), Some(600.0), Some(5.0)),
+            row(120, Some(120), Some(500.0), Some(9.0)),
+        ];
+        rows[0].lat = Some(10.0); // stale leading fix (seen once)
+        rows[0].lon = Some(20.0);
+        rows[1].lat = Some(30.0); // the real location (dominant — seen twice)
+        rows[1].lon = Some(40.0);
+        rows[2].lat = Some(30.0);
+        rows[2].lon = Some(40.0);
+        let s = summarize(&rows);
+        assert_eq!(s.location_lat, Some(30.0));
+        assert_eq!(s.location_lon, Some(40.0));
+        // A single-fix session is unchanged.
+        let mut single = vec![row(0, Some(2), Some(5.0), Some(0.0))];
+        single[0].lat = Some(50.0);
+        single[0].lon = Some(60.0);
+        let ss = summarize(&single);
+        assert_eq!(ss.location_lat, Some(50.0));
     }
 
     #[test]
