@@ -195,23 +195,69 @@ fn integrate_power_kwh(rows: &[ChargeRow]) -> Option<f64> {
     if kwh > 0.0 { Some(kwh) } else { None }
 }
 
-/// One time-of-use price window in local minutes-of-day. `start_min >
-/// end_min` wraps past midnight (e.g. 22:00–06:00 off-peak).
-struct TouPeriod {
+/// One time-of-use price window for a tag, scoped by time-of-day, days of
+/// the week, and a month range — the device equivalent of a Tessie "rate
+/// schedule". All bounds are in local time.
+struct RateSchedule {
     rate: f64,
+    /// Local minutes-of-day. `start_min > end_min` wraps past midnight
+    /// (e.g. 22:00–06:00 off-peak).
     start_min: i32,
     end_min: i32,
+    /// Days the window applies on, 0=Sun..6=Sat. Empty = every day.
+    days: Vec<i32>,
+    /// Inclusive month range, 1=Jan..12=Dec. `start_month > end_month`
+    /// wraps the year (e.g. Nov–Feb).
+    start_month: i32,
+    end_month: i32,
 }
 
-impl TouPeriod {
-    /// Whether `min` (local minutes-of-day) is in [start, end), wrapping
-    /// when the window crosses midnight.
-    fn covers(&self, min: i32) -> bool {
+impl RateSchedule {
+    /// Whether a local `minute`-of-day / `weekday` (0=Sun) / `month`
+    /// (1=Jan) falls in this window. Time is half-open `[start, end)`,
+    /// the month range is inclusive, and an empty `days` matches any day.
+    fn covers(&self, minute: i32, weekday: i32, month: i32) -> bool {
+        self.covers_time(minute) && self.covers_day(weekday) && self.covers_month(month)
+    }
+
+    /// Time-of-day in `[start, end)`, wrapping when the window crosses
+    /// midnight.
+    fn covers_time(&self, min: i32) -> bool {
         if self.start_min <= self.end_min {
             min >= self.start_min && min < self.end_min
         } else {
             min >= self.start_min || min < self.end_min
         }
+    }
+
+    fn covers_day(&self, weekday: i32) -> bool {
+        self.days.is_empty() || self.days.contains(&weekday)
+    }
+
+    /// Inclusive month range, wrapping the year when `start_month >
+    /// end_month` (e.g. Nov–Feb covers Nov, Dec, Jan, Feb).
+    fn covers_month(&self, month: i32) -> bool {
+        if self.start_month <= self.end_month {
+            month >= self.start_month && month <= self.end_month
+        } else {
+            month >= self.start_month || month <= self.end_month
+        }
+    }
+}
+
+/// Pricing for one tag: an optional flat fallback rate plus any number of
+/// time-of-use schedules. A charging interval is priced at the first
+/// schedule that covers it, else `flat`, else the global default rate.
+struct TagRate {
+    flat: Option<f64>,
+    schedules: Vec<RateSchedule>,
+}
+
+impl TagRate {
+    /// A plan with neither a flat rate nor a schedule carries no pricing,
+    /// so it never wins selection and never costs a session.
+    fn is_configured(&self) -> bool {
+        self.flat.is_some() || !self.schedules.is_empty()
     }
 }
 
@@ -234,17 +280,16 @@ fn parse_minute_of_day(v: &serde_json::Value) -> Option<i32> {
 }
 
 /// Electricity-rate config for charge cost, read from user preferences:
-/// `charging_currency` (symbol, default "$"), `charging_default_rate`
-/// (price per kWh), `charging_tag_rates` (a `{ tag: price-per-kWh }`
-/// map), and an optional time-of-use schedule (`charging_tou_enabled` +
-/// `charging_tou_periods`). Numeric prefs may arrive as a JSON number or
-/// a numeric string (the web inputs send strings).
+/// `charging_currency` (symbol, default "$"), `charging_default_rate` (the
+/// flat price per kWh for untagged sessions / fallback), and
+/// `charging_tag_rates` — a `{ tag: plan }` map where each plan is either a
+/// bare number (a flat per-tag rate) or `{ flat, schedules }` (a flat rate
+/// plus time-of-use schedules). Numeric prefs may arrive as a JSON number
+/// or a numeric string (the web inputs send strings).
 struct RateConfig {
     currency: String,
     default_rate: Option<f64>,
-    tag_rates: std::collections::HashMap<String, f64>,
-    tou_enabled: bool,
-    tou_periods: Vec<TouPeriod>,
+    tags: std::collections::HashMap<String, TagRate>,
 }
 
 impl RateConfig {
@@ -258,65 +303,82 @@ impl RateConfig {
             .unwrap_or("$")
             .to_string();
         let default_rate = prefs.get("charging_default_rate").and_then(num_from_json);
-        let tag_rates = prefs
+        let tags = prefs
             .get("charging_tag_rates")
             .and_then(|v| v.as_object())
-            .map(|m| {
-                m.iter()
-                    .filter_map(|(k, v)| num_from_json(v).map(|r| (k.clone(), r)))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let tou_enabled = prefs
-            .get("charging_tou_enabled")
-            .map(|v| v.as_bool() == Some(true) || v.as_str() == Some("true"))
-            .unwrap_or(false);
-        let tou_periods = prefs
-            .get("charging_tou_periods")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|p| {
-                        let obj = p.as_object()?;
-                        Some(TouPeriod {
-                            rate: num_from_json(obj.get("rate")?)?,
-                            start_min: parse_minute_of_day(obj.get("start")?)?,
-                            end_min: parse_minute_of_day(obj.get("end")?)?,
-                        })
-                    })
-                    .collect()
-            })
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), parse_tag_rate(v))).collect())
             .unwrap_or_default();
         Self {
             currency,
             default_rate,
-            tag_rates,
-            tou_enabled,
-            tou_periods,
+            tags,
         }
     }
+}
 
-    /// Highest rate among a session's rate-bearing tags, if any. Highest
-    /// (not first) so it's independent of tag order.
-    fn tag_rate(&self, tags: &[String]) -> Option<f64> {
-        tags.iter()
-            .filter_map(|t| self.tag_rates.get(t).copied())
-            .fold(None, |acc: Option<f64>, r| Some(acc.map_or(r, |a| a.max(r))))
+/// Parse one `charging_tag_rates` entry. Accepts the legacy shape (a bare
+/// number / numeric string = a flat rate, no schedules) and the new shape
+/// (`{ flat, schedules: [...] }`), so per-tag flat rates set before this
+/// feature survive the upgrade.
+fn parse_tag_rate(v: &serde_json::Value) -> TagRate {
+    if let Some(obj) = v.as_object() {
+        let flat = obj.get("flat").and_then(num_from_json);
+        let schedules = obj
+            .get("schedules")
+            .and_then(|s| s.as_array())
+            .map(|arr| arr.iter().filter_map(parse_schedule).collect())
+            .unwrap_or_default();
+        TagRate { flat, schedules }
+    } else {
+        TagRate {
+            flat: num_from_json(v),
+            schedules: Vec::new(),
+        }
     }
+}
 
-    /// Flat resolved price-per-kWh: a tag rate if present, else the
-    /// default. (TOU pricing is handled separately in `apply_rates`.)
-    fn rate_for(&self, tags: &[String]) -> Option<f64> {
-        self.tag_rate(tags).or(self.default_rate)
-    }
+/// Parse one schedule object; `None` if it lacks a valid rate or time
+/// bounds (mirrors the web editor, which drops such rows on save). A
+/// missing/empty `days` means every day; missing months default to the
+/// full year.
+fn parse_schedule(v: &serde_json::Value) -> Option<RateSchedule> {
+    let obj = v.as_object()?;
+    Some(RateSchedule {
+        rate: num_from_json(obj.get("rate")?)?,
+        start_min: parse_minute_of_day(obj.get("start")?)?,
+        end_min: parse_minute_of_day(obj.get("end")?)?,
+        days: parse_days(obj.get("days")),
+        start_month: parse_month(obj.get("startMonth")).unwrap_or(1),
+        end_month: parse_month(obj.get("endMonth")).unwrap_or(12),
+    })
+}
 
-    /// TOU rate for a local minute-of-day, if a period covers it.
-    fn tou_rate_at(&self, minute_of_day: i32) -> Option<f64> {
-        self.tou_periods
-            .iter()
-            .find(|p| p.covers(minute_of_day))
-            .map(|p| p.rate)
-    }
+/// Parse a `days` array (0=Sun..6=Sat) into a sorted, deduped, in-range
+/// Vec. Missing / empty / all-out-of-range yields an empty Vec, which
+/// `RateSchedule::covers_day` treats as "every day".
+fn parse_days(v: Option<&serde_json::Value>) -> Vec<i32> {
+    let Some(arr) = v.and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut days: Vec<i32> = arr
+        .iter()
+        .filter_map(|d| d.as_i64())
+        .map(|d| d as i32)
+        .filter(|d| (0..=6).contains(d))
+        .collect();
+    days.sort_unstable();
+    days.dedup();
+    days
+}
+
+/// Parse a month pref (1=Jan..12=Dec) from a JSON number or numeric
+/// string; `None` if absent or out of range.
+fn parse_month(v: Option<&serde_json::Value>) -> Option<i32> {
+    let v = v?;
+    let m = v
+        .as_i64()
+        .or_else(|| v.as_str().and_then(|s| s.trim().parse::<i64>().ok()))? as i32;
+    (1..=12).contains(&m).then_some(m)
 }
 
 /// Parse a preference value (JSON number or numeric string) into a
@@ -328,13 +390,20 @@ fn num_from_json(v: &serde_json::Value) -> Option<f64> {
     (n.is_finite() && n >= 0.0).then_some(n)
 }
 
-/// Cost of a session under time-of-use pricing: integrate charger power
-/// over each sample interval and price it at the TOU rate for that
-/// interval's local time-of-day. An interval in an uncovered window
-/// falls back to the default rate (else free). `None` with too little
-/// power data to integrate.
-fn tou_cost(rows: &[ChargeRow], rates: &RateConfig) -> Option<f64> {
-    use chrono::{Local, Timelike};
+/// Cost of a session under one rate plan: integrate charger power over
+/// each sample interval (trapezoidal, V × I-refined per `sample_power_kw`,
+/// so this matches `energy_used_kwh`) and price each interval at the first
+/// schedule covering its local time, else the plan's `flat` rate, else the
+/// global `default_rate`. Returns `None` when no interval ever resolved a
+/// configured rate (so an empty plan with no default leaves cost null) or
+/// with too little power data to integrate.
+fn plan_cost(
+    rows: &[ChargeRow],
+    flat: Option<f64>,
+    schedules: &[RateSchedule],
+    default_rate: Option<f64>,
+) -> Option<f64> {
+    use chrono::{Datelike, Local, Timelike};
     let pts: Vec<(i64, f64)> = rows
         .iter()
         .filter_map(|r| sample_power_kw(r).map(|p| (r.ts, p)))
@@ -343,7 +412,7 @@ fn tou_cost(rows: &[ChargeRow], rates: &RateConfig) -> Option<f64> {
         return None;
     }
     let mut cost = 0.0;
-    let mut any = false;
+    let mut priced = false;
     for w in pts.windows(2) {
         let dt_h = (w[1].0 - w[0].0) as f64 / 3600.0;
         if dt_h <= 0.0 {
@@ -351,40 +420,55 @@ fn tou_cost(rows: &[ChargeRow], rates: &RateConfig) -> Option<f64> {
         }
         let energy = (w[0].1 + w[1].1) / 2.0 * dt_h;
         let mid_ts = (w[0].0 + w[1].0) / 2;
-        let minute = chrono::DateTime::from_timestamp(mid_ts, 0)
-            .map(|dt| {
-                let local = dt.with_timezone(&Local);
-                local.hour() as i32 * 60 + local.minute() as i32
-            })
-            .unwrap_or(0);
-        let rate = rates.tou_rate_at(minute).or(rates.default_rate).unwrap_or(0.0);
-        cost += energy * rate;
-        any = true;
+        // The local clock at the interval midpoint selects the schedule.
+        let rate = chrono::DateTime::from_timestamp(mid_ts, 0).and_then(|dt| {
+            let local = dt.with_timezone(&Local);
+            let minute = local.hour() as i32 * 60 + local.minute() as i32;
+            let weekday = local.weekday().num_days_from_sunday() as i32;
+            let month = local.month() as i32;
+            schedules
+                .iter()
+                .find(|s| s.covers(minute, weekday, month))
+                .map(|s| s.rate)
+                .or(flat)
+                .or(default_rate)
+        });
+        if let Some(rate) = rate {
+            cost += energy * rate;
+            priced = true;
+        }
     }
-    any.then_some(cost)
+    priced.then_some(cost)
 }
 
-/// Fill a summary's tag + cost fields. Resolution order: a rate-bearing
-/// tag wins (e.g. a flat Supercharger rate); otherwise time-of-use if
-/// enabled; otherwise the flat default. Cost is charged on energy used
-/// (wall-side), so it includes charging loss. `rate` is the effective
-/// $/kWh — a blended average under TOU.
+/// Fill a summary's tag + cost fields. A session priced by a configured
+/// tag plan wins over the untagged default; among multiple configured tag
+/// plans the most expensive one wins (order-independent — never
+/// under-bill). Cost is charged on energy used (wall-side), so it includes
+/// charging loss. `rate` is the effective $/kWh — a blended average when
+/// schedules span the session.
 fn apply_rates(
     s: &mut ChargeSessionSummary,
     rows: &[ChargeRow],
     tags: Vec<String>,
     rates: &RateConfig,
 ) {
-    let (cost, rate) = if let Some(tr) = rates.tag_rate(&tags) {
-        (s.energy_used_kwh.map(|u| tr * u), Some(tr))
-    } else if rates.tou_enabled && !rates.tou_periods.is_empty() {
-        let c = tou_cost(rows, rates);
-        let blended = match (c, s.energy_used_kwh) {
-            (Some(c), Some(u)) if u > 0.0 => Some(c / u),
+    // Most expensive configured tag plan the session carries, if any.
+    let best_tag_cost = tags
+        .iter()
+        .filter_map(|t| rates.tags.get(t))
+        .filter(|p| p.is_configured())
+        .filter_map(|p| plan_cost(rows, p.flat, &p.schedules, rates.default_rate))
+        .fold(None, |acc: Option<f64>, c| Some(acc.map_or(c, |a: f64| a.max(c))));
+
+    let (cost, rate) = if let Some(c) = best_tag_cost {
+        let blended = match s.energy_used_kwh {
+            Some(u) if u > 0.0 => Some(c / u),
             _ => None,
         };
-        (c, blended)
+        (Some(c), blended)
     } else if let Some(dr) = rates.default_rate {
+        // Untagged, or no configured tag plan: flat default on used energy.
         (s.energy_used_kwh.map(|u| dr * u), Some(dr))
     } else {
         (None, None)
@@ -1059,33 +1143,61 @@ mod tests {
 
     // ── Cost + efficiency ──────────────────────────────────────────────
 
+    /// Build a config with a flat default and flat-only tag plans — the
+    /// pre-schedule shape, so the cost/efficiency tests read cleanly.
     fn rates(default: Option<f64>, tags: &[(&str, f64)]) -> RateConfig {
         RateConfig {
             currency: "$".into(),
             default_rate: default,
-            tag_rates: tags.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
-            tou_enabled: false,
-            tou_periods: Vec::new(),
+            tags: tags
+                .iter()
+                .map(|(k, v)| (k.to_string(), TagRate { flat: Some(*v), schedules: Vec::new() }))
+                .collect(),
         }
     }
 
-    #[test]
-    fn rate_for_prefers_highest_tag_rate_then_default() {
-        let r = rates(Some(0.10), &[("Home", 0.12), ("Public", 0.40)]);
-        // No tags, or a tag with no configured rate → default.
-        assert_eq!(r.rate_for(&[]), Some(0.10));
-        assert_eq!(r.rate_for(&["Work".into()]), Some(0.10));
-        // One rate-bearing tag → its rate.
-        assert_eq!(r.rate_for(&["Home".into()]), Some(0.12));
-        // Multiple → highest, independent of order.
-        assert_eq!(r.rate_for(&["Home".into(), "Public".into()]), Some(0.40));
-        assert_eq!(r.rate_for(&["Public".into(), "Home".into()]), Some(0.40));
+    /// Steady 10 kW for an hour = 10 kWh used; a convenient fixture for
+    /// cost math (cost = rate × 10, blended rate = cost / 10).
+    fn hour_session() -> [ChargeRow; 2] {
+        [
+            row(0, Some(10), Some(30.0), Some(0.0)),
+            row(3600, Some(10), Some(30.0), Some(9.0)),
+        ]
+    }
+
+    /// `Some(x)` within float tolerance of `b` — blended rates and costs go
+    /// through a multiply-then-divide, so avoid brittle exact equality.
+    fn approx(a: Option<f64>, b: f64) -> bool {
+        matches!(a, Some(x) if (x - b).abs() < 1e-9)
     }
 
     #[test]
-    fn rate_for_is_none_without_default_or_tag_rate() {
-        let r = rates(None, &[]);
-        assert_eq!(r.rate_for(&["Home".into()]), None);
+    fn highest_cost_tag_plan_wins_then_default() {
+        let session = hour_session();
+        let r = rates(Some(0.10), &[("Home", 0.12), ("Public", 0.40)]);
+        let cost_for = |tags: Vec<String>| {
+            let mut s = summarize(&session);
+            apply_rates(&mut s, &session, tags, &r);
+            s.cost
+        };
+        // No tags, or a tag with no configured plan → default (0.10 × 10).
+        assert!(approx(cost_for(vec![]), 1.0));
+        assert!(approx(cost_for(vec!["Work".into()]), 1.0));
+        // One configured tag → its rate (0.12 × 10).
+        assert!(approx(cost_for(vec!["Home".into()]), 1.2));
+        // Multiple → most expensive, independent of order (0.40 × 10).
+        assert!(approx(cost_for(vec!["Home".into(), "Public".into()]), 4.0));
+        assert!(approx(cost_for(vec!["Public".into(), "Home".into()]), 4.0));
+    }
+
+    #[test]
+    fn cost_is_none_without_default_or_tag_plan() {
+        let session = hour_session();
+        let mut s = summarize(&session);
+        // A tag with no configured plan and no default → no cost.
+        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[]));
+        assert_eq!(s.cost, None);
+        assert_eq!(s.rate, None);
     }
 
     #[test]
@@ -1202,47 +1314,112 @@ mod tests {
     }
 
     #[test]
-    fn tou_period_covers_with_overnight_wrap() {
-        let off = TouPeriod { rate: 0.08, start_min: 22 * 60, end_min: 6 * 60 };
-        assert!(off.covers(23 * 60)); // 11pm
-        assert!(off.covers(2 * 60)); // 2am
-        assert!(!off.covers(12 * 60)); // noon
-        let peak = TouPeriod { rate: 0.30, start_min: 6 * 60, end_min: 22 * 60 };
-        assert!(peak.covers(12 * 60));
-        assert!(!peak.covers(2 * 60));
+    fn schedule_covers_time_day_month() {
+        // Off-peak overnight, weekdays (Mon–Fri), summer (Jun–Sep).
+        let s = RateSchedule {
+            rate: 0.08,
+            start_min: 22 * 60,
+            end_min: 6 * 60,
+            days: vec![1, 2, 3, 4, 5],
+            start_month: 6,
+            end_month: 9,
+        };
+        assert!(s.covers(23 * 60, 3, 7)); // 11pm Wed in July — in window
+        assert!(s.covers(2 * 60, 3, 7)); // 2am — still off-peak (wraps midnight)
+        assert!(!s.covers(12 * 60, 3, 7)); // noon — outside time window
+        assert!(!s.covers(23 * 60, 0, 7)); // Sunday — outside day set
+        assert!(!s.covers(23 * 60, 3, 12)); // December — outside month range
+
+        // Empty days = every day; month range wrapping the year (Nov–Feb).
+        let winter = RateSchedule {
+            rate: 0.05,
+            start_min: 0,
+            end_min: 1440,
+            days: vec![],
+            start_month: 11,
+            end_month: 2,
+        };
+        assert!(winter.covers(9 * 60, 0, 1)); // January, Sunday — inside wrap
+        assert!(winter.covers(9 * 60, 0, 12)); // December — inside wrap
+        assert!(!winter.covers(9 * 60, 0, 6)); // June — outside wrapped range
     }
 
     #[test]
-    fn tou_cost_prices_energy_by_active_period() {
-        // Steady 10 kW for an hour = 10 kWh used. A single all-day period
-        // keeps this timezone-independent: cost = 10 × 0.20 = 2.00,
-        // blended rate = 0.20.
-        let session = [
-            row(0, Some(10), Some(30.0), Some(0.0)),
-            row(3600, Some(10), Some(30.0), Some(9.0)),
-        ];
+    fn tag_schedule_prices_session() {
+        // A tag whose only schedule is all-day/all-year at 0.20 prices the
+        // hour session at 0.20 × 10 = 2.00 (timezone-independent).
+        let session = hour_session();
         let mut r = rates(None, &[]);
-        r.tou_enabled = true;
-        r.tou_periods = vec![TouPeriod { rate: 0.20, start_min: 0, end_min: 1440 }];
+        r.tags.insert(
+            "Home".into(),
+            TagRate {
+                flat: None,
+                schedules: vec![RateSchedule {
+                    rate: 0.20,
+                    start_min: 0,
+                    end_min: 1440,
+                    days: vec![],
+                    start_month: 1,
+                    end_month: 12,
+                }],
+            },
+        );
         let mut s = summarize(&session);
-        apply_rates(&mut s, &session, vec![], &r);
-        assert_eq!(s.cost, Some(2.0));
-        assert_eq!(s.rate, Some(0.20));
+        apply_rates(&mut s, &session, vec!["Home".into()], &r);
+        assert!(approx(s.cost, 2.0));
+        assert!(approx(s.rate, 0.20));
     }
 
     #[test]
-    fn tag_rate_overrides_tou() {
-        let session = [
-            row(0, Some(10), Some(30.0), Some(0.0)),
-            row(3600, Some(10), Some(30.0), Some(9.0)),
-        ];
-        let mut r = rates(None, &[("Supercharger", 0.40)]);
-        r.tou_enabled = true;
-        r.tou_periods = vec![TouPeriod { rate: 0.10, start_min: 0, end_min: 1440 }];
+    fn tag_plan_beats_default() {
+        // A flat tag plan (Supercharger 0.40) wins over the default 0.10.
+        let session = hour_session();
         let mut s = summarize(&session);
-        apply_rates(&mut s, &session, vec!["Supercharger".into()], &r);
-        assert_eq!(s.cost, Some(4.0)); // 0.40 × 10 used; tag beats TOU
-        assert_eq!(s.rate, Some(0.40));
+        apply_rates(
+            &mut s,
+            &session,
+            vec!["Supercharger".into()],
+            &rates(Some(0.10), &[("Supercharger", 0.40)]),
+        );
+        assert!(approx(s.cost, 4.0)); // 0.40 × 10 used; tag beats default
+        assert!(approx(s.rate, 0.40));
+    }
+
+    #[test]
+    fn parse_tag_rate_accepts_number_and_object() {
+        // Legacy shape: a bare number is read as a flat rate, no schedules.
+        let legacy = parse_tag_rate(&serde_json::json!(0.04));
+        assert_eq!(legacy.flat, Some(0.04));
+        assert!(legacy.schedules.is_empty());
+
+        // New shape: flat + a schedule with days + month range. The rate
+        // arrives as a string (the web inputs send strings).
+        let plan = parse_tag_rate(&serde_json::json!({
+            "flat": 0.30,
+            "schedules": [{
+                "label": "Off-peak",
+                "start": "22:00",
+                "end": "06:00",
+                "days": [1, 2, 3, 4, 5],
+                "startMonth": 6,
+                "endMonth": 9,
+                "rate": "0.08"
+            }]
+        }));
+        assert_eq!(plan.flat, Some(0.30));
+        assert_eq!(plan.schedules.len(), 1);
+        let sch = &plan.schedules[0];
+        assert_eq!(sch.rate, 0.08);
+        assert_eq!(sch.start_min, 22 * 60);
+        assert_eq!(sch.end_min, 6 * 60);
+        assert_eq!(sch.days, vec![1, 2, 3, 4, 5]);
+        assert_eq!(sch.start_month, 6);
+        assert_eq!(sch.end_month, 9);
+
+        // Object with no flat and no schedules → an unconfigured plan.
+        let empty = parse_tag_rate(&serde_json::json!({}));
+        assert_eq!(empty.flat, None);
+        assert!(!empty.is_configured());
     }
 
     #[test]
