@@ -628,3 +628,7 @@ code, pre, .font-mono {
 /* Live indicator dot */
 @keyframes pulse-dot { 0%,100%{opacity:1} 50%{opacity:.35} }
 .dot-live { display: inline-block; width: 6px; height: 6px; border-radius: 50%; background: currentColor; animation: pulse-dot 1.4s ease-in-out infinite; }
+
+/* The Setup Wizard sits over the busy dashboard, so its glass uses a more
+   opaque fill (≈ level 5) than the global level-2 — less see-through. */
+.setup-wizard-glass { --lg-glass: 0.05; }

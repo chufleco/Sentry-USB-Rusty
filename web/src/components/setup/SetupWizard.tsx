@@ -697,7 +697,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   if (destructiveWarning) {
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-        <div className="glass-card flex w-full max-w-lg flex-col gap-5 p-8">
+        <div className="glass-card setup-wizard-glass flex w-full max-w-lg flex-col gap-5 p-8">
           <div className="flex items-start gap-4">
             <div className="flex h-12 w-12 shrink-0 items-center justify-center rounded-full bg-amber-500/20">
               <AlertTriangle className="h-6 w-6 text-amber-400" />
@@ -755,7 +755,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
     const isInProgress = phase === "applying" || phase === "running" || phase === "rebooting" || phase === "finalizing"
     return (
       <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-        <div className="glass-card flex w-full max-w-2xl flex-col gap-6 p-8 lg:max-w-5xl">
+        <div className="glass-card setup-wizard-glass flex w-full max-w-2xl flex-col gap-6 p-8 lg:max-w-5xl">
           {isInProgress ? (
             <>
               <div className="text-center">
@@ -828,7 +828,7 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
   // ── Wizard steps ──
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-      <div className="glass-card relative flex h-[90vh] w-full max-w-3xl flex-col overflow-hidden">
+      <div className="glass-card setup-wizard-glass relative flex h-[90vh] w-full max-w-3xl flex-col overflow-hidden">
         {/* Header with step indicator */}
         <div className="shrink-0 border-b border-white/5 px-6 py-4">
           <div className="mb-3 flex items-center justify-between">
