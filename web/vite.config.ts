@@ -51,8 +51,11 @@ export default defineConfig({
   server: {
     allowedHosts: true,
     proxy: {
-      '/api': 'http://localhost:8788',
-      '/TeslaCam': 'http://localhost:8788',
+      // Backend API target. Defaults to the local Rust server on :8788;
+      // set SENTRYUSB_API (e.g. http://sentryusb.local) to develop the
+      // UI against a live Pi without running the backend locally.
+      '/api': process.env.SENTRYUSB_API || 'http://localhost:8788',
+      '/TeslaCam': process.env.SENTRYUSB_API || 'http://localhost:8788',
     },
   },
 })

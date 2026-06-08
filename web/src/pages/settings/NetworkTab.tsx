@@ -1,5 +1,5 @@
 import { Wifi, Cable } from "lucide-react"
-import { PrefCard, PrefGrid } from "@/components/settings/PrefCard"
+import { PrefCard } from "@/components/settings/PrefCard"
 import { Row } from "@/components/ui/StatusTile"
 import { Pill } from "@/components/ui/Pill"
 import CloudPairingSection from "@/components/CloudPairingSection"
@@ -18,74 +18,66 @@ export function NetworkTab({ status }: Props) {
     !!status?.ether_speed && status.ether_speed !== "Unknown!"
 
   return (
-    <div className="space-y-2.5">
-      {/* Local links sit side-by-side at any width that allows two columns;
-          collapse to single column on mobile. Heights can still differ
-          (one card may show 1 row, the other 4) but widths stay matched. */}
-      <div className="grid items-start gap-2.5 sm:grid-cols-2">
-        <PrefCard
-          icon={<Wifi className="h-3.5 w-3.5" />}
-          halo={wifiConnected ? "accent" : "slate"}
-          title="WiFi"
-          badge={wifiConnected ? <Pill kind="accent">Connected</Pill> : null}
-        >
-          {wifiConnected && status ? (
-            <>
-              <div className="t-md font-semibold">{status.wifi_ssid}</div>
-              <Row
-                label="IP"
-                value={<span className="t-mono">{status.wifi_ip || "—"}</span>}
-              />
-              {status.wifi_strength && (
-                <Row label="Signal" value={status.wifi_strength} />
-              )}
-            </>
-          ) : (
-            <p className="t-xs">
-              No WiFi configured. Use the Setup Wizard to scan and connect.
-            </p>
-          )}
-        </PrefCard>
+    // One unified 2-column grid for the whole tab so every card aligns to the
+    // same two columns. The old layout stacked three separate containers — a
+    // 50/50 grid (WiFi/Ethernet), a masonry PrefGrid (BLE), and another grid
+    // with a different breakpoint (Away/Cloud) — so column edges never lined
+    // up row-to-row. Cards now pair up in order and collapse to one column
+    // below lg (where two ~360px cards would get cramped).
+    <div className="grid grid-cols-1 gap-2.5 lg:grid-cols-2">
+      {/* Network interfaces */}
+      <PrefCard
+        icon={<Wifi className="h-3.5 w-3.5" />}
+        halo={wifiConnected ? "accent" : "slate"}
+        title="WiFi"
+        badge={wifiConnected ? <Pill kind="accent">Connected</Pill> : null}
+      >
+        {wifiConnected && status ? (
+          <>
+            <div className="t-md font-semibold">{status.wifi_ssid}</div>
+            <Row
+              label="IP"
+              value={<span className="t-mono">{status.wifi_ip || "—"}</span>}
+            />
+            {status.wifi_strength && (
+              <Row label="Signal" value={status.wifi_strength} />
+            )}
+          </>
+        ) : (
+          <p className="t-xs">
+            No WiFi configured. Use the Setup Wizard to scan and connect.
+          </p>
+        )}
+      </PrefCard>
 
-        <PrefCard
-          icon={<Cable className="h-3.5 w-3.5" />}
-          halo={ethConnected ? "accent" : "slate"}
-          title="Ethernet"
-          badge={
-            ethConnected && status ? <Pill kind="accent">{status.ether_speed}</Pill> : null
-          }
-        >
-          {ethConnected && status ? (
-            <>
-              <Row
-                label="IP"
-                value={<span className="t-mono">{status.ether_ip || "—"}</span>}
-              />
-              <Row label="Link" value={status.ether_speed} />
-            </>
-          ) : (
-            <p className="t-xs">No Ethernet link detected.</p>
-          )}
-        </PrefCard>
-      </div>
+      <PrefCard
+        icon={<Cable className="h-3.5 w-3.5" />}
+        halo={ethConnected ? "accent" : "slate"}
+        title="Ethernet"
+        badge={
+          ethConnected && status ? <Pill kind="accent">{status.ether_speed}</Pill> : null
+        }
+      >
+        {ethConnected && status ? (
+          <>
+            <Row
+              label="IP"
+              value={<span className="t-mono">{status.ether_ip || "—"}</span>}
+            />
+            <Row label="Link" value={status.ether_speed} />
+          </>
+        ) : (
+          <p className="t-xs">No Ethernet link detected.</p>
+        )}
+      </PrefCard>
 
-      {/* Tesla BLE — the car-connection layer. Enable/disable the telemetry
-          + keep-awake-nudge features, then pair with the car. Lives here on
-          the Car & Network tab alongside the other connectivity surfaces
-          (WiFi, Cloud, Away Mode) rather than on the Device tab. */}
-      <PrefGrid min={300}>
-        <BleEnableToggle />
-        <BlePairButton />
-      </PrefGrid>
+      {/* Tesla BLE — enable the telemetry / keep-awake features, then pair.
+          Kept adjacent so "enable" sits right next to "pair". */}
+      <BleEnableToggle />
+      <BlePairButton />
 
-      {/* Away Mode — single card owning both the toggle/duration controls
-          and the active-AP details. The AP info used to live in a separate
-          card below; it's now a sub-section inside this card so the user
-          sees one cohesive thing. */}
+      {/* Remote access */}
       <AwayModeControl />
-
-      {/* SentryCloud spans the full width — it has 4 stat boxes + pairing
-          input that need room to breathe. */}
       <CloudPairingSection />
     </div>
   )

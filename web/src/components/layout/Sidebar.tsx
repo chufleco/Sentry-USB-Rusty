@@ -121,9 +121,14 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
               key={item.to}
               to={item.to}
               end={item.to === "/"}
+              // Native tooltip so the icon-only collapsed rail is still
+              // usable — without it, collapsed nav items are unlabeled.
+              title={collapsed ? item.label : undefined}
+              aria-label={collapsed ? item.label : undefined}
               className={({ isActive }) =>
                 cn(
                   "flex items-center gap-3 rounded-lg px-3 py-2.5 text-sm font-medium transition-colors",
+                  collapsed && "justify-center",
                   isActive
                     ? "bg-blue-500/15 text-blue-400"
                     : "text-slate-400 hover:bg-white/5 hover:text-slate-200"
@@ -154,9 +159,12 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
       {/* Terminal link (secondary) */}
       <NavLink
         to="/terminal"
+        title={collapsed ? "Terminal" : undefined}
+        aria-label={collapsed ? "Terminal" : undefined}
         className={({ isActive }) =>
           cn(
             "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition-colors",
+            collapsed && "justify-center",
             isActive
               ? "bg-blue-500/10 text-blue-400"
               : "text-slate-600 hover:bg-white/5 hover:text-slate-400"
@@ -170,9 +178,12 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
       {/* Support link (secondary) */}
       <NavLink
         to="/support"
+        title={collapsed ? "Support" : undefined}
+        aria-label={collapsed ? "Support" : undefined}
         className={({ isActive }) =>
           cn(
             "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs transition-colors",
+            collapsed && "justify-center",
             isActive
               ? "bg-blue-500/10 text-blue-400"
               : "text-slate-600 hover:bg-white/5 hover:text-slate-400"
@@ -184,8 +195,11 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
       </NavLink>
 
       {/* Connection status */}
-      <div className={cn(
+      <div
+        title={collapsed ? (connState === "connected" ? "Connected" : connState === "reconnecting" ? "Reconnecting" : "Offline") : undefined}
+        className={cn(
         "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs",
+        collapsed && "justify-center",
         connState === "connected" ? "text-emerald-400" : connState === "reconnecting" ? "text-amber-400" : "text-red-400"
       )}>
         <span className={cn(
@@ -201,7 +215,7 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
 
       {/* Away Mode indicator */}
       {awayModeStatus.state === "active" && (
-        <div className="mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-blue-400">
+        <div title={collapsed ? "Away Mode" : undefined} className={cn("mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-blue-400", collapsed && "justify-center")}>
           <Wifi className="h-3.5 w-3.5 animate-pulse" />
           {!collapsed && (
             <span className="opacity-70">Away Mode</span>
@@ -211,8 +225,11 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
 
       {/* Keep-awake indicator */}
       {isAwake && (
-        <div className={cn(
+        <div
+          title={collapsed ? (status.state === "active" ? "Keeping awake" : "Waiting for archive...") : undefined}
+          className={cn(
           "mx-2 mb-2 flex items-center gap-2 rounded-lg px-3 py-2 text-xs",
+          collapsed && "justify-center",
           status.state === "active"
             ? "text-rose-400"
             : "text-amber-400"
@@ -234,7 +251,12 @@ export function Sidebar({ collapsed, onToggle }: SidebarProps) {
       {authRequired && (
         <button
           onClick={logout}
-          className="mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-slate-600 transition-colors hover:bg-white/5 hover:text-slate-400"
+          title={collapsed ? "Logout" : undefined}
+          aria-label={collapsed ? "Logout" : undefined}
+          className={cn(
+            "mx-2 mb-1 flex items-center gap-2 rounded-lg px-3 py-2 text-xs text-slate-600 transition-colors hover:bg-white/5 hover:text-slate-400",
+            collapsed && "justify-center"
+          )}
         >
           <LogOut className="h-3.5 w-3.5 shrink-0" />
           {!collapsed && <span>Logout</span>}

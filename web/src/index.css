@@ -469,8 +469,13 @@ code, pre, .font-mono {
 .tile-row > .sub { font-size: 10px; color: #7a8294; }
 .tile-divider { height: 1px; background: rgba(255,255,255,.04); margin: 2px 0; }
 
-/* Auto-fit tile grid — reflows cleanly when optional tiles hide. */
-.tile-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; }
+/* Dashboard status tiles. Explicit 1 / 2 / 4 columns — never 3 — so the
+   4 tiles can't strand the last one in a 3+1 orphan row (which the old
+   auto-fit did across the whole ~960-1200px range). Phones get 1 column,
+   tablets/medium 2, desktop 4. */
+.tile-grid { display: grid; grid-template-columns: 1fr; gap: 10px; }
+@media (min-width: 640px)  { .tile-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (min-width: 1280px) { .tile-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); } }
 
 /* Banner stack */
 .banner { display: flex; align-items: center; gap: 12px; padding: 10px 14px; border-radius: 14px; border: 1px solid; }

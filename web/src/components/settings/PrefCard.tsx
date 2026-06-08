@@ -64,14 +64,20 @@ export function PrefCard({
       </div>
       {disabled ? (
         <div className="relative">
+          {/* Keep the real controls mounted (no state loss on re-enable)
+              but push them fully behind a frosted scrim so their text
+              can't bleed through and collide with the centered message —
+              the previous blur-only treatment left the body legible and
+              looked like a rendering glitch. */}
           <div
             inert
-            className="flex flex-col gap-2.5 p-3.5 blur-[2px] opacity-40 select-none transition-all"
+            aria-hidden
+            className="flex flex-col gap-2.5 p-3.5 blur-[3px] opacity-20 select-none"
           >
             {children}
           </div>
-          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center">
-            <p className="max-w-[28ch] text-xs text-slate-300">{disabled.reason}</p>
+          <div className="absolute inset-0 flex flex-col items-center justify-center gap-2.5 bg-gradient-to-b from-slate-900/75 to-slate-950/85 p-4 text-center backdrop-blur-[1px]">
+            <p className="max-w-[30ch] text-xs leading-relaxed text-slate-300">{disabled.reason}</p>
             {disabled.cta && <DisabledCta cta={disabled.cta} />}
           </div>
         </div>
@@ -102,12 +108,20 @@ function DisabledCta({ cta }: { cta: NonNullable<DisabledConfig["cta"]> }) {
   )
 }
 
-/** Grid wrapper used by every settings tab — auto-fit so cards reflow when hidden. */
-export function PrefGrid({ children, min = 280 }: { children: ReactNode; min?: number }) {
+/**
+ * Card wrapper used by every settings tab. Masonry via CSS multi-column:
+ *  - cards keep a consistent ~`min`px width and never stretch to fill the
+ *    row on wide screens (the old `auto-fit … 1fr` ballooned them), and
+ *  - tall cards next to short ones pack vertically instead of forcing a
+ *    row-aligned "staircase" with big gaps (e.g. the System tab's backup
+ *    list next to the short Export/Raw cards).
+ * Each card is kept whole with `break-inside-avoid`.
+ */
+export function PrefGrid({ children, min = 340 }: { children: ReactNode; min?: number }) {
   return (
     <div
-      className="grid items-start gap-2.5"
-      style={{ gridTemplateColumns: `repeat(auto-fit, minmax(${min}px, 1fr))` }}
+      className="[&>*]:mb-2.5 [&>*]:break-inside-avoid"
+      style={{ columnWidth: `${min}px`, columnGap: "0.625rem" }}
     >
       {children}
     </div>

@@ -21,7 +21,15 @@ const PREFETCH_ROUTES: Array<() => Promise<unknown>> = [
 ]
 
 export function AppShell() {
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  // Persist the collapse choice so it survives reloads (previously reset
+  // to expanded every refresh).
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem("sidebar-collapsed") === "1"
+    } catch {
+      return false
+    }
+  })
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
   // Warm the module cache for likely-next routes on idle. Respects
@@ -59,7 +67,17 @@ export function AppShell() {
           <div className="hidden md:block">
             <Sidebar
               collapsed={sidebarCollapsed}
-              onToggle={() => setSidebarCollapsed(!sidebarCollapsed)}
+              onToggle={() =>
+                setSidebarCollapsed((c) => {
+                  const next = !c
+                  try {
+                    localStorage.setItem("sidebar-collapsed", next ? "1" : "0")
+                  } catch {
+                    /* ignore */
+                  }
+                  return next
+                })
+              }
             />
           </div>
 
@@ -85,7 +103,11 @@ export function AppShell() {
               <span className="text-sm font-semibold text-slate-100" style={{ fontFamily: '"Inter", -apple-system, system-ui, sans-serif' }}>Sentry USB</span>
             </div>
 
-            <div className="p-4 pb-safe md:p-6">
+            {/* Cap the content column so cards don't stretch into giant
+                sparse bands on wide monitors / zoomed-out viewports —
+                centered in the post-sidebar area. Pages that genuinely
+                need full bleed can opt out with their own wrapper. */}
+            <div className="mx-auto w-full max-w-[1280px] p-4 pb-safe md:p-6">
               <ConnectionBanner />
               <Outlet />
             </div>

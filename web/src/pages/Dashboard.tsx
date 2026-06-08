@@ -493,28 +493,22 @@ export default function Dashboard() {
         {isAwayActive && <AwayModeTile />}
       </div>
 
-      {/* Car status overview — shows last-known battery / cabin temps
-          / tire health as compact chips, with the tire-pressure
-          history chart hidden behind an expand toggle on the Tires
-          chip. The chart bundle (recharts ~380KB) stays unloaded
-          until the user expands it.
-          Lives below the tile-grid (not inside it) — keeping the
-          tile-grid as 4 same-height cards in one row, and putting
-          the car summary on its own row constrained to ~2 tile
-          widths so on wide monitors it doesn't stretch into a long
-          horizontal strip. */}
+      {/* Car status overview — last-known battery / cabin temps / tire
+          health as chips, with the tire-pressure history chart behind an
+          expand toggle (recharts stays unloaded until expanded). Spans the
+          full content width so its flex-1 chips line up under the status
+          tiles above; the page-level max-width keeps it from over-stretching
+          on ultrawide. */}
       {(carStatusSample?.ts != null || currentCharge?.soc != null) && (
-        <div className="max-w-[640px]">
-          <CarStatusCard
-            sample={carStatusSample}
-            latestDriveEnd={latestDriveEnd}
-            tireHistory={tireHistory ?? undefined}
-            useFahrenheit={useFahrenheit}
-            metric={metric}
-            currentCharge={currentCharge}
-            lockChimeName={activeChimeName}
-          />
-        </div>
+        <CarStatusCard
+          sample={carStatusSample}
+          latestDriveEnd={latestDriveEnd}
+          tireHistory={tireHistory ?? undefined}
+          useFahrenheit={useFahrenheit}
+          metric={metric}
+          currentCharge={currentCharge}
+          lockChimeName={activeChimeName}
+        />
       )}
     </div>
   )
