@@ -138,7 +138,12 @@ export default function ChargeSessionDetailPage() {
     nowMs - session.endMs < 15 * 60 * 1000
   const projMins = inProgress ? (current?.minutesToFull ?? null) : null
   // Dashed projection from the last sample to the charge limit over the
-  // reported time-to-full.
+  // reported time-to-full. We emit a point roughly once a minute (capped
+  // at 60 so a long, slow charge doesn't generate hundreds) rather than
+  // only the endpoint, so the dashed line can be hovered anywhere to read
+  // the projected battery % at that time — not just "now" and "full by".
+  // SoC is interpolated linearly: the car reports only total time-to-full,
+  // so a straight ramp up to the limit is the honest model.
   const projection = useMemo(() => {
     if (!inProgress || projMins == null || projMins <= 0 || !lastPoint) {
       return undefined
@@ -146,7 +151,18 @@ export default function ChargeSessionDetailPage() {
     const limit = current?.limitSoc ?? 100
     const lastSoc = lastPoint.soc ?? current?.soc ?? null
     if (lastSoc == null || limit <= lastSoc) return undefined
-    return [{ ts: lastPoint.ts + projMins * 60_000, soc: limit }]
+    const startTs = lastPoint.ts
+    const endTs = startTs + projMins * 60_000
+    const segments = Math.min(60, Math.max(1, Math.round(projMins)))
+    const pts: { ts: number; soc: number }[] = []
+    for (let i = 1; i <= segments; i++) {
+      const frac = i / segments
+      pts.push({
+        ts: Math.round(startTs + (endTs - startTs) * frac),
+        soc: lastSoc + (limit - lastSoc) * frac,
+      })
+    }
+    return pts
   }, [inProgress, projMins, lastPoint, current])
   const remaining =
     projMins != null && projMins > 0
