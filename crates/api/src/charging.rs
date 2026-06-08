@@ -26,6 +26,19 @@ use crate::router::AppState;
 /// without merging two genuinely separate plug-ins.
 const SESSION_GAP_SECS: i64 = 30 * 60;
 
+/// Peak charger power (kW) above which a session counts as **fast
+/// charging** — DC fast charging (Supercharger, CCS). Set just above the
+/// AC Level 2 ceiling (19.2 kW in North America, 22 kW in Europe) with a
+/// strict `>`, so no home/destination AC charge ever trips it — including
+/// a 22 kW European 3-phase wallbox — while every DC charge (50 kW+) does.
+/// One threshold covers both regions, no locale setting needed.
+///
+/// The telemetry crate (`tesla_telemetry::main`) keeps its own copy to
+/// drive the adaptive poll cadence; it can't depend on this binary-less
+/// api crate, so the two are a deliberate string-/value-contract pair like
+/// `as_db_str` ⇄ `phase_is_active`. Keep them in sync.
+const FAST_CHARGE_THRESHOLD_KW: i64 = 22;
+
 /// One row pulled from `telemetry_samples`, already filtered to samples
 /// where the car was actively charging (see `is_actively_charging`).
 struct ChargeRow {
@@ -85,6 +98,14 @@ struct ChargeSessionSummary {
     rate: Option<f64>,
     /// Currency symbol for `cost` (from prefs, default "$").
     currency: String,
+    /// Peak power exceeded `FAST_CHARGE_THRESHOLD_KW` — i.e. DC fast
+    /// charging. Drives the web "Fast charging" badge and unlocks the
+    /// manual per-charge cost (which is offered on fast charges only).
+    fast_charging: bool,
+    /// `cost` came from a user-entered per-charge override rather than the
+    /// tag/rate engine (see `apply_cost_override`). Lets the UI show the
+    /// cost as manually set and skip the "set a rate" hint.
+    cost_overridden: bool,
 }
 
 /// One point on the detail charts. Carries every per-sample series the
@@ -169,6 +190,37 @@ fn sample_power_kw(r: &ChargeRow) -> Option<f64> {
             }
         }
         _ => Some(coarse),
+    }
+}
+
+/// Charger current in amps for display. Tesla's `charger_actual_current`
+/// is the AC current into the **onboard charger**, so during DC fast
+/// charging (Supercharger / CCS) — where the onboard charger is bypassed
+/// and DC flows straight to the HV battery — the car reports a literal
+/// `0 A`. The true DC current isn't carried in any field; like Tessie we
+/// derive it as power ÷ voltage (e.g. 158 kW ÷ 389 V ≈ 406 A, matching
+/// Tessie's reading on the same charge).
+///
+/// We derive only when the reported current is absent or zero. AC charging
+/// always reports a real nonzero current (12 A on Level 1, 48 A on Level
+/// 2, per-phase amps on European 3-phase), so a genuine measurement is
+/// never overwritten — this sharpens exactly the DC case that needs it and
+/// is a no-op everywhere else.
+fn display_current_a(
+    power_kw: Option<i64>,
+    voltage_v: Option<i64>,
+    raw: Option<i64>,
+) -> Option<i64> {
+    match raw {
+        // Real AC measurement — trust it.
+        Some(a) if a > 0 => Some(a),
+        // Reported 0 (DC) or missing: derive P÷V when both are present.
+        _ => match (power_kw, voltage_v) {
+            (Some(p), Some(v)) if v > 0 && p > 0 => {
+                Some((p as f64 * 1000.0 / v as f64).round() as i64)
+            }
+            _ => raw,
+        },
     }
 }
 
@@ -479,6 +531,25 @@ fn apply_rates(
     s.tags = tags;
 }
 
+/// Apply a manual per-charge cost override on top of the rate-derived
+/// cost. A stored override always wins — it's a real total the user took
+/// off a receipt (e.g. a Supercharger session), so it supersedes whatever
+/// the tag/rate engine computed. Clears `rate` (a lump sum has no per-kWh
+/// rate to show) and flags `cost_overridden` so the UI labels it as
+/// manually set. `None` is a no-op, leaving the rate-derived cost in place.
+fn apply_cost_override(s: &mut ChargeSessionSummary, override_cost: Option<(f64, String)>) {
+    if let Some((amount, currency)) = override_cost {
+        s.cost = Some(amount);
+        // The override carries the currency it was entered in; keep the
+        // rate-config currency if the stored one is blank (legacy/NULL).
+        if !currency.is_empty() {
+            s.currency = currency;
+        }
+        s.rate = None;
+        s.cost_overridden = true;
+    }
+}
+
 /// Heuristic "is this row charging?" for pre-v14 rows that don't carry a
 /// persisted Tesla phase. `rate_mph` is the authoritative truth when the
 /// car reports it: nonzero rate = energy is going into the battery; an
@@ -634,6 +705,8 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         _ => None,
     };
 
+    let peak_power_kw = rows.iter().filter_map(|r| r.power_kw).max();
+
     ChargeSessionSummary {
         id: first.ts,
         start_ms: first.ts * 1000,
@@ -645,7 +718,7 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         energy_added_kwh,
         energy_used_kwh,
         efficiency_pct,
-        peak_power_kw: rows.iter().filter_map(|r| r.power_kw).max(),
+        peak_power_kw,
         start_soc: rows.iter().find_map(|r| r.battery_pct),
         end_soc: rows.iter().rev().find_map(|r| r.battery_pct),
         start_range_mi: rows.iter().find_map(|r| r.range_mi),
@@ -656,6 +729,9 @@ fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         cost: None,
         rate: None,
         currency: String::new(),
+        fast_charging: peak_power_kw.is_some_and(|p| p > FAST_CHARGE_THRESHOLD_KW),
+        // Set true by `apply_cost_override` when a manual cost is stored.
+        cost_overridden: false,
     }
 }
 
@@ -674,12 +750,15 @@ pub async fn list_charging(
         Ok(rows) => {
             let rates = RateConfig::load();
             let tag_map = state.drives.store.get_all_charge_tags().unwrap_or_default();
+            let cost_map = state.drives.store.get_all_charge_costs().unwrap_or_default();
             let mut sessions: Vec<ChargeSessionSummary> = group_sessions(rows)
                 .iter()
                 .map(|s| {
                     let mut summary = summarize(s);
                     let tags = tag_map.get(&summary.id).cloned().unwrap_or_default();
+                    let override_cost = cost_map.get(&summary.id).cloned();
                     apply_rates(&mut summary, s, tags, &rates);
+                    apply_cost_override(&mut summary, override_cost);
                     summary
                 })
                 .collect();
@@ -728,14 +807,22 @@ pub async fn single_charging(
         .store
         .get_charge_tags(summary.id)
         .unwrap_or_default();
+    let override_cost = state
+        .drives
+        .store
+        .get_charge_cost(summary.id)
+        .unwrap_or_default();
     apply_rates(&mut summary, &session, tags, &RateConfig::load());
+    apply_cost_override(&mut summary, override_cost);
 
     let points: Vec<ChargePoint> = session
         .iter()
         .map(|r| ChargePoint {
             ts: r.ts * 1000,
             power_kw: r.power_kw,
-            current_a: r.current_a,
+            // DC fast charging reports 0 A (onboard charger bypassed); show
+            // the derived P÷V current so the amperage curve is meaningful.
+            current_a: display_current_a(r.power_kw, r.voltage_v, r.current_a),
             voltage_v: r.voltage_v,
             rate_mph: r.rate_mph,
             soc: r.battery_pct,
@@ -746,8 +833,13 @@ pub async fn single_charging(
 
     let detail = ChargeSessionDetail {
         avg_power_kw: avg(session.iter().filter_map(|r| r.power_kw.map(|v| v as f64))),
-        peak_current_a: session.iter().filter_map(|r| r.current_a).max(),
-        avg_current_a: avg(session.iter().filter_map(|r| r.current_a.map(|v| v as f64))),
+        peak_current_a: session
+            .iter()
+            .filter_map(|r| display_current_a(r.power_kw, r.voltage_v, r.current_a))
+            .max(),
+        avg_current_a: avg(session.iter().filter_map(|r| {
+            display_current_a(r.power_kw, r.voltage_v, r.current_a).map(|v| v as f64)
+        })),
         peak_voltage_v: session.iter().filter_map(|r| r.voltage_v).max(),
         avg_voltage_v: avg(session.iter().filter_map(|r| r.voltage_v.map(|v| v as f64))),
         peak_rate_mph: session
@@ -904,6 +996,42 @@ pub async fn set_charge_tags(
     Json(body): Json<SetChargeTagsRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     match state.drives.store.set_charge_tags(id, &body.tags) {
+        Ok(()) => crate::json_ok(),
+        Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct SetChargeCostRequest {
+    /// The manual total for this charge. `null` clears the override and
+    /// reverts the session to its rate-derived cost.
+    pub amount: Option<f64>,
+}
+
+/// PUT /api/charging/{id}/cost — set or clear a manual per-charge cost
+/// override. `id` is the session's start timestamp (its stable id). The
+/// amount is stored in the user's currently-configured currency so the
+/// shown value stays stable even if the default currency pref changes.
+pub async fn set_charge_cost(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(body): Json<SetChargeCostRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let cost = match body.amount {
+        // A real total to store, in the configured currency.
+        Some(a) if a.is_finite() && a >= 0.0 => Some((a, RateConfig::load().currency)),
+        // Reject a malformed amount rather than silently clearing — that
+        // would hide a client bug behind a "success".
+        Some(_) => {
+            return crate::json_error(
+                StatusCode::BAD_REQUEST,
+                "amount must be a non-negative number",
+            );
+        }
+        // Explicit null → clear the override.
+        None => None,
+    };
+    match state.drives.store.set_charge_cost(id, cost) {
         Ok(()) => crate::json_ok(),
         Err(e) => crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     }
@@ -1282,6 +1410,51 @@ mod tests {
         assert!((used - 7.0).abs() < 1e-9, "expected integer 7 kWh when volts missing, got {used}");
     }
 
+    // ── Derived DC current + fast-charging flag ─────────────────────────
+
+    #[test]
+    fn display_current_derives_dc_amps_only_when_reported_zero_or_missing() {
+        // Supercharger: the car reports 0 A (onboard charger bypassed).
+        // Derive 158 kW ÷ 389 V ≈ 406 A — matches Tessie's reading.
+        assert_eq!(display_current_a(Some(158), Some(389), Some(0)), Some(406));
+        // Mid-taper DC sample, 85 kW ÷ 398 V ≈ 214 A.
+        assert_eq!(display_current_a(Some(85), Some(398), Some(0)), Some(214));
+        // Reported current missing entirely on a DC sample → still derive.
+        assert_eq!(display_current_a(Some(90), Some(397), None), Some(227));
+        // AC Level 2: a real 48 A measurement is kept, NOT replaced by the
+        // (rounding-noisy) V×I product.
+        assert_eq!(display_current_a(Some(11), Some(240), Some(48)), Some(48));
+        // Level 1: 12 A kept.
+        assert_eq!(display_current_a(Some(1), Some(120), Some(12)), Some(12));
+        // 0 A but no voltage to derive from → return the raw 0 unchanged.
+        assert_eq!(display_current_a(Some(150), None, Some(0)), Some(0));
+        // Nothing to work with.
+        assert_eq!(display_current_a(None, None, None), None);
+    }
+
+    #[test]
+    fn fast_charging_flag_tracks_peak_power_above_threshold() {
+        // Supercharge peaking at 158 kW → fast.
+        let sc = summarize(&[
+            row(0, Some(60), Some(500.0), Some(0.0)),
+            row(60, Some(158), Some(600.0), Some(6.0)),
+        ]);
+        assert!(sc.fast_charging);
+        // Home Level 2 peaking at 11 kW → not fast.
+        let home = summarize(&[
+            row(0, Some(7), Some(25.0), Some(0.0)),
+            row(60, Some(11), Some(40.0), Some(1.0)),
+        ]);
+        assert!(!home.fast_charging);
+        // Exactly 22 kW is NOT fast (strict >, so a 22 kW EU AC wallbox
+        // stays "normal").
+        let edge = summarize(&[
+            row(0, Some(22), Some(80.0), Some(0.0)),
+            row(60, Some(22), Some(80.0), Some(1.0)),
+        ]);
+        assert!(!edge.fast_charging);
+    }
+
     #[test]
     fn summarize_computes_used_and_efficiency_then_apply_rates_costs_on_used() {
         let session = [
@@ -1311,6 +1484,33 @@ mod tests {
         apply_rates(&mut s, &session, vec![], &rates(None, &[]));
         assert_eq!(s.cost, None);
         assert_eq!(s.rate, None);
+    }
+
+    #[test]
+    fn manual_cost_override_beats_rate_and_sets_flag() {
+        let session = hour_session();
+        let mut s = summarize(&session);
+        // Rate engine would price this at 0.30 × 10 kWh = 3.00.
+        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        assert_eq!(s.cost, Some(3.0));
+        assert!(!s.cost_overridden);
+        // A manual override wins: replaces cost, clears the per-kWh rate,
+        // adopts its currency, and flips the flag.
+        apply_cost_override(&mut s, Some((18.75, "€".to_string())));
+        assert_eq!(s.cost, Some(18.75));
+        assert_eq!(s.rate, None);
+        assert_eq!(s.currency, "€");
+        assert!(s.cost_overridden);
+    }
+
+    #[test]
+    fn no_override_leaves_rate_cost_untouched() {
+        let session = hour_session();
+        let mut s = summarize(&session);
+        apply_rates(&mut s, &session, vec!["Home".into()], &rates(None, &[("Home", 0.30)]));
+        apply_cost_override(&mut s, None);
+        assert_eq!(s.cost, Some(3.0));
+        assert!(!s.cost_overridden);
     }
 
     #[test]

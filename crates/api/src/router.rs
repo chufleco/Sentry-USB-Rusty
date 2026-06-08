@@ -214,6 +214,10 @@ pub fn build_router(state: AppState) -> Router {
             "/api/charging/{id}/tags",
             put(crate::charging::set_charge_tags),
         )
+        .route(
+            "/api/charging/{id}/cost",
+            put(crate::charging::set_charge_cost),
+        )
         // Keep-awake
         .route("/api/keep-awake/start", post(crate::keep_awake::start))
         .route("/api/keep-awake/stop", post(crate::keep_awake::stop))

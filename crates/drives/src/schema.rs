@@ -343,6 +343,22 @@ pub const CHARGE_TAGS_TABLE: &[&str] = &[
     "CREATE INDEX IF NOT EXISTS idx_charge_tags_tag ON charge_tags(tag)",
 ];
 
+/// Manual per-charge cost overrides — a user-entered total (e.g. from a
+/// Supercharger receipt) that overrides the tag/rate-derived cost. Mirrors
+/// `charge_tags`: keyed on the charge session id (its start timestamp in
+/// unix seconds), a standalone table created idempotently on every open,
+/// so it needs no `CURRENT_SCHEMA_VERSION` bump — presence is guaranteed
+/// by `IF NOT EXISTS` and it's unrelated to the route cache the version
+/// key invalidates. The currency it was entered in rides along so the
+/// shown value stays stable if the default currency pref later changes.
+pub const CHARGE_COSTS_TABLE: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS charge_costs (
+        session_ts INTEGER PRIMARY KEY,
+        amount     REAL NOT NULL,
+        currency   TEXT
+    ) WITHOUT ROWID",
+];
+
 /// Bring the DB up to `CURRENT_SCHEMA_VERSION`. Safe on every open â€”
 /// idempotent by construction.
 pub fn migrate(conn: &Connection) -> Result<()> {
@@ -375,6 +391,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
     for stmt in CHARGE_TAGS_TABLE {
         conn.execute(stmt, []).with_context(|| {
             format!("migrate: applying charge_tags DDL {:?}", truncate(stmt, 60))
+        })?;
+    }
+
+    // Manual per-charge cost overrides. Same idempotent standalone-table
+    // treatment as charge_tags; see CHARGE_COSTS_TABLE docs.
+    for stmt in CHARGE_COSTS_TABLE {
+        conn.execute(stmt, []).with_context(|| {
+            format!("migrate: applying charge_costs DDL {:?}", truncate(stmt, 60))
         })?;
     }
 

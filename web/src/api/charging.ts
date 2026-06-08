@@ -47,6 +47,21 @@ export async function setChargeTags(
   if (!res.ok) throw new Error(`set charge tags ${id}: ${res.status}`)
 }
 
+/// Set or clear the manual per-charge cost override (id == its start
+/// timestamp). Pass `null` to clear and revert to the rate-derived cost.
+/// The amount is stored in the user's configured currency server-side.
+export async function setChargeCost(
+  id: string | number,
+  amount: number | null,
+): Promise<void> {
+  const res = await fetch(`/api/charging/${id}/cost`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ amount }),
+  })
+  if (!res.ok) throw new Error(`set charge cost ${id}: ${res.status}`)
+}
+
 export interface BulkDeleteChargesResult {
   deleted: number
   sessions: number

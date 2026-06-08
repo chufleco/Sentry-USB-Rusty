@@ -57,6 +57,22 @@ const CLIMATE_INTERVAL: Duration = Duration::from_secs(60);
 const CHARGE_INTERVAL: Duration = Duration::from_secs(60);
 const CHARGE_INITIAL_OFFSET: Duration = Duration::from_secs(30);
 
+/// Charge refresh cadence while **fast charging** (DC: Supercharger /
+/// CCS). The power curve tapers fast on a DC charge, so 60s smears the
+/// shape and misses the early peak; 15s captures it. Only used while the
+/// last charge poll showed active charging above `FAST_CHARGE_THRESHOLD_KW`
+/// — it reverts to `CHARGE_INTERVAL` the moment power drops or the charge
+/// ends.
+const CHARGE_FAST_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Charger power (kW) above which we treat a charge as DC fast charging
+/// and switch to `CHARGE_FAST_INTERVAL`. Mirror of
+/// `FAST_CHARGE_THRESHOLD_KW` in `crates/api/src/charging.rs` (the api
+/// crate can't be a dependency here) — keep the two in sync. Strict `>`,
+/// so a 22 kW European AC wallbox stays on the normal cadence. `i32` to
+/// match the decoded `charger_power_kw`.
+const FAST_CHARGE_THRESHOLD_KW: i32 = 22;
+
 /// Tire-pressure refresh in Active mode. 5 min — TPMS barely changes
 /// mid-drive.
 const TIRES_INTERVAL: Duration = Duration::from_secs(300);
@@ -188,9 +204,13 @@ impl Schedule {
         self.climate_failures = if success { 0 } else { self.climate_failures.saturating_add(1) };
         self.next_climate = Self::next_after(now, success, self.climate_failures, CLIMATE_INTERVAL);
     }
-    fn mark_charge(&mut self, now: Instant, success: bool) {
+    /// `fast` = the last charge poll saw active DC fast charging; use the
+    /// 15s cadence so the steep power taper is captured, else the 60s one.
+    /// The fast-retry-on-failure path is unchanged.
+    fn mark_charge(&mut self, now: Instant, success: bool, fast: bool) {
         self.charge_failures = if success { 0 } else { self.charge_failures.saturating_add(1) };
-        self.next_charge = Self::next_after(now, success, self.charge_failures, CHARGE_INTERVAL);
+        let interval = if fast { CHARGE_FAST_INTERVAL } else { CHARGE_INTERVAL };
+        self.next_charge = Self::next_after(now, success, self.charge_failures, interval);
     }
     fn mark_tires(&mut self, now: Instant, success: bool) {
         self.tires_failures = if success { 0 } else { self.tires_failures.saturating_add(1) };
@@ -977,8 +997,11 @@ async fn tick(
             any_call_ran = true;
         }
 
-        // ── 3. CHARGE (every 60s, offset 30s from climate) ──
+        // ── 3. CHARGE (every 60s, or 15s while DC fast charging) ──
         if schedule.charge_due(tick_now) {
+            // Set in the Ok arm when this poll sees DC fast charging; picks
+            // the 15s vs 60s next-charge cadence in `mark_charge` below.
+            let mut fast_charging = false;
             let success = match sample_ble::sample_charge_ble(session).await {
                 Ok(c) => {
                     if cfg.experimental {
@@ -997,6 +1020,16 @@ async fn tick(
                     sample.charge_limit_soc = d.charge_limit_soc;
                     sample.battery_range_mi = d.battery_range_mi;
                     sample.charge_minutes_to_full = d.minutes_to_full_charge;
+                    // DC fast charging = actively charging AND power above
+                    // the AC Level 2 ceiling. Drives the 15s poll cadence so
+                    // the steep Supercharger taper is captured (60s smears
+                    // it and misses the early peak). Reverts automatically
+                    // once power drops or the charge ends.
+                    fast_charging = c
+                        .charging_state
+                        .map(|s| s.is_active_charging())
+                        .unwrap_or(false)
+                        && d.charger_power_kw.is_some_and(|p| p > FAST_CHARGE_THRESHOLD_KW);
                     // Persist the charge phase (v14) so /api/charging/current
                     // can keep the dashboard banner up the whole charge across
                     // BLE sampler dropouts — and only drop it when a poll
@@ -1017,7 +1050,7 @@ async fn tick(
                     false
                 }
             };
-            schedule.mark_charge(tick_now, success);
+            schedule.mark_charge(tick_now, success, fast_charging);
             any_call_ran = true;
         }
 

@@ -653,6 +653,70 @@ impl DriveStore {
         Ok(tags)
     }
 
+    // ── Charge-cost overrides ───────────────────────────────────────────
+    // A manual per-charge cost (e.g. a Supercharger receipt total) that
+    // overrides the tag/rate-derived cost. Keyed on the session start
+    // timestamp like charge_tags; `None` clears the override. The web
+    // offers this only for fast-charging sessions.
+
+    /// Set, or clear when `cost` is `None`, the manual cost override for
+    /// charge session `session_ts`. `cost` is `(amount, currency)`.
+    pub fn set_charge_cost(&self, session_ts: i64, cost: Option<(f64, String)>) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        match cost {
+            Some((amount, currency)) => conn.execute(
+                "INSERT INTO charge_costs(session_ts, amount, currency) VALUES(?1, ?2, ?3) \
+                 ON CONFLICT(session_ts) DO UPDATE SET amount = ?2, currency = ?3",
+                params![session_ts, amount, currency],
+            )?,
+            None => conn.execute(
+                "DELETE FROM charge_costs WHERE session_ts = ?1",
+                params![session_ts],
+            )?,
+        };
+        Ok(())
+    }
+
+    /// Manual cost override for one charge session, if set.
+    pub fn get_charge_cost(&self, session_ts: i64) -> Result<Option<(f64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn
+            .prepare_cached("SELECT amount, currency FROM charge_costs WHERE session_ts = ?1")?;
+        let mut rows = stmt.query_map(params![session_ts], |row| {
+            Ok((
+                row.get::<_, f64>(0)?,
+                row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+            ))
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Full session_ts → (amount, currency) map of manual cost overrides,
+    /// for pricing the whole charging list in one query.
+    pub fn get_all_charge_costs(
+        &self,
+    ) -> Result<std::collections::HashMap<i64, (f64, String)>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare_cached("SELECT session_ts, amount, currency FROM charge_costs")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, Option<String>>(2)?.unwrap_or_default(),
+            ))
+        })?;
+        let mut out = std::collections::HashMap::new();
+        for r in rows {
+            let (k, amount, currency) = r?;
+            out.insert(k, (amount, currency));
+        }
+        Ok(out)
+    }
+
     /// Empty `processed_files` so every clip becomes eligible for
     /// re-extraction. Routes and drive_tags are preserved.
     pub fn clear_processed_for_reprocess(&self) -> Result<()> {
@@ -1974,6 +2038,44 @@ mod tests {
         assert_eq!(map.get(&1800), Some(&vec!["Work".to_string()]));
         assert!(!map.contains_key(&1700));
         assert_eq!(store.get_all_charge_tag_names().unwrap(), vec!["Work".to_string()]);
+    }
+
+    #[test]
+    fn charge_cost_override_set_get_clear() {
+        let store = DriveStore::open_memory().unwrap();
+        // No override initially.
+        assert_eq!(store.get_charge_cost(1700).unwrap(), None);
+
+        // Set an override; read it back with its currency symbol.
+        store
+            .set_charge_cost(1700, Some((24.50, "$".to_string())))
+            .unwrap();
+        assert_eq!(
+            store.get_charge_cost(1700).unwrap(),
+            Some((24.50, "$".to_string())),
+        );
+
+        // Upsert replaces the amount in place (PRIMARY KEY, no dup row).
+        store
+            .set_charge_cost(1700, Some((30.0, "$".to_string())))
+            .unwrap();
+        assert_eq!(
+            store.get_charge_cost(1700).unwrap(),
+            Some((30.0, "$".to_string())),
+        );
+
+        // A second session is independent; the map carries both.
+        store
+            .set_charge_cost(1800, Some((12.0, "€".to_string())))
+            .unwrap();
+        let map = store.get_all_charge_costs().unwrap();
+        assert_eq!(map.get(&1700), Some(&(30.0, "$".to_string())));
+        assert_eq!(map.get(&1800), Some(&(12.0, "€".to_string())));
+
+        // None clears the override.
+        store.set_charge_cost(1700, None).unwrap();
+        assert_eq!(store.get_charge_cost(1700).unwrap(), None);
+        assert!(!store.get_all_charge_costs().unwrap().contains_key(&1700));
     }
 
     /// End-to-end contract for the `drive_tags` join key.

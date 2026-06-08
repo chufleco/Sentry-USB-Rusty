@@ -490,6 +490,15 @@ function ChargeRow({
               Charging
             </span>
           )}
+          {session.fastCharging && (
+            <span
+              title="DC fast charging (Supercharger / CCS) — peak power over 22 kW"
+              className="inline-flex shrink-0 items-center gap-1 rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-300 ring-1 ring-inset ring-amber-400/20"
+            >
+              <Zap className="h-2.5 w-2.5 fill-amber-300" />
+              Fast
+            </span>
+          )}
           {session.location ? (
             <>
               <MapPin className="h-3.5 w-3.5 shrink-0 text-emerald-300/80" />

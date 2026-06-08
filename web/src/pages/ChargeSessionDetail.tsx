@@ -3,17 +3,21 @@ import { Link, useParams } from "react-router-dom"
 import {
   ArrowLeft,
   BatteryCharging,
+  Check,
   DollarSign,
   Gauge,
   Leaf,
   Loader2,
   MapPin,
+  Pencil,
   Plug,
+  X,
   Zap,
 } from "lucide-react"
 import {
   fetchChargeSession,
   fetchCurrentCharge,
+  setChargeCost,
   setChargeTags,
 } from "@/api/charging"
 import type { ChargeSessionDetail, CurrentCharge } from "@/types/charging"
@@ -78,6 +82,17 @@ export default function ChargeSessionDetailPage() {
           /* keep optimistic tags if the refetch fails */
         }
       }
+    },
+    [id],
+  )
+
+  // Save (or clear, when `amount` is null) the manual per-charge cost, then
+  // refetch so the override/rate state comes straight from the backend.
+  const onCostSave = useCallback(
+    async (amount: number | null) => {
+      if (!id) return
+      await setChargeCost(id, amount)
+      setSession(await fetchChargeSession(id))
     },
     [id],
   )
@@ -205,6 +220,15 @@ export default function ChargeSessionDetailPage() {
                 {formatDateTime(session.startMs)}
               </h1>
               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-sm text-slate-500">
+                {session.fastCharging && (
+                  <span
+                    title="DC fast charging (Supercharger / CCS) — peak power over 22 kW"
+                    className="inline-flex items-center gap-1 rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300 ring-1 ring-inset ring-amber-400/20"
+                  >
+                    <Zap className="h-3 w-3 fill-amber-300" />
+                    Fast charging
+                  </span>
+                )}
                 <span>&rarr; {formatEndLabel(session.startMs, session.endMs)}</span>
                 <span>{fmtDuration(session.durationSecs)}</span>
                 {session.location && (
@@ -277,15 +301,28 @@ export default function ChargeSessionDetailPage() {
                 <StatTile
                   label="Cost"
                   value={
-                    session.cost != null
-                      ? fmtMoney(session.cost, session.currency)
-                      : "—"
+                    session.fastCharging ? (
+                      <EditableCost
+                        cost={session.cost}
+                        currency={session.currency}
+                        overridden={session.costOverridden}
+                        onSave={onCostSave}
+                      />
+                    ) : session.cost != null ? (
+                      fmtMoney(session.cost, session.currency)
+                    ) : (
+                      "—"
+                    )
                   }
                   icon={<DollarSign className="h-4 w-4" />}
                   info={
-                    session.rate != null
-                      ? `Charged on energy used at ${fmtMoney(session.rate, session.currency)}/kWh. Set rates from the Charging page.`
-                      : "Set an electricity rate from the Charging page to see cost."
+                    session.fastCharging
+                      ? session.costOverridden
+                        ? "Manually set for this charge. Click to edit or clear."
+                        : "Click to enter what this fast charge cost (e.g. from the Supercharger receipt). Overrides any rate."
+                      : session.rate != null
+                        ? `Charged on energy used at ${fmtMoney(session.rate, session.currency)}/kWh. Set rates from the Charging page.`
+                        : "Set an electricity rate from the Charging page to see cost."
                   }
                 />
               </StatGroup>
@@ -361,6 +398,12 @@ export default function ChargeSessionDetailPage() {
           {session.points.length > 1 && hasCurrent && (
             <div className="rounded-2xl border border-white/10 bg-slate-900/40 p-5">
               <SectionHeading>Amperage</SectionHeading>
+              {session.fastCharging && (
+                <p className="-mt-2 mb-3 text-xs text-slate-500">
+                  Estimated from power ÷ voltage — Tesla reports 0 A on DC
+                  fast charging (the onboard AC charger is bypassed).
+                </p>
+              )}
               <ChargingLineChart
                 points={session.points}
                 series={[{ key: "currentA", name: "Current", color: "#fbbf24" }]}
@@ -414,6 +457,116 @@ function formatEndLabel(startMs: number, endMs: number): string {
           hour: "numeric",
           minute: "2-digit",
         },
+  )
+}
+
+// Inline editor for the manual per-charge cost, rendered inside the Cost
+// StatTile's value slot on fast-charging sessions. Click to type an amount
+// (e.g. off the Supercharger receipt); saving overrides the rate-derived
+// cost, Clear reverts to it. Empty/invalid input clears the override.
+function EditableCost({
+  cost,
+  currency,
+  overridden,
+  onSave,
+}: {
+  cost: number | null
+  currency: string
+  overridden: boolean
+  onSave: (amount: number | null) => Promise<void>
+}) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState("")
+  const [saving, setSaving] = useState(false)
+
+  const begin = () => {
+    setDraft(cost != null ? String(cost) : "")
+    setEditing(true)
+  }
+  const commit = async (amount: number | null) => {
+    setSaving(true)
+    try {
+      await onSave(amount)
+      setEditing(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+  const save = () => {
+    const n = parseFloat(draft)
+    void commit(draft.trim() !== "" && Number.isFinite(n) && n >= 0 ? n : null)
+  }
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={begin}
+        className="group/cost inline-flex items-center gap-1.5 text-lg font-semibold text-slate-100 tabular-nums hover:text-white"
+      >
+        {cost != null ? (
+          fmtMoney(cost, currency)
+        ) : (
+          <span className="text-base font-medium text-slate-500">Set cost</span>
+        )}
+        <Pencil className="h-3.5 w-3.5 text-slate-500 opacity-0 transition-opacity group-hover/cost:opacity-100" />
+      </button>
+    )
+  }
+
+  return (
+    <div className="flex items-center gap-1.5">
+      <div className="inline-flex items-center rounded-md border border-white/10 bg-white/[0.04] pl-2">
+        <span className="text-sm text-slate-400">{currency}</span>
+        <input
+          autoFocus
+          type="number"
+          inputMode="decimal"
+          step="0.01"
+          min="0"
+          value={draft}
+          disabled={saving}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") save()
+            if (e.key === "Escape") setEditing(false)
+          }}
+          className="w-20 bg-transparent px-1 py-1 text-lg font-semibold text-slate-100 outline-none tabular-nums [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none"
+        />
+      </div>
+      <button
+        type="button"
+        aria-label="Save cost"
+        disabled={saving}
+        onClick={save}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-md bg-emerald-500/90 text-white hover:bg-emerald-400 disabled:opacity-50"
+      >
+        {saving ? (
+          <Loader2 className="h-4 w-4 animate-spin" />
+        ) : (
+          <Check className="h-4 w-4" />
+        )}
+      </button>
+      <button
+        type="button"
+        aria-label="Cancel"
+        disabled={saving}
+        onClick={() => setEditing(false)}
+        className="inline-flex h-7 w-7 items-center justify-center rounded-md border border-white/10 bg-white/[0.03] text-slate-300 hover:bg-white/[0.06] disabled:opacity-50"
+      >
+        <X className="h-4 w-4" />
+      </button>
+      {overridden && (
+        <button
+          type="button"
+          disabled={saving}
+          onClick={() => void commit(null)}
+          className="text-xs font-medium text-slate-500 hover:text-rose-300 disabled:opacity-50"
+        >
+          Clear
+        </button>
+      )}
+    </div>
   )
 }
 

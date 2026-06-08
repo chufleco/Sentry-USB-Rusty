@@ -29,6 +29,13 @@ export interface ChargeSessionSummary {
   cost: number | null
   rate: number | null
   currency: string
+  // True when peak power exceeds the AC Level 2 ceiling (>22 kW) — i.e. DC
+  // fast charging. Drives the "Fast charging" badge and, in the detail
+  // view, unlocks the manual per-charge cost.
+  fastCharging: boolean
+  // True when `cost` is a user-entered per-charge override rather than a
+  // rate-derived value (so `rate` is null and the UI shows it as manual).
+  costOverridden: boolean
 }
 
 export interface ChargePoint {
