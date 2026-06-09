@@ -63,11 +63,10 @@ async fn proxy_json(
     timeout: Duration,
 ) -> Response {
     let url = format!("{}{}", COMMUNITY_API, path);
-    let client = match reqwest::Client::builder().timeout(timeout).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let mut req = client.request(method, &url).headers(headers);
+    let mut req = crate::http_client()
+        .request(method, &url)
+        .timeout(timeout)
+        .headers(headers);
     if let Some(b) = body {
         req = req.header("Content-Type", "application/json").body(b);
     }
@@ -94,18 +93,9 @@ async fn proxy_library(
     headers: HeaderMap,
 ) -> Response {
     let url = format!("{}{}", COMMUNITY_API, path);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
-        Ok(c) => c,
-        Err(_) => {
-            return (
-                StatusCode::OK,
-                Json(serde_json::json!({ key: [], "total": 0 })),
-            )
-                .into_response();
-        }
-    };
-    let resp = match client
+    let resp = match crate::http_client()
         .get(&url)
+        .timeout(Duration::from_secs(15))
         .headers(forward_headers(&headers))
         .query(params)
         .send()
@@ -140,11 +130,12 @@ async fn proxy_library(
 
 async fn proxy_image(path: &str) -> Response {
     let url = format!("{}{}", COMMUNITY_API, path);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(15)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let resp = match client.get(&url).send().await {
+    let resp = match crate::http_client()
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return bad_gateway("Failed to fetch image"),
     };
@@ -195,11 +186,12 @@ pub async fn lock_chime_stream(
     }
     // Streams audio (WAV) — binary passthrough with appropriate cache headers.
     let url = format!("{}/lockchime/download/{}", COMMUNITY_API, code);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let resp = match client.get(&url).send().await {
+    let resp = match crate::http_client()
+        .get(&url)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+    {
         Ok(r) => r,
         Err(_) => return bad_gateway("Failed to fetch chime"),
     };
@@ -229,11 +221,7 @@ pub async fn lock_chime_upload(
     body: Bytes,
 ) -> Response {
     let url = format!("{}/lockchime/upload", COMMUNITY_API);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let mut req = client.post(&url);
+    let mut req = crate::http_client().post(&url).timeout(Duration::from_secs(30));
     if let Some(ct) = headers.get("content-type") {
         if let Ok(v) = reqwest::header::HeaderValue::from_bytes(ct.as_bytes()) {
             req = req.header("Content-Type", v);
@@ -276,12 +264,9 @@ pub async fn lock_chime_download(
     }
 
     let url = format!("{}/lockchime/download/{}", COMMUNITY_API, code);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let resp = match client
+    let resp = match crate::http_client()
         .get(&url)
+        .timeout(Duration::from_secs(30))
         .headers(forward_headers(&headers))
         .send()
         .await
@@ -512,11 +497,7 @@ pub async fn wraps_upload(
     }
 
     let url = format!("{}/wraps/upload", COMMUNITY_API);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let mut req = client.post(&url);
+    let mut req = crate::http_client().post(&url).timeout(Duration::from_secs(30));
     if let Some(ct) = headers.get("content-type") {
         if let Ok(v) = reqwest::header::HeaderValue::from_bytes(ct.as_bytes()) {
             req = req.header("Content-Type", v);
@@ -560,12 +541,9 @@ pub async fn wraps_download(
     const WRAPS_MAX_BYTES: usize = 20 * 1024 * 1024;
 
     let url = format!("{}/wraps/download/{}", COMMUNITY_API, code);
-    let client = match reqwest::Client::builder().timeout(Duration::from_secs(30)).build() {
-        Ok(c) => c,
-        Err(e) => return bad_gateway(&e.to_string()),
-    };
-    let resp = match client
+    let resp = match crate::http_client()
         .get(&url)
+        .timeout(Duration::from_secs(30))
         .headers(forward_headers(&headers))
         .send()
         .await

@@ -49,3 +49,25 @@ pub fn json_error(status: StatusCode, msg: &str) -> (StatusCode, Json<serde_json
 pub fn json_ok() -> (StatusCode, Json<serde_json::Value>) {
     (StatusCode::OK, Json(serde_json::json!({"success": true})))
 }
+
+/// Process-wide shared `reqwest` client for the outbound community /
+/// notification proxies.
+///
+/// Previously every proxied request built its own `reqwest::Client`,
+/// spinning up a fresh rustls/TLS stack and connection pool with no
+/// keep-alive reuse. One shared client pools connections to the two
+/// upstreams across requests. It carries **no** request-level timeout —
+/// the per-endpoint values (10s / 15s / 30s …) are preserved by each
+/// call site via `.timeout(..)` on the request builder, which overrides
+/// the client default. The 120s builder timeout is only a backstop so a
+/// site that forgets one can't hang a connection forever.
+pub fn http_client() -> &'static reqwest::Client {
+    use std::sync::OnceLock;
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(120))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}

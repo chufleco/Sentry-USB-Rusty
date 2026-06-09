@@ -321,14 +321,10 @@ async fn register_code_with_backend(
         "hostname": hostname,
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("failed to build HTTP client: {}", e))?;
-
     let url = format!("{}/register-code", notification_base_url());
-    let resp = client
+    let resp = crate::http_client()
         .post(&url)
+        .timeout(Duration::from_secs(10))
         .json(&body)
         .send()
         .await
@@ -366,26 +362,14 @@ pub async fn list_paired_devices(
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return crate::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to build HTTP client: {}", e),
-            );
-        }
-    };
-
     let url = format!(
         "{}/devices?device_id={}",
         notification_base_url(),
         creds.device_id
     );
-    let resp = match client
+    let resp = match crate::http_client()
         .get(&url)
+        .timeout(Duration::from_secs(10))
         .header("X-Device-Secret", &creds.device_secret)
         .send()
         .await
@@ -421,27 +405,15 @@ pub async fn remove_paired_device(
         }
     };
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            return crate::json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("failed to build HTTP client: {}", e),
-            );
-        }
-    };
-
     let url = format!(
         "{}/devices/{}?device_id={}",
         notification_base_url(),
         id,
         creds.device_id
     );
-    let resp = match client
+    let resp = match crate::http_client()
         .delete(&url)
+        .timeout(Duration::from_secs(10))
         .header("X-Device-Secret", &creds.device_secret)
         .send()
         .await
