@@ -357,6 +357,48 @@ use serde::Deserialize;
 
 use crate::router::AppState;
 
+/// Per-IP failed-login throttle: 5 failures in 5 minutes locks the IP
+/// out until the window drains. Same policy as the web terminal's
+/// shadow-auth limiter (terminal.rs) — without it the web login was
+/// the only credential surface on the box an attacker could
+/// brute-force without backoff.
+const LOGIN_RATE_WINDOW: Duration = Duration::from_secs(5 * 60);
+const LOGIN_RATE_MAX_FAILS: usize = 5;
+
+fn login_rate_store() -> &'static std::sync::Mutex<HashMap<String, Vec<std::time::Instant>>> {
+    static STORE: std::sync::OnceLock<
+        std::sync::Mutex<HashMap<String, Vec<std::time::Instant>>>,
+    > = std::sync::OnceLock::new();
+    STORE.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn login_rate_limited(ip: &str) -> bool {
+    let mut map = match login_rate_store().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    let cutoff = std::time::Instant::now().checked_sub(LOGIN_RATE_WINDOW);
+    if let Some(times) = map.get_mut(ip) {
+        times.retain(|t| cutoff.map(|c| *t > c).unwrap_or(true));
+        if times.is_empty() {
+            map.remove(ip);
+            return false;
+        }
+        return times.len() >= LOGIN_RATE_MAX_FAILS;
+    }
+    false
+}
+
+fn record_login_failure(ip: &str) {
+    let mut map = match login_rate_store().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    map.entry(ip.to_string())
+        .or_default()
+        .push(std::time::Instant::now());
+}
+
 #[derive(Deserialize)]
 pub struct LoginRequest {
     username: String,
@@ -366,14 +408,28 @@ pub struct LoginRequest {
 /// POST /api/auth/login
 pub async fn handle_login(
     axum::extract::State(state): axum::extract::State<AppState>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> Response {
     if !state.auth.auth_required() {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Authentication is not configured"}))).into_response();
     }
 
+    let ip = addr.ip().to_canonical().to_string();
+    if login_rate_limited(&ip) {
+        warn!("[auth] Login rate limit hit for {}", ip);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "error": "Too many failed attempts — try again in a few minutes"
+            })),
+        )
+            .into_response();
+    }
+
     if !state.auth.check_credentials(&req.username, &req.password) {
-        warn!("[auth] Failed login attempt for user {:?}", req.username);
+        record_login_failure(&ip);
+        warn!("[auth] Failed login attempt for user {:?} from {}", req.username, ip);
         return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error": "Invalid username or password"}))).into_response();
     }
 
