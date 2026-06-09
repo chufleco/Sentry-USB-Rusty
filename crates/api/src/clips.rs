@@ -135,12 +135,18 @@ pub async fn get_clips(
     }
     let limit = params.limit.unwrap_or(20).min(200);
 
-    let response = list_clips_in(
-        Path::new(TESLACAM_DIR),
-        category,
-        limit,
-        params.before.as_deref(),
-    );
+    // Each dated clip folder is read off disk, and the folders are
+    // symlinks into on-demand (autofs) snapshot mounts — the first read
+    // can block for seconds while the kernel mounts the image. Run it on
+    // the blocking pool so it can't stall the async reactor and drop the
+    // WebSocket heartbeat ("Reconnecting to SentryUSB…").
+    let category = category.to_string();
+    let before = params.before;
+    let response = tokio::task::spawn_blocking(move || {
+        list_clips_in(Path::new(TESLACAM_DIR), &category, limit, before.as_deref())
+    })
+    .await
+    .unwrap_or_else(|_| serde_json::json!([]));
     (StatusCode::OK, Json(response))
 }
 
@@ -151,6 +157,19 @@ pub async fn get_clips(
 pub async fn get_clip_telemetry(
     State(_state): State<AppState>,
     Query(params): Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    // Parsing GPS out of a clip reads and decodes the whole video file —
+    // heavy I/O + CPU. Run it on the blocking pool so opening a clip can't
+    // freeze the reactor (and drop the live WebSocket) for everyone else.
+    tokio::task::spawn_blocking(move || clip_telemetry_blocking(params))
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "telemetry task failed")
+        })
+}
+
+fn clip_telemetry_blocking(
+    params: std::collections::HashMap<String, String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let file = match params.get("file") {
         Some(f) => f,

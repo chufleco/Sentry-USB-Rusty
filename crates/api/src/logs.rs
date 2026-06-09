@@ -47,6 +47,16 @@ pub async fn get_log(
         return crate::ble_debug::get_ble_debug(State(s)).await;
     }
 
+    // Tail-reading a log seeks + reads up to 512 KB off the SD card — keep
+    // it off the reactor so a slow read can't stall the WebSocket heartbeat.
+    tokio::task::spawn_blocking(move || read_log_tail(name))
+        .await
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "log read task failed").into_response()
+        })
+}
+
+fn read_log_tail(name: String) -> Response {
     let known = log_path(&name).is_some();
     let path = match log_path(&name) {
         Some(p) => p.to_string(),

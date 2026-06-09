@@ -109,6 +109,20 @@ pub async fn list_files(
     State(_s): State<AppState>,
     Query(params): Query<ListParams>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // A folder listing reads the directory and stats every entry — and
+    // TeslaCam clip folders are symlinks into on-demand (autofs) snapshot
+    // mounts, so the first listing of a busy day can block for seconds
+    // while the kernel mounts the image. Run it on the blocking pool so it
+    // can't stall the async reactor (which would drop the WebSocket
+    // heartbeat and surface "Reconnecting to SentryUSB…" in the UI).
+    tokio::task::spawn_blocking(move || list_files_blocking(params))
+        .await
+        .unwrap_or_else(|_| {
+            crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, "file listing task failed")
+        })
+}
+
+fn list_files_blocking(params: ListParams) -> (StatusCode, Json<serde_json::Value>) {
     let req_path = params.path.as_deref().unwrap_or("/");
     let offset = params.offset.unwrap_or(0);
     let limit = params.limit.unwrap_or(0);
