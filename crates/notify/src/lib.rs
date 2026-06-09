@@ -246,71 +246,80 @@ pub async fn send_to_all_with_context(
     config: &NotifyConfig,
     req: &NotifyRequest<'_>,
 ) -> Vec<(String, Result<()>)> {
+    use futures::future::BoxFuture;
+
     let client = notify_client();
 
     let title = req.title;
     let message = req.message;
 
-    let mut results = Vec::new();
+    // Fan the providers out CONCURRENTLY. Each send is an independent
+    // HTTP call with its own 30s timeout; dispatching sequentially made
+    // total latency the SUM of every enabled channel — a time-sensitive
+    // Sentry alert's mobile push could sit behind a slow or unreachable
+    // Discord/Gotify endpoint for up to 30s per channel. Concurrent
+    // dispatch makes it the MAX instead, with per-provider results (and
+    // ordering) unchanged for callers.
+    let mut sends: Vec<(&'static str, String, BoxFuture<'_, Result<()>>)> = Vec::new();
 
     if config.pushover_enabled {
-        let r = pushover::send(&client, &config.pushover_app_key, &config.pushover_user_key, title, message).await;
-        log_result("Pushover", &r);
-        results.push(("pushover".to_string(), r));
+        sends.push(("Pushover", "pushover".into(), Box::pin(
+            pushover::send(client, &config.pushover_app_key, &config.pushover_user_key, title, message),
+        )));
     }
 
     if config.discord_enabled {
-        let r = discord::send(&client, &config.discord_webhook_url, title, message).await;
-        log_result("Discord", &r);
-        results.push(("discord".to_string(), r));
+        sends.push(("Discord", "discord".into(), Box::pin(
+            discord::send(client, &config.discord_webhook_url, title, message),
+        )));
     }
 
     if config.telegram_enabled {
-        let r = telegram::send(&client, &config.telegram_bot_token, &config.telegram_chat_id, title, message, config.telegram_silent).await;
-        log_result("Telegram", &r);
-        results.push(("telegram".to_string(), r));
+        sends.push(("Telegram", "telegram".into(), Box::pin(
+            telegram::send(client, &config.telegram_bot_token, &config.telegram_chat_id, title, message, config.telegram_silent),
+        )));
     }
 
     if config.slack_enabled {
-        let r = slack::send(&client, &config.slack_webhook_url, title, message).await;
-        log_result("Slack", &r);
-        results.push(("slack".to_string(), r));
+        sends.push(("Slack", "slack".into(), Box::pin(
+            slack::send(client, &config.slack_webhook_url, title, message),
+        )));
     }
 
     if config.gotify_enabled {
-        let r = gotify::send(&client, &config.gotify_domain, &config.gotify_app_token, &config.gotify_priority, title, message).await;
-        log_result("Gotify", &r);
-        results.push(("gotify".to_string(), r));
+        sends.push(("Gotify", "gotify".into(), Box::pin(
+            gotify::send(client, &config.gotify_domain, &config.gotify_app_token, &config.gotify_priority, title, message),
+        )));
     }
 
     if config.ntfy_enabled {
-        let r = ntfy::send(&client, &config.ntfy_url, &config.ntfy_token, &config.ntfy_priority, title, message).await;
-        log_result("ntfy", &r);
-        results.push(("ntfy".to_string(), r));
+        sends.push(("ntfy", "ntfy".into(), Box::pin(
+            ntfy::send(client, &config.ntfy_url, &config.ntfy_token, &config.ntfy_priority, title, message),
+        )));
     }
 
     if config.ifttt_enabled {
-        let r = ifttt::send(&client, &config.ifttt_event_name, &config.ifttt_key, title, message).await;
-        log_result("IFTTT", &r);
-        results.push(("ifttt".to_string(), r));
+        sends.push(("IFTTT", "ifttt".into(), Box::pin(
+            ifttt::send(client, &config.ifttt_event_name, &config.ifttt_key, title, message),
+        )));
     }
 
     if config.webhook_enabled {
-        let r = webhook::send(&client, &config.webhook_url, title, message).await;
-        log_result("Webhook", &r);
-        results.push(("webhook".to_string(), r));
+        sends.push(("Webhook", "webhook".into(), Box::pin(
+            webhook::send(client, &config.webhook_url, title, message),
+        )));
     }
 
     if config.signal_enabled {
-        let r = signal::send(&client, &config.signal_url, &config.signal_from_num, &config.signal_to_num, message).await;
-        log_result("Signal", &r);
-        results.push(("signal".to_string(), r));
+        sends.push(("Signal", "signal".into(), Box::pin(
+            signal::send(client, &config.signal_url, &config.signal_from_num, &config.signal_to_num, message),
+        )));
     }
 
     if config.matrix_enabled {
-        let r = matrix::send(&client, &config.matrix_server_url, &config.matrix_username, &config.matrix_password, &config.matrix_room, title, message).await;
-        log_result("Matrix", &r);
-        results.push(("matrix".to_string(), r));
+        sends.push(("Matrix", "matrix".into(), Box::pin(
+            matrix::send(client, &config.matrix_server_url, &config.matrix_username, &config.matrix_password, &config.matrix_room, title, message),
+        )));
     }
 
     if config.mobile_push_enabled {
@@ -320,26 +329,33 @@ pub async fn send_to_all_with_context(
             archive_total_count: req.archive_total_count,
             device_name: Some(title),
         };
-        let r = sentry_connect::send_with_context(
-            &client,
-            &config.mobile_push_device_id,
-            &config.mobile_push_secret,
-            title,
-            message,
-            &ctx,
-        )
-        .await;
-        log_result("Mobile Push", &r);
-        results.push(("mobile_push".to_string(), r));
+        sends.push(("Mobile Push", "mobile_push".into(), Box::pin(async move {
+            sentry_connect::send_with_context(
+                client,
+                &config.mobile_push_device_id,
+                &config.mobile_push_secret,
+                title,
+                message,
+                &ctx,
+            )
+            .await
+        })));
     }
 
     if config.sns_enabled {
-        let r = sns::send(&config.sns_topic_arn, title, message).await;
-        log_result("SNS", &r);
-        results.push(("sns".to_string(), r));
+        sends.push(("SNS", "sns".into(), Box::pin(
+            sns::send(&config.sns_topic_arn, title, message),
+        )));
     }
 
-    results
+    futures::future::join_all(sends.into_iter().map(
+        |(display, key, fut)| async move {
+            let r = fut.await;
+            log_result(display, &r);
+            (key, r)
+        },
+    ))
+    .await
 }
 
 fn log_result(provider: &str, result: &Result<()>) {
