@@ -125,12 +125,22 @@ fn find_mdat_box(f: &mut File) -> Result<(u64, u64)> {
 }
 
 /// Reads through the mdat box parsing NAL units and extracting GPS from SEI.
-/// Uses a 64KB read buffer to avoid loading large mdat sections into memory.
+///
+/// Streams the mdat sequentially through a `BufReader`: the access pattern
+/// is forward-only (read each 4-byte length, peek the type byte, then
+/// either read the small SEI payload or skip past the NAL), so a single
+/// large buffer turns what used to be 2-3 `seek`+`read` syscalls *per NAL*
+/// — thousands of tiny syscalls on a typical minute-long clip's unbuffered
+/// File handle — into one read per ~256 KB. Non-SEI NALs (the bulk of the
+/// bytes — encoded video) are skipped with `seek_relative`, which discards
+/// the buffer only when the skip lands outside it, so large video frames
+/// don't get pulled into memory.
 fn extract_from_mdat(
     f: &mut File,
     offset: u64,
     size: u64,
 ) -> Result<(Vec<GpsPoint>, Vec<u8>, Vec<u8>, Vec<f32>, Vec<f32>)> {
+    use std::io::BufReader;
     const BUF_SIZE: u64 = 64 * 1024;
 
     let mut points = Vec::new();
@@ -143,10 +153,13 @@ fn extract_from_mdat(
     let mut cursor = offset;
     let mut size_buf = [0u8; 4];
 
+    let mut reader = BufReader::with_capacity(256 * 1024, f);
+    reader.seek(SeekFrom::Start(offset))?;
+
     while cursor + 4 <= end {
-        // Read NAL size (4 bytes, big-endian)
-        f.seek(SeekFrom::Start(cursor))?;
-        if f.read(&mut size_buf)? < 4 {
+        // Read NAL size (4 bytes, big-endian). Sequential — no seek; the
+        // reader is already positioned at `cursor` from the prior NAL.
+        if reader.read_exact(&mut size_buf).is_err() {
             break;
         }
         cursor += 4;
@@ -156,20 +169,19 @@ fn extract_from_mdat(
             break;
         }
 
-        // Read NAL type byte
+        // Read the NAL type byte (first byte of the NAL).
         let mut type_buf = [0u8; 1];
-        f.seek(SeekFrom::Start(cursor))?;
-        if f.read(&mut type_buf)? < 1 {
+        if reader.read_exact(&mut type_buf).is_err() {
             break;
         }
-
         let nal_type = type_buf[0] & 0x1F;
 
-        // NAL type 6 = SEI
+        // NAL type 6 = SEI. The type byte is the first byte of the NAL, so
+        // read the remaining (nal_size - 1) bytes after it into the buffer.
         if nal_type == 6 && nal_size <= BUF_SIZE {
             let mut nal = vec![0u8; nal_size as usize];
-            f.seek(SeekFrom::Start(cursor))?;
-            if f.read_exact(&mut nal).is_ok() {
+            nal[0] = type_buf[0];
+            if reader.read_exact(&mut nal[1..]).is_ok() {
                 if let Some((lat, lon, gear, ap_state, speed, accel_pos)) = parse_tesla_sei(&nal) {
                     points.push([
                         (lat * 1e6).round() / 1e6,
@@ -180,6 +192,13 @@ fn extract_from_mdat(
                     speeds.push(speed);
                     accel_positions.push(accel_pos);
                 }
+            } else {
+                break;
+            }
+        } else {
+            // Skip the rest of this NAL (the type byte was already read).
+            if reader.seek_relative((nal_size - 1) as i64).is_err() {
+                break;
             }
         }
 
