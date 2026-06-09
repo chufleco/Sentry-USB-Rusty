@@ -277,75 +277,95 @@ APEOF
   chmod 755 /etc/NetworkManager/dispatcher.d/10-sentryusb-ap
 fi
 
-# ── Install Tesla BLE telemetry sampler service + binary ──
+# ── Refresh the per-CPU binary picker ──
+# The picker now also re-validates the telemetry + ble-action symlinks
+# under /root/bin at every boot (the issue #88 SIGILL self-heal). Ship
+# the new version to existing installs from the tarball. Harmless on
+# very old installs whose sentryusb.service predates the ExecStartPre
+# hook — the script just sits unused until the unit is updated.
+if [ -f "$TMPDIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" ]; then
+  install -m 755 "$TMPDIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" /usr/local/bin/sentryusb-pick-binary
+fi
+
+# ── Install Tesla BLE telemetry sampler service + aux binaries ──
 # Two concerns here:
 #   1. The systemd unit ships in the source tarball — copy it into place
 #      and enable it. Idempotent on every upgrade.
-#   2. The binary itself needs to be on disk for the service's
-#      ConditionPathExists to pass. Future updates pull both binaries
-#      together via update.rs::self_update, but THIS run (the first
-#      upgrade onto telemetry-aware code) won't have it — bootstrap by
-#      downloading it from the same GitHub release that just shipped the
-#      main sentryusb binary. Idempotent: skipped if already present.
+#   2. The telemetry + ble-action binaries need to be on disk in the
+#      picker-managed layout: per-CPU variant copies under
+#      /opt/sentryusb with /root/bin/<name> as symlinks the picker
+#      re-validates at every boot (issue #88). A legacy regular file at
+#      /root/bin is converted by re-downloading the right variant — its
+#      own variant is unknowable (it may be the wrong-CPU build that
+#      caused the SIGILL crash-loop in the first place), so we never
+#      trust it. The old file is only replaced after a successful
+#      download; offline installs keep working and convert on a later
+#      run. Already-converted installs (symlink present) are skipped.
 if [ -f "$TMPDIR/server/ble/sentryusb-telemetry.service" ]; then
   cp "$TMPDIR/server/ble/sentryusb-telemetry.service" "/etc/systemd/system/sentryusb-telemetry.service"
   systemctl daemon-reload
   systemctl enable sentryusb-telemetry 2>/dev/null || true
 
-  if [ ! -x /root/bin/sentryusb-tesla-telemetry ]; then
-    # Match the suffix scheme update.rs uses. Three-tier: active-variant
-    # file (written by sentryusb-pick-binary) → live CPU detection → arch
-    # family fallback. The aarch64 suffix is per-CPU (-a53/-a72/-a76) so
-    # the telemetry binary's tuning matches the main daemon's tuning.
-    _suffix=""
-    if [ -s /opt/sentryusb/active-variant ]; then
-      _suffix=$(cat /opt/sentryusb/active-variant 2>/dev/null | tr -d '[:space:]')
-    fi
-    if [ -z "$_suffix" ]; then
-      _arch=$(dpkg --print-architecture 2>/dev/null || true)
-      case "$_arch" in
-        armhf)  _suffix=linux-armv7 ;;
-        amd64)  _suffix=linux-amd64 ;;
-        arm64)
-          # Sub-detect for aarch64: HWCAP atomics → a76, CPU part 0xD08 → a72,
-          # else a53. Same rules as sentryusb-pick-binary.
-          if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
-            _suffix=linux-arm64-a76
-          elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
-            _suffix=linux-arm64-a72
-          else
-            _suffix=linux-arm64-a53
-          fi
-          ;;
-        *)
-          _arch=$(uname -m 2>/dev/null || echo "")
-          case "$_arch" in
-            armv7l)  _suffix=linux-armv7 ;;
-            x86_64)  _suffix=linux-amd64 ;;
-            aarch64)
-              if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
-                _suffix=linux-arm64-a76
-              elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
-                _suffix=linux-arm64-a72
-              else
-                _suffix=linux-arm64-a53
-              fi
-              ;;
-            *)       _suffix="" ;;
-          esac
-          ;;
-      esac
-    fi
-    if [ -n "$_suffix" ]; then
-      _tele_url="https://github.com/{repo}/releases/latest/download/sentryusb-tesla-telemetry-${{_suffix}}"
-      if curl -sfI --max-time 10 "$_tele_url" >/dev/null 2>&1; then
-        mkdir -p /root/bin
-        if curl -fsSL --max-time 120 "$_tele_url" -o /tmp/sentryusb-tesla-telemetry-update 2>/dev/null; then
-          chmod +x /tmp/sentryusb-tesla-telemetry-update
-          mv /tmp/sentryusb-tesla-telemetry-update /root/bin/sentryusb-tesla-telemetry
+  # Match the suffix scheme update.rs uses. Three-tier: active-variant
+  # file (written by sentryusb-pick-binary) → live CPU detection → arch
+  # family fallback. The aarch64 suffix is per-CPU (-a53/-a72/-a76) so
+  # the aux binaries' tuning matches the main daemon's tuning.
+  _suffix=""
+  if [ -s /opt/sentryusb/active-variant ]; then
+    _suffix=$(cat /opt/sentryusb/active-variant 2>/dev/null | tr -d '[:space:]')
+  fi
+  if [ -z "$_suffix" ]; then
+    _arch=$(dpkg --print-architecture 2>/dev/null || true)
+    case "$_arch" in
+      armhf)  _suffix=linux-armv7 ;;
+      amd64)  _suffix=linux-amd64 ;;
+      arm64)
+        # Sub-detect for aarch64: HWCAP atomics → a76, CPU part 0xD08 → a72,
+        # else a53. Same rules as sentryusb-pick-binary.
+        if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+          _suffix=linux-arm64-a76
+        elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
+          _suffix=linux-arm64-a72
+        else
+          _suffix=linux-arm64-a53
+        fi
+        ;;
+      *)
+        _arch=$(uname -m 2>/dev/null || echo "")
+        case "$_arch" in
+          armv7l)  _suffix=linux-armv7 ;;
+          x86_64)  _suffix=linux-amd64 ;;
+          aarch64)
+            if grep -qE '^Features.*\batomics\b' /proc/cpuinfo 2>/dev/null; then
+              _suffix=linux-arm64-a76
+            elif grep -qE '^CPU part[[:space:]]*:[[:space:]]*0x[dD]08' /proc/cpuinfo 2>/dev/null; then
+              _suffix=linux-arm64-a72
+            else
+              _suffix=linux-arm64-a53
+            fi
+            ;;
+          *)       _suffix="" ;;
+        esac
+        ;;
+    esac
+  fi
+  if [ -n "$_suffix" ]; then
+    for _name in sentryusb-tesla-telemetry sentryusb-ble-action; do
+      # Symlink already in place → the picker owns it now; skip.
+      if [ -L "/root/bin/$_name" ]; then
+        continue
+      fi
+      _url="https://github.com/{repo}/releases/latest/download/$_name-$_suffix"
+      if curl -sfI --max-time 10 "$_url" >/dev/null 2>&1; then
+        mkdir -p /root/bin /opt/sentryusb
+        if curl -fsSL --max-time 120 "$_url" -o "/tmp/$_name.migrate" 2>/dev/null; then
+          chmod +x "/tmp/$_name.migrate"
+          mv "/tmp/$_name.migrate" "/opt/sentryusb/$_name-$_suffix"
+          ln -sfn "/opt/sentryusb/$_name-$_suffix" "/root/bin/$_name"
+          echo "migrate: installed $_name-$_suffix and linked /root/bin/$_name"
         fi
       fi
-    fi
+    done
   fi
 
   # Only attempt restart if the binary is actually present — the
@@ -389,4 +409,34 @@ fi
         repo = MIGRATE_REPO,
         branch = MIGRATE_BRANCH
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The migration script is a format!() template full of shell — a
+    /// stray unescaped `{` or a typo'd quote renders a script that fails
+    /// at runtime on every user's Pi. Render it and let bash parse it.
+    #[test]
+    fn migration_script_parses() {
+        let script = build_migration_script(
+            "https://github.com/Sentry-Six/Sentry-USB-Rusty/archive/v0.0.0.tar.gz",
+        );
+        // Placeholders must all have been substituted.
+        assert!(!script.contains("{repo}"), "unsubstituted {{repo}}");
+        assert!(!script.contains("{branch}"), "unsubstituted {{branch}}");
+        assert!(!script.contains("{tarball_url}"), "unsubstituted {{tarball_url}}");
+
+        let dir = std::env::temp_dir().join("sentryusb-migrate-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("migration.sh");
+        std::fs::write(&path, &script).unwrap();
+        let status = std::process::Command::new("bash")
+            .arg("-n")
+            .arg(&path)
+            .status()
+            .expect("bash not available");
+        assert!(status.success(), "bash -n rejected the migration script");
+    }
 }
