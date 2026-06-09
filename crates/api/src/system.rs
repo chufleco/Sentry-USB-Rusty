@@ -261,37 +261,25 @@ pub async fn ble_pair(State(s): State<AppState>, _body: String) -> (StatusCode, 
         // of the misleading "tap your card" message.
         let verify_ok = match &add_result {
             Ok(_) => {
+                // Verify via sentryusb-ble-action (same binary the
+                // ble-status probe below uses), which prints one token:
+                // PAIRED / NOT_PAIRED / UNREACHABLE. Both PAIRED and
+                // NOT_PAIRED mean the round-trip reached the car —
+                // NOT_PAIRED is just "key not whitelisted yet" because
+                // the user hasn't tapped their card, which still proves
+                // the radio link works. Only UNREACHABLE (or a missing/
+                // garbled reply) is the chip-broken transport state we
+                // flag. The pair flow has stopped the telemetry daemon,
+                // so this takes the binary's direct-BLE fallback — the
+                // fresh, independent round-trip we want here. 20s matches
+                // the ble-status probe's cold direct-scan budget.
                 let probe = sentryusb_shell::run_with_timeout(
-                    Duration::from_secs(15),
-                    "/root/bin/tesla-control",
-                    &[
-                        "-ble",
-                        "-vin", &vin_upper,
-                        "-bt-adapter", &adapter,
-                        "-connect-timeout", "10s",
-                        "-command-timeout", "5s",
-                        "session-info",
-                        "/root/.ble/key_private.pem",
-                        "infotainment",
-                    ],
+                    Duration::from_secs(20),
+                    "/root/bin/sentryusb-ble-action",
+                    &["session-info"],
                 ).await;
-                match probe {
-                    Ok(_) => true,
-                    Err(e) => {
-                        // session-info exits non-zero when the key
-                        // isn't yet whitelisted (user hasn't tapped
-                        // card yet) — that's still a successful BLE
-                        // round-trip and proves the link works. We
-                        // only treat the chip-broken transport
-                        // errors as a verification failure.
-                        let s = format!("{e:#}");
-                        !s.contains("timed out")
-                            && !s.contains("timeout")
-                            && !s.contains("connect failed")
-                            && !s.contains("Failed to initiate write")
-                            && !s.contains("not connected")
-                    }
-                }
+                let token = probe.as_deref().map(str::trim).unwrap_or("");
+                matches!(token, "PAIRED" | "NOT_PAIRED")
             }
             Err(_) => false,
         };
