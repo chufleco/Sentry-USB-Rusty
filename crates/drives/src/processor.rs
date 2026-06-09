@@ -123,10 +123,18 @@ impl Processor {
         self.scan_dir(clip_dir, &mut files)?;
         files.sort();
 
-        // Filter out already-processed files
+        // Filter out already-processed files. One bulk query into a
+        // HashSet rather than a locked `SELECT EXISTS` per file (which
+        // is N round-trips on the connection mutex before any work
+        // starts). `processed_set` normalizes stored paths to forward
+        // slashes and `scan_dir` already pushes forward-slash paths, so
+        // membership here matches `is_processed` exactly. Propagate a
+        // query failure instead of silently treating everything as
+        // unprocessed and re-ingesting the whole tree.
+        let processed = self.store.processed_set()?;
         let unprocessed: Vec<String> = files
             .into_iter()
-            .filter(|f| !self.store.is_processed(f).unwrap_or(true))
+            .filter(|f| !processed.contains(f.as_str()))
             .collect();
 
         let total = unprocessed.len();
