@@ -346,6 +346,14 @@ async fn main() -> Result<()> {
         tokio::signal::unix::SignalKind::user_defined1(),
     )?;
 
+    // Deadline for the next tick. The inter-tick wait is a select branch
+    // (not a sleep inside a branch body), so IPC action requests and
+    // signals are serviced immediately during the wait instead of
+    // queueing behind it for up to DISABLED_POLL. This also means an
+    // action no longer cancels an in-flight tick (the old racing-future
+    // pattern dropped the tick mid-await, silently discarding whatever
+    // sample data that tick had already collected).
+    let mut next_tick_at = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = sigterm.recv() => {
@@ -376,39 +384,45 @@ async fn main() -> Result<()> {
                 // from parked-confirmed Quiet (else we'd only fire a
                 // body_controller call). Next Park observation re-ticks it.
                 parked_polls = 0;
+                // Fire the tick now rather than waiting out the current
+                // inter-tick sleep (up to 30s in Quiet).
+                next_tick_at = tokio::time::Instant::now();
             }
             Some(req) = action_rx.recv() => {
                 // IPC: an external process (sentryusb-ble-action) wants a
                 // one-shot action through our PersistentSession. Serializes
-                // naturally with the select.
+                // naturally with the select. Doesn't touch next_tick_at —
+                // the schedule decides what's due, not the action.
                 handle_action_request(
                     req,
                     &mut held_radio,
                     &mut ble_session,
                 ).await;
             }
-            sleep = tick(
-                &conn,
-                &mut held_radio,
-                &mut parked_polls,
-                &mut last_user_presence,
-                &mut schedule,
-                &mut last_parked_awake_refresh,
-                &mut last_parked_awake_tpms_refresh,
-                &mut ble_session,
-                &mut last_charging_state,
-                &mut last_sentry_mode,
-                &mut last_gate_log,
-                &mut last_lat,
-                &mut last_lon,
-                &mut last_location_name,
-                &mut last_location_poll,
-            ) => {
+            _ = tokio::time::sleep_until(next_tick_at) => {
+                let (sleep, cfg) = tick(
+                    &conn,
+                    &mut held_radio,
+                    &mut parked_polls,
+                    &mut last_user_presence,
+                    &mut schedule,
+                    &mut last_parked_awake_refresh,
+                    &mut last_parked_awake_tpms_refresh,
+                    &mut ble_session,
+                    &mut last_charging_state,
+                    &mut last_sentry_mode,
+                    &mut last_gate_log,
+                    &mut last_lat,
+                    &mut last_lon,
+                    &mut last_location_name,
+                    &mut last_location_poll,
+                ).await;
                 // Keep-Accessory-Power automation runs after each tick
                 // with the freshly-updated signals. Best-effort; gated
                 // on the 12V flag + home geofence inside evaluate(), and
-                // a no-op until both are configured.
-                if let Ok(cfg) = config::BleConfig::load() {
+                // a no-op until both are configured. Reuses the config
+                // snapshot the tick already parsed (None = load failed).
+                if let Some(cfg) = cfg {
                     if let Some(handle) = ble_session.as_ref() {
                         keep_accessory::evaluate(
                             &cfg.keep_accessory,
@@ -429,7 +443,7 @@ async fn main() -> Result<()> {
                         .await;
                     }
                 }
-                tokio::time::sleep(sleep).await;
+                next_tick_at = tokio::time::Instant::now() + sleep;
             }
         }
     }
@@ -460,7 +474,9 @@ fn should_enter_quiet(
         && !keep_awake_active
 }
 
-/// One main-loop iteration; returns how long to sleep before the next.
+/// One main-loop iteration; returns how long to sleep before the next,
+/// plus the config snapshot it parsed (so the caller's keep-accessory
+/// pass doesn't re-read the file; `None` = config load failed).
 ///
 /// Two phases, decided each tick:
 ///   * **Active** — clip writes happening and shift_state not
@@ -488,12 +504,12 @@ async fn tick(
     last_lon: &mut Option<f64>,
     last_location_name: &mut Option<String>,
     last_location_poll: &mut Option<Instant>,
-) -> Duration {
+) -> (Duration, Option<BleConfig>) {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
         Err(e) => {
             warn!("failed to load BLE config: {e}");
-            return DISABLED_POLL;
+            return (DISABLED_POLL, None);
         }
     };
 
@@ -502,7 +518,7 @@ async fn tick(
     // key-load + scan + connect + handshake.
     if let Err(e) = sample_ble::ensure_session_for(ble_session, &cfg.vin, Some(&cfg.adapter)) {
         warn!("could not start PersistentSession (will retry next tick): {e:#}");
-        return Duration::from_secs(5);
+        return (Duration::from_secs(5), Some(cfg));
     }
     let session = &ble_session
         .as_ref()
@@ -517,7 +533,7 @@ async fn tick(
         }
         *parked_polls = 0;
         *last_user_presence = None;
-        return DISABLED_POLL;
+        return (DISABLED_POLL, Some(cfg));
     }
     if cfg.vin.is_empty() {
         debug!("no TESLA_BLE_VIN configured, idling");
@@ -527,7 +543,7 @@ async fn tick(
         }
         *parked_polls = 0;
         *last_user_presence = None;
-        return DISABLED_POLL;
+        return (DISABLED_POLL, Some(cfg));
     }
 
     let observation = usb_watch::observe();
@@ -639,6 +655,11 @@ async fn tick(
         };
 
         if acquired {
+            // Set when the BC poll failed at the connect layer (scan /
+            // adapter / GATT connect). Every further BLE call this tick
+            // would redo the same 30s scan + backoff against an
+            // unreachable car, so the follow-up probes are skipped.
+            let mut connect_failed = false;
             // Always probe body-controller first — it's the
             // canonical source of user_presence and is sleep-safe.
             let presence_now = match sample_ble::sample_body_controller_ble(session).await {
@@ -648,6 +669,8 @@ async fn tick(
                     p
                 }
                 Err(e) => {
+                    connect_failed =
+                        sentryusb_tesla_ble::manager::is_connect_failure(&e);
                     warn!("sample_body_controller failed: {e}");
                     *last_user_presence
                 }
@@ -666,7 +689,7 @@ async fn tick(
                 }
                 // 1s so the OS scheduler gets a moment; effectively
                 // immediate next tick → state poll.
-                return Duration::from_secs(1);
+                return (Duration::from_secs(1), Some(cfg));
             }
 
             // When the user is in the car AND we're in Quiet
@@ -678,7 +701,7 @@ async fn tick(
             // we just need shiftState here — the full Active mode
             // scheduler kicks in on the next tick if we detect a
             // shift change.
-            if presence_now == Some(true) {
+            if !connect_failed && presence_now == Some(true) {
                 match sample_ble::sample_drive_ble(session).await {
                     Ok(d) => {
                         if cfg.experimental {
@@ -712,7 +735,7 @@ async fn tick(
                             // Reset schedule so Active starts fresh
                             // with a full snapshot.
                             *schedule = Schedule::new(Instant::now());
-                            return Duration::from_secs(1);
+                            return (Duration::from_secs(1), Some(cfg));
                         }
                     }
                     Err(e) => {
@@ -734,7 +757,7 @@ async fn tick(
             // when the user is in the car (the drive probe above
             // already covers that path and a state transition is
             // imminent).
-            if observation == CarState::Awake && presence_now != Some(true) {
+            if !connect_failed && observation == CarState::Awake && presence_now != Some(true) {
                 // Two independent timers in this branch:
                 //   * `refresh_due`   — climate + charge every 3 min
                 //   * `tpms_due`      — tire pressure every 30 min
@@ -846,7 +869,7 @@ async fn tick(
                 *held_radio = false;
             }
         }
-        QUIET_INTERVAL
+        (QUIET_INTERVAL, Some(cfg))
     } else {
         // Active mode — scheduler-driven multi-poll. Each tick runs the
         // overdue sub-samplers in priority order, `state drive` first
@@ -863,11 +886,11 @@ async fn tick(
                         lock::current_owner(),
                         RADIO_CONTENDED_BACKOFF.as_secs()
                     );
-                    return RADIO_CONTENDED_BACKOFF;
+                    return (RADIO_CONTENDED_BACKOFF, Some(cfg));
                 }
                 Err(e) => {
                     warn!("failed to acquire radio lock: {e}");
-                    return RADIO_CONTENDED_BACKOFF;
+                    return (RADIO_CONTENDED_BACKOFF, Some(cfg));
                 }
             }
         }
@@ -890,6 +913,12 @@ async fn tick(
         };
         let mut shift_state_observed: Option<sample::ShiftState> = None;
         let mut any_call_ran = false;
+        // Set when a sub-sampler failed at the connect layer (scan /
+        // adapter / GATT connect) — the car is unreachable, so each
+        // remaining sub-sampler this tick would redo the same 30s scan
+        // + backoff. Skip them; their next_due stays in the past, so
+        // they re-run on the next tick once the car is reachable.
+        let mut connect_failed = false;
 
         // ── 1. DRIVE (priority) ── shiftState, locationName, odometer.
         if schedule.drive_due(tick_now) {
@@ -918,6 +947,9 @@ async fn tick(
                     true
                 }
                 Err(e) => {
+                    if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
+                        connect_failed = true;
+                    }
                     warn!("sample_drive failed: {e}");
                     false
                 }
@@ -940,7 +972,7 @@ async fn tick(
             .as_ref()
             .map(|s| s.is_active_charging())
             .unwrap_or(false);
-        if cfg.keep_accessory.enabled || charging_now {
+        if !connect_failed && (cfg.keep_accessory.enabled || charging_now) {
             let due = last_location_poll
                 .map(|t| tick_now.duration_since(t) >= LOCATION_POLL_INTERVAL)
                 .unwrap_or(true);
@@ -976,7 +1008,7 @@ async fn tick(
         }
 
         // ── 2. CLIMATE (every 60s) ──
-        if schedule.climate_due(tick_now) {
+        if !connect_failed && schedule.climate_due(tick_now) {
             let success = match sample_ble::sample_climate_ble(session).await {
                 Ok(c) => {
                     if cfg.experimental {
@@ -989,6 +1021,9 @@ async fn tick(
                     true
                 }
                 Err(e) => {
+                    if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
+                        connect_failed = true;
+                    }
                     warn!("sample_climate failed: {e}");
                     false
                 }
@@ -998,7 +1033,7 @@ async fn tick(
         }
 
         // ── 3. CHARGE (every 60s, or 15s while DC fast charging) ──
-        if schedule.charge_due(tick_now) {
+        if !connect_failed && schedule.charge_due(tick_now) {
             // Set in the Ok arm when this poll sees DC fast charging; picks
             // the 15s vs 60s next-charge cadence in `mark_charge` below.
             let mut fast_charging = false;
@@ -1046,6 +1081,9 @@ async fn tick(
                     true
                 }
                 Err(e) => {
+                    if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
+                        connect_failed = true;
+                    }
                     warn!("sample_charge failed: {e}");
                     false
                 }
@@ -1057,7 +1095,7 @@ async fn tick(
         // ── 4. CLOSURES (every 60s) ── consumed only for sentry_mode
         // (the quiet-mode gate); door/window/port state is in the same
         // response if the UI ever needs it.
-        if schedule.closures_due(tick_now) {
+        if !connect_failed && schedule.closures_due(tick_now) {
             let success = match sample_ble::sample_closures_ble(session).await {
                 Ok(c) => {
                     if cfg.experimental {
@@ -1070,6 +1108,9 @@ async fn tick(
                     true
                 }
                 Err(e) => {
+                    if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
+                        connect_failed = true;
+                    }
                     warn!("sample_closures failed: {e}");
                     false
                 }
@@ -1079,7 +1120,7 @@ async fn tick(
         }
 
         // ── 5. TIRES (every 5 min) ──
-        if schedule.tires_due(tick_now) {
+        if !connect_failed && schedule.tires_due(tick_now) {
             let success = match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {
                     try_sync_clock(t.meta);
@@ -1173,12 +1214,13 @@ async fn tick(
         // Sleep until the next sub-sampler is due (usually drive, 15s).
         let next = schedule.next_due();
         let after = Instant::now();
-        if next > after {
+        let sleep = if next > after {
             next.duration_since(after)
         } else {
             // Already overdue — tick again immediately.
             Duration::from_millis(100)
-        }
+        };
+        (sleep, Some(cfg))
     }
 }
 

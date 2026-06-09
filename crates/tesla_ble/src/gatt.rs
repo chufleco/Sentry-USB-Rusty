@@ -129,9 +129,27 @@ impl Connection {
     /// before TX in `round_trip` (short window, clears stragglers) and
     /// after subscribe in `open` (longer window, catches bluez's
     /// post-subscribe burst).
+    ///
+    /// Bounded by `MAX_DRAIN_TOTAL` wall-clock: the loop only exits when
+    /// the stream goes quiet for a full `quiet_window`, so a car emitting
+    /// unsolicited VCSEC broadcasts faster than the window would
+    /// otherwise pin us here forever — and this runs *outside* the
+    /// caller's response timeout, so nothing above us would fire.
     async fn drain_until_quiet(&mut self, quiet_window: Duration) {
+        const MAX_DRAIN_TOTAL: Duration = Duration::from_secs(2);
+        let started = std::time::Instant::now();
         let mut drained = 0;
         loop {
+            if started.elapsed() >= MAX_DRAIN_TOTAL {
+                warn!(
+                    "drain_until_quiet: still receiving after {}ms ({} notifications \
+                     drained) — proceeding anyway; the response validator will \
+                     discard remaining stragglers",
+                    started.elapsed().as_millis(),
+                    drained,
+                );
+                break;
+            }
             match timeout(quiet_window, self.rx_stream.next()).await {
                 Ok(Some(n)) => {
                     drained += 1;

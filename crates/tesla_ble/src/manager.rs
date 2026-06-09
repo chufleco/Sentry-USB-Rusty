@@ -105,6 +105,30 @@ pub enum PairingStatus {
     Unreachable(String),
 }
 
+/// Marker attached (via anyhow context) to every error coming out of
+/// the connect layer — adapter lookup, scan, GATT connect. Lets callers
+/// distinguish "couldn't reach the car at all" (where every further
+/// query this cycle would redo the same 30s scan + backoff) from
+/// per-domain protocol failures (where other queries may still work).
+/// Check with [`is_connect_failure`].
+#[derive(Debug, Clone, Copy)]
+pub struct ConnectFailure;
+
+impl std::fmt::Display for ConnectFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Wording deliberately avoids the substrings is_transport_error
+        // matches on ("not connected", "Peripheral", "BLE write", ...) —
+        // a connect failure has no held connection to drop.
+        f.write_str("could not reach vehicle (connect-layer failure)")
+    }
+}
+
+/// Whether `e` originated in the connect layer (scan/adapter/connect),
+/// i.e. carries a [`ConnectFailure`] marker anywhere in its chain.
+pub fn is_connect_failure(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ConnectFailure>().is_some()
+}
+
 enum Command {
     Query {
         domain: Domain,
@@ -670,6 +694,27 @@ async fn try_signed_request_once(
     ensure_connected(state).await?;
     ensure_domain_session(state, domain).await?;
 
+    // Counter rollover guard: refuse to send rather than wrap to 0. The
+    // car enforces strict per-epoch monotonicity, so a wrap is rejected
+    // as a replay forever; only a re-handshake recovers. Checked before
+    // borrowing the domain session so the cached state can actually be
+    // dropped here — the next query then re-handshakes from scratch
+    // (which resets the counter to whatever the car's fresh SessionInfo
+    // provides).
+    if state
+        .domains
+        .get(&domain)
+        .is_some_and(|d| d.counter == u32::MAX)
+    {
+        state.domains.remove(&domain);
+        bail!(
+            "counter rollover: domain {:?} counter hit u32::MAX. \
+             Dropped cached session state; the next query re-handshakes \
+             from scratch.",
+            domain
+        );
+    }
+
     let conn = state
         .conn
         .as_mut()
@@ -682,19 +727,6 @@ async fn try_signed_request_once(
     // TX time for the SessionInfo stale-window check below — measured
     // from when our message left, so it reflects round-trip latency.
     let request_sent_at = Instant::now();
-
-    // Counter rollover guard: refuse to send rather than wrap to 0. The
-    // car enforces strict per-epoch monotonicity, so a wrap is rejected
-    // as a replay forever; only a re-handshake recovers.
-    if ds.counter == u32::MAX {
-        bail!(
-            "counter rollover: domain {:?} counter hit u32::MAX. \
-             Dropping cached session state so the next query re-handshakes \
-             from scratch (which resets the counter to whatever the car's \
-             fresh SessionInfo provides).",
-            domain
-        );
-    }
     let counter = ds.counter + 1;
     let expires_at = ds.estimated_car_clock().saturating_add(EXPIRES_WINDOW);
 
@@ -1226,7 +1258,9 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
                 note_connect_failure(state);
                 sleep(state.backoff).await;
                 state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-                return Err(e).context("locating BLE adapter");
+                return Err(e)
+                    .context(ConnectFailure)
+                    .context("locating BLE adapter");
             }
         },
     };
@@ -1242,7 +1276,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             note_connect_failure(state);
             sleep(state.backoff).await;
             state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-            return Err(e).context("scan failed");
+            return Err(e).context(ConnectFailure).context("scan failed");
         }
     };
 
@@ -1257,7 +1291,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             note_connect_failure(state);
             sleep(state.backoff).await;
             state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-            return Err(e).context("connect failed");
+            return Err(e).context(ConnectFailure).context("connect failed");
         }
     };
 
