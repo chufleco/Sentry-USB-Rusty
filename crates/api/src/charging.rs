@@ -273,9 +273,16 @@ impl RateSchedule {
     }
 
     /// Time-of-day in `[start, end)`, wrapping when the window crosses
-    /// midnight.
+    /// midnight. Equal start/end means the full 24 hours: on a wrapping
+    /// clock "12AM to 12AM" reads as "all day", but the half-open
+    /// interval arithmetic made it a zero-width window that matched
+    /// nothing — schedules saved that way silently never priced a
+    /// session. The rate editor now rejects equal times on save; this
+    /// keeps already-saved configs working instead of ignoring them.
     fn covers_time(&self, min: i32) -> bool {
-        if self.start_min <= self.end_min {
+        if self.start_min == self.end_min {
+            true
+        } else if self.start_min < self.end_min {
             min >= self.start_min && min < self.end_min
         } else {
             min >= self.start_min || min < self.end_min
@@ -1605,6 +1612,29 @@ mod tests {
         apply_cost_override(&mut s, None);
         assert_eq!(s.cost, Some(3.0));
         assert!(!s.cost_overridden);
+    }
+
+    #[test]
+    fn equal_start_end_covers_all_day() {
+        // "12AM to 12AM" (and any other equal pair) means the full 24h —
+        // previously a zero-width window that matched nothing, so such a
+        // schedule silently never priced a session.
+        let s = RateSchedule {
+            rate: 0.10,
+            start_min: 0,
+            end_min: 0,
+            days: vec![],
+            start_month: 1,
+            end_month: 12,
+        };
+        assert!(s.covers(0, 3, 7));
+        assert!(s.covers(12 * 60, 3, 7));
+        assert!(s.covers(1439, 3, 7));
+
+        // Non-midnight equal pair behaves the same.
+        let nine = RateSchedule { start_min: 9 * 60, end_min: 9 * 60, ..s };
+        assert!(nine.covers(9 * 60, 3, 7));
+        assert!(nine.covers(8 * 60, 3, 7));
     }
 
     #[test]

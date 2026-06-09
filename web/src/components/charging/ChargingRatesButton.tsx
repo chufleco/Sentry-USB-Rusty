@@ -83,11 +83,13 @@ export function ChargingRatesButton({
   const [plans, setPlans] = useState<Record<string, PlanDraft>>({})
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const [busy, setBusy] = useState(false)
+  const [saveError, setSaveError] = useState<string | null>(null)
 
   // Seed the draft from the loaded rates + known tags, then open. The
   // Rates button stays disabled until rates finish loading, so this
   // always runs with the saved values in hand.
   const openEditor = () => {
+    setSaveError(null)
     setCurrency(rates.currency)
     setDefaultRate(rates.defaultRate != null ? String(rates.defaultRate) : "")
     const draft: Record<string, PlanDraft> = {}
@@ -139,6 +141,27 @@ export function ChargingRatesButton({
     })
 
   const onSave = async () => {
+    // Reject equal start/end times before anything is persisted. The
+    // half-open window math treats "12AM to 12AM" as zero-width, so a
+    // schedule saved that way silently never prices a session — surface
+    // the problem instead of dropping or mangling the row.
+    for (const [tag, plan] of Object.entries(plans)) {
+      for (const s of plan.schedules) {
+        if (
+          parseRate(s.rate) != null &&
+          TIME_RE.test(s.start) &&
+          TIME_RE.test(s.end) &&
+          s.start === s.end
+        ) {
+          setSaveError(
+            `"${tag}": schedule start and end times can't match (${s.start}). ` +
+              "For an all-day rate, use the flat rate instead.",
+          )
+          return
+        }
+      }
+    }
+    setSaveError(null)
     setBusy(true)
     try {
       const tagsOut: Record<string, TagRate> = {}
@@ -279,6 +302,9 @@ export function ChargingRatesButton({
 
             {/* Footer */}
             <div className="flex items-center justify-end gap-2 border-t border-white/10 px-4 py-3">
+              {saveError && (
+                <span className="mr-auto text-xs text-rose-300">{saveError}</span>
+              )}
               <button
                 type="button"
                 disabled={busy}
