@@ -671,7 +671,7 @@ async fn tick(
                 Err(e) => {
                     connect_failed =
                         sentryusb_tesla_ble::manager::is_connect_failure(&e);
-                    warn!("sample_body_controller failed: {e}");
+                    warn!("sample_body_controller failed: {e:#}");
                     *last_user_presence
                 }
             };
@@ -739,7 +739,7 @@ async fn tick(
                         }
                     }
                     Err(e) => {
-                        warn!("state drive probe in quiet+present failed: {e}");
+                        warn!("state drive probe in quiet+present failed: {e:#}");
                     }
                 }
             }
@@ -790,7 +790,7 @@ async fn tick(
                                 refresh.hvac_on = c.hvac_on;
                                 any_ok = true;
                             }
-                            Err(e) => warn!("parked-awake climate refresh failed: {e}"),
+                            Err(e) => warn!("parked-awake climate refresh failed: {e:#}"),
                         }
                         match sample_ble::sample_charge_ble(session).await {
                             Ok(c) => {
@@ -813,7 +813,7 @@ async fn tick(
                                 }
                                 any_ok = true;
                             }
-                            Err(e) => warn!("parked-awake charge refresh failed: {e}"),
+                            Err(e) => warn!("parked-awake charge refresh failed: {e:#}"),
                         }
                         // Closures refresh — gives us a sentry_mode
                         // update so a remotely-enabled sentry session
@@ -829,7 +829,7 @@ async fn tick(
                                     *last_sentry_mode = Some(sm);
                                 }
                             }
-                            Err(e) => warn!("parked-awake closures refresh failed: {e}"),
+                            Err(e) => warn!("parked-awake closures refresh failed: {e:#}"),
                         }
                         // Location not refreshed: Tesla only returns
                         // location_name in `state drive`, which Quiet
@@ -850,7 +850,7 @@ async fn tick(
                                 refresh.tire_rr_psi = t.tire_rr_psi;
                                 any_ok = true;
                             }
-                            Err(e) => warn!("parked-awake tires refresh failed: {e}"),
+                            Err(e) => warn!("parked-awake tires refresh failed: {e:#}"),
                         }
                         *last_parked_awake_tpms_refresh = Some(Instant::now());
                     }
@@ -950,7 +950,7 @@ async fn tick(
                     if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
                         connect_failed = true;
                     }
-                    warn!("sample_drive failed: {e}");
+                    warn!("sample_drive failed: {e:#}");
                     false
                 }
             };
@@ -1002,7 +1002,7 @@ async fn tick(
                             let _ = std::fs::write("/mutable/keep_accessory_gps.json", json);
                         }
                     }
-                    Err(e) => warn!("state-poll: location failed: {e}"),
+                    Err(e) => warn!("state-poll: location failed: {e:#}"),
                 }
             }
         }
@@ -1024,7 +1024,7 @@ async fn tick(
                     if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
                         connect_failed = true;
                     }
-                    warn!("sample_climate failed: {e}");
+                    warn!("sample_climate failed: {e:#}");
                     false
                 }
             };
@@ -1084,7 +1084,7 @@ async fn tick(
                     if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
                         connect_failed = true;
                     }
-                    warn!("sample_charge failed: {e}");
+                    warn!("sample_charge failed: {e:#}");
                     false
                 }
             };
@@ -1111,7 +1111,7 @@ async fn tick(
                     if sentryusb_tesla_ble::manager::is_connect_failure(&e) {
                         connect_failed = true;
                     }
-                    warn!("sample_closures failed: {e}");
+                    warn!("sample_closures failed: {e:#}");
                     false
                 }
             };
@@ -1131,7 +1131,7 @@ async fn tick(
                     true
                 }
                 Err(e) => {
-                    warn!("sample_tires failed: {e}");
+                    warn!("sample_tires failed: {e:#}");
                     false
                 }
             };

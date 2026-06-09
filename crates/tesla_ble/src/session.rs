@@ -119,6 +119,28 @@ fn parse_response(
         .context("decode outer Routable")?;
     debug!("session-info RX decoded: {:#?}", routable);
 
+    // Newer car firmware answers a SessionInfoRequest from an unenrolled
+    // key with a bare MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID status instead of
+    // a SessionInfo carrying KEY_NOT_ON_WHITELIST. Both mean the same
+    // thing — the key isn't paired — so map both to KeyNotPaired, or the
+    // UI's pairing probe reads this as "couldn't reach the car" and tells
+    // the user their Bluetooth adapter is bad instead of "re-pair and tap
+    // your card" (seen live on a Pi 4B against 2026 firmware).
+    const MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID: i32 = 3;
+    if routable
+        .signed_message_status
+        .as_ref()
+        .is_some_and(|s| s.signed_message_fault == MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID)
+    {
+        warn!(
+            "session-info from {:?}: car returned MESSAGEFAULT_ERROR_UNKNOWN_KEY_ID — \
+             our public key is not paired with this VIN. \
+             User must re-pair from the SentryUSB UI and tap the card on the console.",
+            domain,
+        );
+        return Err(SessionError::KeyNotPaired);
+    }
+
     let raw = match routable.payload {
         Some(routable_message::Payload::SessionInfo(b)) => b,
         Some(other) => {
