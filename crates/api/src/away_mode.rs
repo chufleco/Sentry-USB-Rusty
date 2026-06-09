@@ -45,6 +45,12 @@ struct Inner {
     expires_at: Option<SystemTime>,
     enabled_at: Option<SystemTime>,
     stop: std::sync::Arc<Notify>,
+    /// Bumped on every session start/stop. `notify_waiters` only wakes
+    /// tasks currently parked on `notified()` — a watcher that's between
+    /// awaits misses the stop signal, and a quick disable→enable would
+    /// then leave two watchers polling. Each watcher captures the epoch
+    /// it was spawned for and exits when it no longer matches.
+    epoch: u64,
 }
 
 fn mgr() -> &'static Mutex<Inner> {
@@ -62,6 +68,7 @@ fn mgr() -> &'static Mutex<Inner> {
             expires_at: None,
             enabled_at: None,
             stop: std::sync::Arc::new(Notify::new()),
+            epoch: 0,
         })
     })
 }
@@ -169,7 +176,7 @@ async fn get_ap_info() -> (String, String) {
     (ssid, ip)
 }
 
-fn spawn_watcher(stop: std::sync::Arc<Notify>) {
+fn spawn_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -178,7 +185,7 @@ fn spawn_watcher(stop: std::sync::Arc<Notify>) {
             }
             let expired = {
                 let mut inner = mgr().lock().unwrap();
-                if inner.state != "active" {
+                if inner.state != "active" || inner.epoch != my_epoch {
                     return;
                 }
                 let expired = inner.expires_at.map_or(true, |e| SystemTime::now() >= e);
@@ -241,13 +248,14 @@ pub fn restore_from_file() {
     }
 
     let enabled_at = from_rfc3339(&flag.enabled_at).unwrap_or_else(SystemTime::now);
-    let notify = {
+    let (notify, epoch) = {
         let mut inner = mgr().lock().unwrap();
         inner.state = "active";
         inner.enabled_at = Some(enabled_at);
         inner.expires_at = Some(SystemTime::now() + remaining);
         inner.stop = std::sync::Arc::new(Notify::new());
-        inner.stop.clone()
+        inner.epoch += 1;
+        (inner.stop.clone(), inner.epoch)
     };
 
     away_mode_log(&format!(
@@ -260,7 +268,7 @@ pub fn restore_from_file() {
         remaining.as_secs()
     );
     start_ap_bg();
-    spawn_watcher(notify);
+    spawn_watcher(notify, epoch);
 }
 
 #[derive(Deserialize)]
@@ -302,7 +310,7 @@ pub async fn enable(
     let duration = Duration::from_secs(minutes * 60);
     enum Action {
         Extended,
-        Started(std::sync::Arc<Notify>),
+        Started(std::sync::Arc<Notify>, u64),
     }
     let (action, snap) = {
         let mut inner = mgr().lock().unwrap();
@@ -318,19 +326,23 @@ pub async fn enable(
             inner.enabled_at = Some(now);
             inner.expires_at = Some(now + duration);
             inner.stop = std::sync::Arc::new(Notify::new());
+            inner.epoch += 1;
             write_flag_file(&inner);
             away_mode_log(&format!(
                 "Enabled (duration: {}m, rtc: {})",
                 minutes, inner.has_rtc
             ));
             info!("[away-mode] Enabled (duration: {}m)", minutes);
-            (Action::Started(inner.stop.clone()), status_snapshot_sync(&inner))
+            (
+                Action::Started(inner.stop.clone(), inner.epoch),
+                status_snapshot_sync(&inner),
+            )
         }
     };
 
-    if let Action::Started(notify) = action {
+    if let Action::Started(notify, epoch) = action {
         start_ap_bg();
-        spawn_watcher(notify);
+        spawn_watcher(notify, epoch);
     }
 
     let mut snap = snap;
@@ -353,6 +365,7 @@ pub async fn disable(State(_s): State<AppState>) -> (StatusCode, Json<serde_json
         inner.state = "idle";
         inner.expires_at = None;
         inner.enabled_at = None;
+        inner.epoch += 1;
         remove_flag_file();
     }
     away_mode_log("Disabled by user");

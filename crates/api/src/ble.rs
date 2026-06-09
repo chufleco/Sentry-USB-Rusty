@@ -529,10 +529,24 @@ fn read_gate_status() -> (Option<String>, Option<String>, Option<String>) {
 ///
 /// Used by the "Show output" panel on the BLE pair card. Polled
 /// every 5 s while the panel is open.
+/// How far back the latest-sample queries look. `telemetry_samples` is
+/// keyed on `ts` (WITHOUT ROWID), so an `ORDER BY ts DESC LIMIT 1` with a
+/// `ts >= floor` bound is a short reverse B-tree slice that stops at the
+/// floor — without it, a column the car never reports (TPMS on some
+/// models, `location_name`) walks the entire table on every poll of this
+/// endpoint (every 5s while the panel is open). Data older than this is
+/// stale enough that showing it as "current" would mislead anyway.
+const LATEST_SAMPLE_WINDOW_SECS: i64 = 30 * 86_400;
+
 pub async fn ble_latest_sample(
     State(s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let store = s.drives.store.clone();
+    let floor = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - LATEST_SAMPLE_WINDOW_SECS;
     let result = tokio::task::spawn_blocking(move || {
         store.with_locked_conn(|conn| {
             // Pull two things:
@@ -567,9 +581,9 @@ pub async fn ble_latest_sample(
             let envelope = conn
                 .query_row(
                     "SELECT ts, source FROM telemetry_samples \
-                     WHERE source = 'state' \
+                     WHERE source = 'state' AND ts >= ?1 \
                      ORDER BY ts DESC LIMIT 1",
-                    [],
+                    (floor,),
                     |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
                 )
                 .ok();
@@ -577,10 +591,10 @@ pub async fn ble_latest_sample(
                 conn.query_row(
                     &format!(
                         "SELECT {col} FROM telemetry_samples \
-                         WHERE {col} IS NOT NULL \
+                         WHERE {col} IS NOT NULL AND ts >= ?1 \
                          ORDER BY ts DESC LIMIT 1"
                     ),
-                    [],
+                    (floor,),
                     |r| r.get(0),
                 )
                 .ok()
@@ -589,10 +603,10 @@ pub async fn ble_latest_sample(
                 conn.query_row(
                     &format!(
                         "SELECT {col} FROM telemetry_samples \
-                         WHERE {col} IS NOT NULL \
+                         WHERE {col} IS NOT NULL AND ts >= ?1 \
                          ORDER BY ts DESC LIMIT 1"
                     ),
-                    [],
+                    (floor,),
                     |r| r.get(0),
                 )
                 .ok()
@@ -601,10 +615,10 @@ pub async fn ble_latest_sample(
                 conn.query_row(
                     &format!(
                         "SELECT {col} FROM telemetry_samples \
-                         WHERE {col} IS NOT NULL \
+                         WHERE {col} IS NOT NULL AND ts >= ?1 \
                          ORDER BY ts DESC LIMIT 1"
                     ),
-                    [],
+                    (floor,),
                     |r| r.get(0),
                 )
                 .ok()
@@ -619,9 +633,9 @@ pub async fn ble_latest_sample(
             let body_controller_ts: Option<i64> = conn
                 .query_row(
                     "SELECT ts FROM telemetry_samples \
-                     WHERE source = 'body_controller' \
+                     WHERE source = 'body_controller' AND ts >= ?1 \
                      ORDER BY ts DESC LIMIT 1",
-                    [],
+                    (floor,),
                     |r| r.get(0),
                 )
                 .ok();
@@ -729,10 +743,14 @@ pub async fn ble_force_poll(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     // Best-effort: signal the daemon. Errors are non-fatal — the
-    // UI will discover the result via the normal poll cycle.
-    let _ = std::process::Command::new("systemctl")
-        .args(["kill", "-s", "SIGUSR1", "sentryusb-telemetry"])
-        .status();
+    // UI will discover the result via the normal poll cycle. Async
+    // (tokio process under the hood) so the handler doesn't block a
+    // runtime worker on the fork+wait.
+    let _ = sentryusb_shell::run(
+        "systemctl",
+        &["kill", "-s", "SIGUSR1", "sentryusb-telemetry"],
+    )
+    .await;
     (
         StatusCode::OK,
         Json(serde_json::json!({ "queued": true })),
@@ -900,12 +918,13 @@ pub async fn ble_adapter_set(
     // Restart both BLE services so the new adapter is picked up.
     // Best-effort — log on failure but don't error the request, the
     // config write already succeeded and a Pi reboot would also work.
-    let _ = std::process::Command::new("systemctl")
-        .args(["restart", "sentryusb-telemetry"])
-        .status();
-    let _ = std::process::Command::new("systemctl")
-        .args(["restart", "sentryusb-ble"])
-        .status();
+    // Async so a slow service restart doesn't pin a runtime worker.
+    if let Err(e) = sentryusb_shell::run("systemctl", &["restart", "sentryusb-telemetry"]).await {
+        tracing::warn!("restart sentryusb-telemetry after adapter change failed: {e:#}");
+    }
+    if let Err(e) = sentryusb_shell::run("systemctl", &["restart", "sentryusb-ble"]).await {
+        tracing::warn!("restart sentryusb-ble after adapter change failed: {e:#}");
+    }
 
     (
         StatusCode::OK,
