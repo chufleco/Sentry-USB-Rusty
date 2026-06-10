@@ -35,7 +35,10 @@ function log () {
 
 function log_errors_on_exit {
   log "archiveloop exited with code $1. Recent errors follow"
-  journalctl -n 15 -u teslausb >> "$LOG_FILE" 2>/dev/null || true
+  # The unit is sentryusb-archive (see crates/setup install_archive_service);
+  # this used to read the old teslausb unit, so on a crash the supplementary
+  # journal dump was always empty.
+  journalctl -n 15 -u sentryusb-archive >> "$LOG_FILE" 2>/dev/null || true
   log "end of errors."
   exit "$1"
 }
