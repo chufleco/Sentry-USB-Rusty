@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use chrono::{Datelike, NaiveDate, NaiveDateTime};
 use tracing::{info, warn};
 
+use crate::calc;
 use crate::extract::{
     AUTOPILOT_AUTOSTEER, AUTOPILOT_FSD, AUTOPILOT_OFF, AUTOPILOT_TACC, GEAR_PARK,
 };
@@ -805,7 +806,7 @@ fn build_summary(
 
         // Count boundary distance between clips (prev clip end -> current start).
         if let Some(prev) = prev_end_point {
-            total_dist_m += haversine_m(prev[0], prev[1], clip.route.points[0][0], clip.route.points[0][1]);
+            total_dist_m += calc::geodesic_m(prev[0], prev[1], clip.route.points[0][0], clip.route.points[0][1]);
         }
 
         let clip_duration_ms: f64 = 60000.0;
@@ -822,7 +823,7 @@ fn build_summary(
         let mut pending_disengage_idx: usize = 0;
 
         for i in 1..n {
-            let d = haversine_m(
+            let d = calc::geodesic_m(
                 clip.route.points[i - 1][0],
                 clip.route.points[i - 1][1],
                 clip.route.points[i][0],
@@ -963,10 +964,10 @@ fn build_summary(
         start_time: start_time_str,
         end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
         duration_ms,
-        distance_mi: round2(total_dist_m / 1609.344),
+        distance_mi: round2(total_dist_m / calc::M_PER_MILE),
         distance_km: round2(total_dist_m / 1000.0),
-        avg_speed_mph: round2(avg_speed_mps * 2.23694),
-        max_speed_mph: round2(max_speed_mps * 2.23694),
+        avg_speed_mph: round2(avg_speed_mps * calc::MPS_TO_MPH),
+        max_speed_mph: round2(max_speed_mps * calc::MPS_TO_MPH),
         avg_speed_kmh: round2(avg_speed_mps * 3.6),
         max_speed_kmh: round2(max_speed_mps * 3.6),
         clip_count: clips.len(),
@@ -979,15 +980,15 @@ fn build_summary(
         fsd_accel_pushes,
         fsd_percent,
         fsd_distance_km: round2(fsd_dist_m / 1000.0),
-        fsd_distance_mi: round2(fsd_dist_m / 1609.344),
+        fsd_distance_mi: round2(fsd_dist_m / calc::M_PER_MILE),
         autosteer_engaged_ms,
         autosteer_percent,
         autosteer_distance_km: round2(autosteer_dist_m / 1000.0),
-        autosteer_distance_mi: round2(autosteer_dist_m / 1609.344),
+        autosteer_distance_mi: round2(autosteer_dist_m / calc::M_PER_MILE),
         tacc_engaged_ms,
         tacc_percent,
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
-        tacc_distance_mi: round2(tacc_dist_m / 1609.344),
+        tacc_distance_mi: round2(tacc_dist_m / calc::M_PER_MILE),
         assisted_percent,
         // v6 telemetry: not plumbed through the full-data (`Route`)
         // path yet — that path is used by the single-drive view, and
@@ -1116,11 +1117,11 @@ fn build_drive_stats(
         med_lng /= count as f64;
 
         // Step 2: remove points >1000 km from median
-        const MAX_FROM_MEDIAN_M: f64 = 1_000_000.0;
-        all_points.retain(|p| haversine_m(p.lat, p.lng, med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
+        use crate::calc::MAX_FROM_MEDIAN_M;
+        all_points.retain(|p| calc::geodesic_m(p.lat, p.lng, med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
 
         // Step 3: remove isolated outliers far from both neighbors
-        const MAX_JUMP_M: f64 = 5000.0;
+        use crate::calc::MAX_JUMP_M;
         let n = all_points.len();
         if n > 2 {
             let mut remove = vec![false; n];
@@ -1128,14 +1129,14 @@ fn build_drive_stats(
                 let has_prev = i > 0;
                 let has_next = i < n - 1;
                 let far_from_prev = has_prev
-                    && haversine_m(
+                    && calc::geodesic_m(
                         all_points[i - 1].lat,
                         all_points[i - 1].lng,
                         all_points[i].lat,
                         all_points[i].lng,
                     ) > MAX_JUMP_M;
                 let far_from_next = has_next
-                    && haversine_m(
+                    && calc::geodesic_m(
                         all_points[i].lat,
                         all_points[i].lng,
                         all_points[i + 1].lat,
@@ -1170,7 +1171,7 @@ fn build_drive_stats(
     let mut speeds_vec: Vec<f64> = Vec::new();
 
     for i in 1..all_points.len() {
-        let d = haversine_m(
+        let d = calc::geodesic_m(
             all_points[i - 1].lat,
             all_points[i - 1].lng,
             all_points[i].lat,
@@ -1225,7 +1226,7 @@ fn build_drive_stats(
         let speed = if has_sei_speeds {
             p.sei_speed as f64
         } else if i > 0 {
-            let d = haversine_m(
+            let d = calc::geodesic_m(
                 all_points[i - 1].lat,
                 all_points[i - 1].lng,
                 p.lat,
@@ -1278,7 +1279,7 @@ fn build_drive_stats(
             let prev = &all_points[i - 1];
             let cur = &all_points[i];
             let dt = cur.time_ms - prev.time_ms;
-            let d = haversine_m(prev.lat, prev.lng, cur.lat, cur.lng);
+            let d = calc::geodesic_m(prev.lat, prev.lng, cur.lat, cur.lng);
 
             let prev_fsd = prev.ap_state == AUTOPILOT_FSD;
             let cur_fsd = cur.ap_state == AUTOPILOT_FSD;
@@ -1407,10 +1408,10 @@ fn build_drive_stats(
         start_time: start_time_str,
         end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
         duration_ms,
-        distance_mi: round2(total_distance_m / 1609.344),
+        distance_mi: round2(total_distance_m / calc::M_PER_MILE),
         distance_km: round2(total_distance_m / 1000.0),
-        avg_speed_mph: round2(avg_speed_mps * 2.23694),
-        max_speed_mph: round2(max_speed_mps * 2.23694),
+        avg_speed_mph: round2(avg_speed_mps * calc::MPS_TO_MPH),
+        max_speed_mph: round2(max_speed_mps * calc::MPS_TO_MPH),
         avg_speed_kmh: round2(avg_speed_mps * 3.6),
         max_speed_kmh: round2(max_speed_mps * 3.6),
         clip_count: clips.len(),
@@ -1425,15 +1426,15 @@ fn build_drive_stats(
         fsd_accel_pushes,
         fsd_percent,
         fsd_distance_km: round2(fsd_distance_m / 1000.0),
-        fsd_distance_mi: round2(fsd_distance_m / 1609.344),
+        fsd_distance_mi: round2(fsd_distance_m / calc::M_PER_MILE),
         autosteer_engaged_ms,
         autosteer_percent,
         autosteer_distance_km: round2(autosteer_distance_m / 1000.0),
-        autosteer_distance_mi: round2(autosteer_distance_m / 1609.344),
+        autosteer_distance_mi: round2(autosteer_distance_m / calc::M_PER_MILE),
         tacc_engaged_ms,
         tacc_percent,
         tacc_distance_km: round2(tacc_distance_m / 1000.0),
-        tacc_distance_mi: round2(tacc_distance_m / 1609.344),
+        tacc_distance_mi: round2(tacc_distance_m / calc::M_PER_MILE),
         assisted_percent,
         source: first_clip.route.source.clone(),
         external_signature: first_clip.route.external_signature.clone(),
@@ -1450,8 +1451,8 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
     let groups = group_clips(routes);
     let mut result = Vec::with_capacity(groups.len());
 
-    const MAX_FROM_MEDIAN_M: f64 = 1_000_000.0;
-    const MAX_JUMP_M: f64 = 5000.0;
+    use crate::calc::MAX_FROM_MEDIAN_M;
+    use crate::calc::MAX_JUMP_M;
 
     for (idx, clips) in groups.iter().enumerate() {
         // Collect valid (non-null-island) lat/lng from each clip
@@ -1478,7 +1479,7 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
             let med_lat = sum_lat / count as f64;
             let med_lng = sum_lng / count as f64;
 
-            pts.retain(|p| haversine_m(p[0], p[1], med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
+            pts.retain(|p| calc::geodesic_m(p[0], p[1], med_lat, med_lng) <= MAX_FROM_MEDIAN_M);
         }
 
         // Neighbor-jump filter
@@ -1489,9 +1490,9 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
                 let has_prev = i > 0;
                 let has_next = i < n - 1;
                 let far_from_prev =
-                    has_prev && haversine_m(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) > MAX_JUMP_M;
+                    has_prev && calc::geodesic_m(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]) > MAX_JUMP_M;
                 let far_from_next =
-                    has_next && haversine_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) > MAX_JUMP_M;
+                    has_next && calc::geodesic_m(pts[i][0], pts[i][1], pts[i + 1][0], pts[i + 1][1]) > MAX_JUMP_M;
                 if (has_prev && has_next && far_from_prev && far_from_next)
                     || (!has_prev && far_from_next)
                     || (!has_next && far_from_prev)
@@ -1611,7 +1612,7 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
         let mut in_accel_press = false;
 
         for i in 1..n {
-            let d = haversine_m(
+            let d = calc::geodesic_m(
                 r.points[i - 1][0],
                 r.points[i - 1][1],
                 r.points[i][0],
@@ -1693,13 +1694,13 @@ fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
     }
 
     s.total_distance_km = total_distance_m / 1000.0;
-    s.total_distance_mi = total_distance_m / 1609.344;
+    s.total_distance_mi = total_distance_m / calc::M_PER_MILE;
     s.fsd_distance_km = total_fsd_dist_m / 1000.0;
-    s.fsd_distance_mi = total_fsd_dist_m / 1609.344;
+    s.fsd_distance_mi = total_fsd_dist_m / calc::M_PER_MILE;
     s.autosteer_distance_km = total_autosteer_dist_m / 1000.0;
-    s.autosteer_distance_mi = total_autosteer_dist_m / 1609.344;
+    s.autosteer_distance_mi = total_autosteer_dist_m / calc::M_PER_MILE;
     s.tacc_distance_km = total_tacc_dist_m / 1000.0;
-    s.tacc_distance_mi = total_tacc_dist_m / 1609.344;
+    s.tacc_distance_mi = total_tacc_dist_m / calc::M_PER_MILE;
 
     let sei_total_km = sei_distance_m / 1000.0;
     if sei_total_km > 0.0 {
@@ -2104,17 +2105,6 @@ fn is_tessie(source: &Option<String>) -> bool {
     source.as_deref() == Some("tessie")
 }
 
-/// Haversine distance in meters between two GPS coordinates.
-fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    const R: f64 = 6_371_000.0;
-    let to_rad = |d: f64| d * std::f64::consts::PI / 180.0;
-
-    let d_lat = to_rad(lat2 - lat1);
-    let d_lon = to_rad(lon2 - lon1);
-    let a = (d_lat / 2.0).sin().powi(2)
-        + to_rad(lat1).cos() * to_rad(lat2).cos() * (d_lon / 2.0).sin().powi(2);
-    R * 2.0 * a.sqrt().atan2((1.0 - a).sqrt())
-}
 
 /// Even-spaced downsampling. Returns at most `max_points` entries, always
 /// including the last point.
@@ -2191,15 +2181,10 @@ fn compute_autopilot_percents(
     )
 }
 
-/// Round to 2 decimal places.
-fn round2(v: f64) -> f64 {
-    (v * 100.0).round() / 100.0
-}
-
-/// Round to 1 decimal place (used for percentages: *1000/10 in Go).
-fn round1(v: f64) -> f64 {
-    (v * 10.0).round() / 10.0
-}
+// round2 / round1 are re-exported from calc so every consumer in this
+// module shares the single source of truth without churning ~30 call
+// sites to fully-qualified paths.
+use crate::calc::{round1, round2};
 
 // ---------------------------------------------------------------------------
 // Route::empty helper
@@ -2546,7 +2531,7 @@ fn distance_from_summary_clips(clips: &[SubClipSummary]) -> f64 {
         {
             if !is_null_island_pair(prev_lat, prev_lng) && !is_null_island_pair(cur_lat, cur_lng)
             {
-                total_dist_m += haversine_m(prev_lat, prev_lng, cur_lat, cur_lng);
+                total_dist_m += calc::geodesic_m(prev_lat, prev_lng, cur_lat, cur_lng);
             }
         }
 
@@ -2681,10 +2666,10 @@ fn build_summary_from_aggregates(
         start_time: start_time_str,
         end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
         duration_ms,
-        distance_mi: round2(total_dist_m / 1609.344),
+        distance_mi: round2(total_dist_m / calc::M_PER_MILE),
         distance_km: round2(total_dist_m / 1000.0),
-        avg_speed_mph: round2(avg_speed_mps * 2.23694),
-        max_speed_mph: round2(max_speed_mps * 2.23694),
+        avg_speed_mph: round2(avg_speed_mps * calc::MPS_TO_MPH),
+        max_speed_mph: round2(max_speed_mps * calc::MPS_TO_MPH),
         avg_speed_kmh: round2(avg_speed_mps * 3.6),
         max_speed_kmh: round2(max_speed_mps * 3.6),
         clip_count: unique_clip_count,
@@ -2697,15 +2682,15 @@ fn build_summary_from_aggregates(
         fsd_accel_pushes,
         fsd_percent,
         fsd_distance_km: round2(fsd_dist_m / 1000.0),
-        fsd_distance_mi: round2(fsd_dist_m / 1609.344),
+        fsd_distance_mi: round2(fsd_dist_m / calc::M_PER_MILE),
         autosteer_engaged_ms: autosteer_engaged_ms.round() as i64,
         autosteer_percent,
         autosteer_distance_km: round2(autosteer_dist_m / 1000.0),
-        autosteer_distance_mi: round2(autosteer_dist_m / 1609.344),
+        autosteer_distance_mi: round2(autosteer_dist_m / calc::M_PER_MILE),
         tacc_engaged_ms: tacc_engaged_ms.round() as i64,
         tacc_percent,
         tacc_distance_km: round2(tacc_dist_m / 1000.0),
-        tacc_distance_mi: round2(tacc_dist_m / 1609.344),
+        tacc_distance_mi: round2(tacc_dist_m / calc::M_PER_MILE),
         assisted_percent,
         battery_pct_start: telemetry.battery_pct_start,
         battery_pct_end: telemetry.battery_pct_end,
@@ -2956,13 +2941,13 @@ fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> Aggregate
         s.fsd_accel_pushes += a.fsd_accel_pushes;
     }
     s.total_distance_km = total_m / 1000.0;
-    s.total_distance_mi = total_m / 1609.344;
+    s.total_distance_mi = total_m / calc::M_PER_MILE;
     s.fsd_distance_km = fsd_m / 1000.0;
-    s.fsd_distance_mi = fsd_m / 1609.344;
+    s.fsd_distance_mi = fsd_m / calc::M_PER_MILE;
     s.autosteer_distance_km = autosteer_m / 1000.0;
-    s.autosteer_distance_mi = autosteer_m / 1609.344;
+    s.autosteer_distance_mi = autosteer_m / calc::M_PER_MILE;
     s.tacc_distance_km = tacc_m / 1000.0;
-    s.tacc_distance_mi = tacc_m / 1609.344;
+    s.tacc_distance_mi = tacc_m / calc::M_PER_MILE;
 
     let sei_total_km = sei_total_m / 1000.0;
     if sei_total_km > 0.0 {
@@ -3004,13 +2989,13 @@ mod tests {
     #[test]
     fn test_haversine_m() {
         // New York to Los Angeles ~ 3,944 km
-        let d = haversine_m(40.7128, -74.0060, 34.0522, -118.2437);
+        let d = calc::geodesic_m(40.7128, -74.0060, 34.0522, -118.2437);
         assert!((d - 3_944_000.0).abs() < 50_000.0); // within 50km
     }
 
     #[test]
     fn test_haversine_m_same_point() {
-        assert_eq!(haversine_m(37.7749, -122.4194, 37.7749, -122.4194), 0.0);
+        assert_eq!(calc::geodesic_m(37.7749, -122.4194, 37.7749, -122.4194), 0.0);
     }
 
     #[test]
@@ -3134,7 +3119,7 @@ mod tests {
         ];
 
         let d = distance_from_summary_clips(&clips);
-        let gap = haversine_m(37.0009, -122.0000, 37.0020, -122.0000);
+        let gap = calc::geodesic_m(37.0009, -122.0000, 37.0020, -122.0000);
         assert!(
             (d - (300.0 + gap)).abs() < 0.1,
             "distance should include inter-clip gap"

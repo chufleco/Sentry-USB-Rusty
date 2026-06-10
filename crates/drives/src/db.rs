@@ -54,7 +54,18 @@ pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
 // SavedClips/SentryClips event folders are now skipped, and the grouper was
 // reworked to match Sentry-Drive/Sentry-Cloud distance/AP math. Same routes
 // now yield a different drive list, so stale v3 caches must rebuild.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "4";
+//
+// v5 (2026-06-09): distance moved from spherical haversine to WGS-84
+// geodesic (Andoyer–Lambert) in calc.rs, so every per-drive distance shifts
+// 0.1–0.3%. Stale v4 caches hold haversine-era mileage and must rebuild.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "5";
+
+/// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
+/// Distinct from the cache algo version above: this gates a one-shot
+/// recompute of the persisted `routes` aggregate columns when the math that
+/// produced them changes. Bump on any change to compute_route_aggregates'
+/// numeric output. "geodesic-1" = the WGS-84 distance migration.
+const AGGREGATE_FORMULA_VERSION: &str = "geodesic-1";
 
 /// Ordered list of paths the one-shot importer checks on first boot.
 /// The first that exists wins. `/mutable/drive-data.json` is kept as a
@@ -207,6 +218,45 @@ impl DriveStore {
             run_one_shot_import(&mut guard, import_candidates)
                 .context("load: one-shot import")?;
             let mut mg = guard;
+
+            // Aggregate-formula version gate. The per-clip aggregates
+            // (distance_m, speeds, FSD distances…) are computed once at
+            // insert time and persisted; the backfill below only fills
+            // rows where they're NULL. So when the *formula* changes —
+            // e.g. the spherical→WGS-84-geodesic distance migration — the
+            // existing rows keep their old numbers forever unless we
+            // force a recompute. Bump AGGREGATE_FORMULA_VERSION whenever
+            // compute_route_aggregates' math changes: this NULLs the
+            // aggregate columns once, the backfill then recomputes them
+            // with the new formula, and the cache (algo-versioned
+            // separately) rebuilds from the fresh values.
+            let stored_formula =
+                meta_get(&mg, "aggregate_formula_version")?.unwrap_or_default();
+            if stored_formula != AGGREGATE_FORMULA_VERSION {
+                // NULL only the v2 (ALTER-added, nullable) aggregate
+                // columns. `max_speed_mps` is the backfill's gate
+                // (`WHERE max_speed_mps IS NULL`), so nulling it queues
+                // every row for recompute; the backfill's UPDATE then
+                // overwrites distance_m too. distance_m itself is the
+                // original NOT NULL DEFAULT 0 column and CANNOT be set
+                // NULL — doing so fails the constraint and aborts the DB
+                // open (it did, the first time). It's left as-is and
+                // overwritten micro-seconds later by the backfill.
+                let n = mg.execute(
+                    "UPDATE routes SET max_speed_mps = NULL, avg_speed_mps = NULL, \
+                     assisted_distance_m = NULL, fsd_distance_m = NULL, \
+                     autosteer_distance_m = NULL, tacc_distance_m = NULL",
+                    [],
+                )?;
+                info!(
+                    "[drives] Aggregate formula changed ({} -> {}); reset {} rows for recompute",
+                    if stored_formula.is_empty() { "<none>" } else { &stored_formula },
+                    AGGREGATE_FORMULA_VERSION,
+                    n
+                );
+                meta_set(&mg, "aggregate_formula_version", AGGREGATE_FORMULA_VERSION)?;
+            }
+
             let stats =
                 backfill_route_aggregates(&mut mg, |done, total| {
                     info!("[drives] Backfilling summary aggregates: {}/{} routes", done, total);
@@ -1967,6 +2017,48 @@ mod tests {
         assert_eq!(routes[0].accel_positions, vec![0.5, 0.6]);
         assert_eq!(routes[0].raw_frame_count, 2);
         assert_eq!(routes[0].gear_runs.len(), 1);
+    }
+
+    #[test]
+    fn aggregate_formula_migration_recomputes_without_violating_not_null() {
+        // Regression: the formula-version reset must NOT try to set the
+        // NOT NULL `distance_m` column to NULL (that aborts the DB open).
+        // It NULLs the nullable v2 columns to queue rows for the backfill,
+        // which recomputes everything from the BLOB.
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("a.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .unwrap();
+
+        {
+            let conn = store.conn.lock().unwrap();
+            // Force the gate so the next load() runs the reset + recompute.
+            meta_set(&conn, "aggregate_formula_version", "stale-test").unwrap();
+            // Simulate a stale haversine distance + a non-NULL gate column,
+            // so the migration path (not a fresh insert) is exercised.
+            conn.execute(
+                "UPDATE routes SET distance_m = 999.0, max_speed_mps = 12.3",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Must not error (the NOT NULL trap), and must recompute distance.
+        store.load().unwrap();
+
+        let out = store.with_route_summaries(|s| s.to_vec()).unwrap();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].aggregates.distance_m > 0.0);
+        assert!(
+            (out[0].aggregates.distance_m - 999.0).abs() > 1.0,
+            "stale distance should have been recomputed, got {}",
+            out[0].aggregates.distance_m
+        );
+
+        let conn = store.conn.lock().unwrap();
+        let ver = meta_get(&conn, "aggregate_formula_version").unwrap();
+        assert_eq!(ver.as_deref(), Some(AGGREGATE_FORMULA_VERSION));
     }
 
     #[test]

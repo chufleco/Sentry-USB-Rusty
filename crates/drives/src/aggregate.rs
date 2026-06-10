@@ -23,24 +23,12 @@ use crate::types::{
     GEAR_PARK,
 };
 
-/// Earth radius in meters — used by [`haversine_m`].
-const EARTH_RADIUS_M: f64 = 6371000.0;
+use crate::calc;
 
-/// Great-circle distance between two GPS coordinates in meters.
-/// Mirrors the `haversineM` Go helper used elsewhere in this crate and
-/// the grouper's own inline version.
-pub fn haversine_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
-    let to_rad = std::f64::consts::PI / 180.0;
-    let dlat = (lat2 - lat1) * to_rad;
-    let dlon = (lon2 - lon1) * to_rad;
-    let a = (dlat / 2.0).sin().powi(2)
-        + (lat1 * to_rad).cos() * (lat2 * to_rad).cos() * (dlon / 2.0).sin().powi(2);
-    let c = 2.0 * a.sqrt().atan2((1.0 - a).sqrt());
-    EARTH_RADIUS_M * c
-}
-
+/// Array-form Null Island check over a `[lat, lon]` point — thin wrapper
+/// over [`calc::is_null_island`] for this module's `[f64; 2]` points.
 fn is_null_island(p: &[f64; 2]) -> bool {
-    p[0].abs() < 1.0 && p[1].abs() < 1.0
+    calc::is_null_island(p[0], p[1])
 }
 
 /// Compute every scalar the Drives-page summary endpoints need for a
@@ -105,7 +93,7 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
             continue;
         }
 
-        let d = haversine_m(prev[0], prev[1], cur[0], cur[1]);
+        let d = calc::geodesic_m(prev[0], prev[1], cur[0], cur[1]);
 
         // GPS-teleport guard when no SEI speeds are available.
         if !has_sei_speeds && dt_sec > 0.0 && d / dt_sec > 70.0 {
@@ -345,9 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn haversine_known_distance_sf_to_nyc() {
-        // Rough order-of-magnitude: SF→NYC is ~4100 km.
-        let d = haversine_m(37.7749, -122.4194, 40.7128, -74.0060);
+    fn geodesic_known_distance_sf_to_nyc() {
+        // SF→NYC is ~4139 km via WGS-84 geodesic.
+        let d = calc::geodesic_m(37.7749, -122.4194, 40.7128, -74.0060);
         assert!(d > 4_000_000.0 && d < 4_200_000.0);
     }
 }
