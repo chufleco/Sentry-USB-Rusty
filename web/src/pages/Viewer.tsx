@@ -587,7 +587,15 @@ export default function Viewer() {
   // Delete clip
   async function handleDeleteClip(clip: ClipEntry) {
     try {
-      const fullPath = `/mnt/cam/TeslaCam/${activeCategory}/${clip.date}`
+      // Delete via /mutable/TeslaCam (the snapshot-symlink tree this view
+      // actually lists from), NOT /mnt/cam. /mnt/cam is the live cam-disk
+      // image, which is unmounted on the Pi side whenever the USB gadget is
+      // presenting it to the car — so the old path silently no-op'd in
+      // normal operation while the row vanished optimistically here. The
+      // backend's delete handler also runs its SavedClips/SentryClips
+      // snapshot-symlink cleanup off this exact path. Matches the download
+      // button below and the Files page.
+      const fullPath = `/mutable/TeslaCam/${activeCategory}/${clip.date}`
       await fetch(`/api/files?path=${encodeURIComponent(fullPath)}`, { method: "DELETE" })
       setGroups((prev) =>
         prev.map((g) =>
