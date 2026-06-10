@@ -461,17 +461,7 @@ impl DriveStore {
         select_all_routes(&conn)
     }
 
-    /// Materialize all routes and invoke `f` with the resulting slice.
-    /// Slice and elements must not be retained beyond `f`'s return.
-    pub fn with_routes<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&[Route]) -> R,
-    {
-        let routes = self.get_routes()?;
-        Ok(f(&routes))
-    }
-
-    /// BLOB-free analogue of `with_routes`: materializes per-route
+    /// BLOB-free bulk read: materializes per-route
     /// metadata + pre-computed aggregate columns, excluding all point-data
     /// BLOBs. On a 5500-route DB this costs ~5 MB of heap instead of
     /// ~300 MB for the full `WithRoutes` materialization.

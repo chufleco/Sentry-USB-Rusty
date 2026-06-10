@@ -272,8 +272,8 @@ pub struct DriveSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery_pct_end: Option<f64>,
     /// Convenience scalar: `battery_pct_start - battery_pct_end`,
-    /// rounded to one decimal. Computed in `build_summary_*` so the
-    /// UI doesn't have to derive it (and to avoid floating-point
+    /// rounded to two decimals. Computed in `build_summary_from_aggregates`
+    /// so the UI doesn't have to derive it (and to avoid floating-point
     /// surprises across language boundaries).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub battery_pct_used: Option<f64>,
@@ -326,30 +326,9 @@ pub struct DriveSummary {
     pub tessie_autopilot_percent: Option<f64>,
 }
 
-/// Aggregate statistics across all drives.
-/// Note: uses snake_case JSON to match Go API output expected by the frontend.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct AggregateStats {
-    pub drives_count: usize,
-    pub routes_count: usize,
-    pub processed_count: usize,
-    pub total_distance_km: f64,
-    pub total_distance_mi: f64,
-    pub total_duration_ms: i64,
-    pub fsd_engaged_ms: i64,
-    pub fsd_distance_km: f64,
-    pub fsd_distance_mi: f64,
-    pub fsd_percent: f64,
-    pub fsd_disengagements: i32,
-    pub fsd_accel_pushes: i32,
-    pub autosteer_engaged_ms: i64,
-    pub autosteer_distance_km: f64,
-    pub autosteer_distance_mi: f64,
-    pub tacc_engaged_ms: i64,
-    pub tacc_distance_km: f64,
-    pub tacc_distance_mi: f64,
-    pub assisted_percent: f64,
-}
+// AggregateStats was removed with the Route-walking stats path — the
+// drive-stats JSON contract (snake_case keys, matches the old Go API)
+// is built directly in db.rs::compute_drive_caches.
 
 /// Daily FSD statistics for analytics breakdown.
 #[derive(Debug, Clone, Serialize, Deserialize)]

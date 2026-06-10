@@ -318,7 +318,10 @@ pub async fn all_routes(
     // overview can't freeze the live connection.
     let store = state.drives.store.clone();
     let result = tokio::task::spawn_blocking(move || {
-        store.with_routes(|routes| grouper::route_overviews(routes, max_points))
+        // get_routes hands the grouper an owned Vec so it can consume the
+        // routes in place — the previous borrow forced a full clone of the
+        // point-heavy set, doubling peak memory on the heaviest endpoint.
+        store.get_routes().map(|routes| grouper::route_overviews(routes, max_points))
     })
     .await;
     match result {

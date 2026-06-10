@@ -26,70 +26,21 @@ const DRIVE_GAP_MS: i64 = 5 * 60 * 1000;
 const PARK_GAP_SECONDS: f64 = 2.0;
 
 // ---------------------------------------------------------------------------
-// Public API — signatures match drives_handler.rs call-sites
+// Public API
+//
+// The Route-taking grouping/stats/analytics entry points that re-walked
+// every point BLOB per request (group_summaries, build_single_drive,
+// compute_aggregate_stats, fsd_analytics) were removed once every
+// endpoint moved to the summary-based path below — route_overviews is
+// the only remaining full-Route consumer.
 // ---------------------------------------------------------------------------
 
-/// Groups routes into drives and returns lightweight summaries (no full point
-/// arrays). Memory-efficient: computes stats directly from raw clips.
-pub fn group_summaries(
-    routes: &[Route],
-    tags: &HashMap<String, Vec<String>>,
-) -> Vec<DriveSummary> {
-    let groups = group_clips(routes);
-    let mut summaries = Vec::with_capacity(groups.len());
-
-    for (idx, clips) in groups.iter().enumerate() {
-        summaries.push(build_summary(clips, idx, tags));
-    }
-    summaries
-}
-
-/// Build a single drive with full merged point data.
-/// `id` is a string from the URL path — either a numeric index or a startTime
-/// string. Tries numeric parse first, then falls back to matching by startTime.
-pub fn build_single_drive(
-    routes: &[Route],
-    id: &str,
-    tags: &HashMap<String, Vec<String>>,
-) -> Option<Drive> {
-    let groups = group_clips(routes);
-
-    // Try numeric index first
-    if let Ok(idx) = id.parse::<usize>() {
-        if idx < groups.len() {
-            return Some(build_drive_stats(&groups[idx], idx as i32, tags));
-        }
-    }
-
-    // Fall back to matching by start time string
-    for (idx, group) in groups.iter().enumerate() {
-        let st = group[0]
-            .timestamp
-            .format("%Y-%m-%dT%H:%M:%S")
-            .to_string();
-        if st == id {
-            return Some(build_drive_stats(group, idx as i32, tags));
-        }
-    }
-    None
-}
-
-/// Compute aggregate statistics directly from routes WITHOUT building full
-/// Drive objects. Critical for memory-constrained Pi devices.
-pub fn compute_aggregate_stats(routes: &[Route]) -> AggregateStats {
-    compute_aggregate_stats_from_routes(routes)
-}
-
-/// FSD analytics with daily/weekly breakdowns.
-/// Computes summaries first, then aggregates by period.
-pub fn fsd_analytics(routes: &[Route]) -> FsdAnalytics {
-    let empty_tags = HashMap::new();
-    let summaries = group_summaries(routes, &empty_tags);
-    build_fsd_analytics(&summaries, "week")
-}
-
 /// Overview routes for map display (downsampled, outlier-filtered).
-pub fn route_overviews(routes: &[Route], max_points_per_drive: usize) -> Vec<RouteOverview> {
+/// Takes the routes by value: the full-Route set is the heaviest
+/// allocation in the app (hundreds of MB on a long-used Pi), and the
+/// grouper used to clone every route on top of it — peak memory was
+/// 2× the store size on a 1 GB board.
+pub fn route_overviews(routes: Vec<Route>, max_points_per_drive: usize) -> Vec<RouteOverview> {
     group_routes_overview(routes, max_points_per_drive)
 }
 
@@ -126,20 +77,7 @@ pub fn group_summaries_fast(
         .collect()
 }
 
-/// BLOB-free analogue of [`compute_aggregate_stats`].
-pub fn compute_aggregate_stats_from_summaries(
-    summaries: &[RouteSummary],
-) -> AggregateStats {
-    compute_aggregate_stats_summary_impl(summaries)
-}
-
-/// BLOB-free analogue of [`fsd_analytics`]. Builds the DriveSummary list
-/// via `group_summaries_fast` and runs the existing analytics aggregator.
-pub fn fsd_analytics_from_summaries(summaries: &[RouteSummary]) -> FsdAnalytics {
-    fsd_analytics_from_summaries_for_period(summaries, "week")
-}
-
-/// BLOB-free analogue of [`fsd_analytics`] with explicit period
+/// BLOB-free FSD analytics with explicit period
 /// ("day" / "week" / "all"). Used by `GET /api/drives/fsd-analytics`
 /// when the query string asks for something other than the cached
 /// week view, so the Day / Week / All Time toggle on the FSD page
@@ -326,8 +264,9 @@ fn is_event_folder_path(file: &str) -> bool {
 }
 
 /// Dedup by normalized file path, parse timestamps, sort, split on 5-min gaps,
-/// then split by gear state transitions.
-fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
+/// then split by gear state transitions. Consumes the routes — no clones
+/// of the point-heavy Route values.
+fn group_clips(routes: Vec<Route>) -> Vec<Vec<TimedRoute>> {
     if routes.is_empty() {
         return Vec::new();
     }
@@ -342,7 +281,7 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
     // imports of a drive-data.json produced by an unfixed build.
     let input_count = routes.len();
     let mut seen = HashMap::with_capacity(routes.len());
-    let mut unique = Vec::with_capacity(routes.len());
+    let mut unique: Vec<Route> = Vec::with_capacity(routes.len());
     let mut filtered_event_folder = 0usize;
     for r in routes {
         if is_event_folder_path(&r.file) {
@@ -380,7 +319,7 @@ fn group_clips(routes: &[Route]) -> Vec<Vec<TimedRoute>> {
     let mut timed: Vec<TimedRoute> = unique
         .into_iter()
         .filter_map(|r| match parse_file_timestamp(&r.file) {
-            Some(ts) => Some(TimedRoute { route: r.clone(), timestamp: ts }),
+            Some(ts) => Some(TimedRoute { route: r, timestamp: ts }),
             None => {
                 dropped_total += 1;
                 if dropped_examples.len() < 10 {
@@ -755,276 +694,6 @@ fn clip_is_mostly_parked_legacy(clip: &TimedRoute) -> bool {
         .filter(|&&g| g == GEAR_PARK)
         .count();
     park_count > clip.route.gear_states.len() / 2
-}
-
-// ---------------------------------------------------------------------------
-// GroupSummaries — lightweight stats without merging point arrays
-// ---------------------------------------------------------------------------
-
-/// Build a DriveSummary for one group of clips.
-fn build_summary(
-    clips: &[TimedRoute],
-    idx: usize,
-    tags: &HashMap<String, Vec<String>>,
-) -> DriveSummary {
-    let first_clip = &clips[0];
-    let last_clip = &clips[clips.len() - 1];
-    let start_time = first_clip.timestamp;
-    let end_time = last_clip.timestamp + chrono::Duration::minutes(1);
-    let duration_ms = (end_time - start_time).num_milliseconds();
-
-    let mut total_dist_m: f64 = 0.0;
-    let mut max_speed_mps: f64 = 0.0;
-    let mut speed_sum: f64 = 0.0;
-    let mut speed_count: usize = 0;
-    let mut point_count: usize = 0;
-
-    let mut fsd_engaged_ms: i64 = 0;
-    let mut autosteer_engaged_ms: i64 = 0;
-    let mut tacc_engaged_ms: i64 = 0;
-    let mut fsd_dist_m: f64 = 0.0;
-    let mut autosteer_dist_m: f64 = 0.0;
-    let mut tacc_dist_m: f64 = 0.0;
-    let mut assisted_dist_m: f64 = 0.0;
-    let mut fsd_disengagements: i32 = 0;
-    let mut fsd_accel_pushes: i32 = 0;
-
-    let mut start_point: Option<GpsPoint> = None;
-    let mut end_point: Option<GpsPoint> = None;
-    let mut prev_end_point: Option<GpsPoint> = None;
-
-    // Compute stats from raw merged clip points (matches Sentry-Drive behavior).
-    for clip in clips {
-        let n = clip.route.points.len();
-        if n == 0 {
-            continue;
-        }
-        if start_point.is_none() {
-            start_point = Some([clip.route.points[0][0], clip.route.points[0][1]]);
-        }
-        end_point = Some([clip.route.points[n - 1][0], clip.route.points[n - 1][1]]);
-        point_count += n;
-
-        // Count boundary distance between clips (prev clip end -> current start).
-        if let Some(prev) = prev_end_point {
-            total_dist_m += calc::geodesic_m(prev[0], prev[1], clip.route.points[0][0], clip.route.points[0][1]);
-        }
-
-        let clip_duration_ms: f64 = 60000.0;
-        let has_ap = clip.route.autopilot_states.len() == n;
-        let has_gears = clip.route.gear_states.len() == n;
-        let has_accel = clip.route.accel_positions.len() == n;
-        let has_speeds = clip.route.speeds.len() == n;
-        let has_sei_speeds = has_speeds && clip.route.speeds.iter().any(|&s| s > 0.0);
-
-        // Per-clip FSD event tracking state
-        let mut in_accel_press = false;
-        let mut fsd_engage_idx: i32 = -1;
-        let mut pending_disengage = false;
-        let mut pending_disengage_idx: usize = 0;
-
-        for i in 1..n {
-            let d = calc::geodesic_m(
-                clip.route.points[i - 1][0],
-                clip.route.points[i - 1][1],
-                clip.route.points[i][0],
-                clip.route.points[i][1],
-            );
-
-            total_dist_m += d;
-            let dt_ms = clip_duration_ms / (n - 1) as f64;
-
-            // Speed
-            if has_sei_speeds {
-                let speed = clip.route.speeds[i] as f64;
-                if speed >= 0.0 && speed < 100.0 {
-                    speed_sum += speed;
-                    speed_count += 1;
-                    if speed > max_speed_mps {
-                        max_speed_mps = speed;
-                    }
-                }
-            } else {
-                let dt_sec = dt_ms / 1000.0;
-                if dt_sec > 0.0 {
-                    let speed = d / dt_sec;
-                    if speed < 70.0 {
-                        speed_sum += speed;
-                        speed_count += 1;
-                        if speed > max_speed_mps {
-                            max_speed_mps = speed;
-                        }
-                    }
-                }
-            }
-
-            // Autopilot stats
-            if has_ap {
-                let cur_ap = clip.route.autopilot_states[i];
-                let prev_ap = clip.route.autopilot_states[i - 1];
-
-                if cur_ap != AUTOPILOT_OFF {
-                    assisted_dist_m += d;
-                    match cur_ap {
-                        x if x == AUTOPILOT_FSD => {
-                            fsd_engaged_ms += dt_ms as i64;
-                            fsd_dist_m += d;
-                        }
-                        x if x == AUTOPILOT_AUTOSTEER => {
-                            autosteer_engaged_ms += dt_ms as i64;
-                            autosteer_dist_m += d;
-                        }
-                        x if x == AUTOPILOT_TACC => {
-                            tacc_engaged_ms += dt_ms as i64;
-                            tacc_dist_m += d;
-                        }
-                        _ => {}
-                    }
-                }
-
-                // Track FSD engagement start
-                if prev_ap != AUTOPILOT_FSD && cur_ap == AUTOPILOT_FSD {
-                    fsd_engage_idx = i as i32;
-                    in_accel_press = false;
-                }
-
-                // Resolve pending disengagement: if Park arrives within 2s, FSD
-                // parked the car — not a driver override.
-                if pending_disengage {
-                    let time_since_ms = (i - pending_disengage_idx) as f64 * dt_ms;
-                    if has_gears
-                        && clip.route.gear_states[i] == GEAR_PARK
-                        && time_since_ms <= 2000.0
-                    {
-                        pending_disengage = false;
-                    } else if time_since_ms > 2000.0 || cur_ap == AUTOPILOT_FSD {
-                        fsd_disengagements += 1;
-                        pending_disengage = false;
-                    }
-                }
-
-                // Detect FSD disengagement — defer for Park grace period
-                if prev_ap == AUTOPILOT_FSD && cur_ap != AUTOPILOT_FSD {
-                    pending_disengage = true;
-                    pending_disengage_idx = i;
-                    in_accel_press = false;
-                }
-
-                // Accel push detection
-                if cur_ap == AUTOPILOT_FSD && has_accel {
-                    let mut accel_pct = clip.route.accel_positions[i] as f64;
-                    if accel_pct <= 1.0 {
-                        accel_pct *= 100.0;
-                    }
-                    let time_since_engage_ms = if fsd_engage_idx >= 0 {
-                        (i as i32 - fsd_engage_idx) as f64 * dt_ms
-                    } else {
-                        0.0
-                    };
-                    if !in_accel_press && accel_pct > 1.0 && time_since_engage_ms >= 3000.0 {
-                        in_accel_press = true;
-                    } else if in_accel_press && accel_pct <= 0.0 {
-                        fsd_accel_pushes += 1;
-                        in_accel_press = false;
-                    }
-                } else if cur_ap != AUTOPILOT_FSD {
-                    in_accel_press = false;
-                }
-            }
-        }
-
-        // Flush pending disengagement at end of clip
-        if pending_disengage {
-            if !(has_gears && clip.route.gear_states[n - 1] == GEAR_PARK) {
-                fsd_disengagements += 1;
-            }
-        }
-
-        prev_end_point = Some([clip.route.points[n - 1][0], clip.route.points[n - 1][1]]);
-    }
-
-    let avg_speed_mps = if speed_count > 0 {
-        speed_sum / speed_count as f64
-    } else {
-        0.0
-    };
-
-    let (fsd_percent, autosteer_percent, tacc_percent, assisted_percent) =
-        compute_autopilot_percents(total_dist_m, fsd_dist_m, autosteer_dist_m, tacc_dist_m, assisted_dist_m);
-
-    let start_time_str = start_time.format("%Y-%m-%dT%H:%M:%S").to_string();
-    let drive_tags = tags.get(&start_time_str).cloned().unwrap_or_default();
-
-    DriveSummary {
-        id: idx as i32,
-        // Derive from the parsed start_time, not the raw `date_dir` column.
-        // Tesla directories are `YYYY-MM-DD_HH-MM-SS`; the web UI parses
-        // `.date` as a JS `new Date(date + "T00:00:00")` which fails on
-        // anything other than `YYYY-MM-DD` and renders "INVALID DATE".
-        date: start_time.format("%Y-%m-%d").to_string(),
-        start_time: start_time_str,
-        end_time: end_time.format("%Y-%m-%dT%H:%M:%S").to_string(),
-        duration_ms,
-        distance_mi: round2(total_dist_m / calc::M_PER_MILE),
-        distance_km: round2(total_dist_m / 1000.0),
-        avg_speed_mph: round2(avg_speed_mps * calc::MPS_TO_MPH),
-        max_speed_mph: round2(max_speed_mps * calc::MPS_TO_MPH),
-        avg_speed_kmh: round2(avg_speed_mps * 3.6),
-        max_speed_kmh: round2(max_speed_mps * 3.6),
-        clip_count: clips.len(),
-        point_count,
-        start_point,
-        end_point,
-        tags: drive_tags,
-        fsd_engaged_ms,
-        fsd_disengagements,
-        fsd_accel_pushes,
-        fsd_percent,
-        fsd_distance_km: round2(fsd_dist_m / 1000.0),
-        fsd_distance_mi: round2(fsd_dist_m / calc::M_PER_MILE),
-        autosteer_engaged_ms,
-        autosteer_percent,
-        autosteer_distance_km: round2(autosteer_dist_m / 1000.0),
-        autosteer_distance_mi: round2(autosteer_dist_m / calc::M_PER_MILE),
-        tacc_engaged_ms,
-        tacc_percent,
-        tacc_distance_km: round2(tacc_dist_m / 1000.0),
-        tacc_distance_mi: round2(tacc_dist_m / calc::M_PER_MILE),
-        assisted_percent,
-        // v6 telemetry: not plumbed through the full-data (`Route`)
-        // path yet — that path is used by the single-drive view, and
-        // the routes-table v6 columns aren't decoded into `Route`.
-        // Default to None; the list-view (`build_summary_from_aggregates`)
-        // does the real rollup from `RouteSummary.telemetry`.
-        battery_pct_start: None,
-        battery_pct_end: None,
-        battery_pct_used: None,
-        interior_temp_min_c: None,
-        interior_temp_max_c: None,
-        exterior_temp_avg_c: None,
-        hvac_runtime_s: None,
-        tire_fl_psi: None,
-        tire_fr_psi: None,
-        tire_rl_psi: None,
-        tire_rr_psi: None,
-        odometer_mi_start: None,
-        odometer_mi_end: None,
-        odometer_mi_driven: None,
-        start_location: None,
-        end_location: None,
-        // Default null source to "sei" for a stable JSON contract
-        // (`hide_tessie_overlapping_sei` and the FSD analytics filter
-        // both compare to the literal "sei" string).
-        source: Some(
-            first_clip
-                .route
-                .source
-                .clone()
-                .unwrap_or_else(|| "sei".to_string()),
-        ),
-        external_signature: first_clip.route.external_signature.clone(),
-        tessie_autopilot_percent: first_clip.route.tessie_autopilot_percent,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1448,7 +1117,7 @@ fn build_drive_stats(
 // ---------------------------------------------------------------------------
 
 /// Returns downsampled route polylines for every drive, with outlier filtering.
-fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<RouteOverview> {
+fn group_routes_overview(routes: Vec<Route>, max_points_per_drive: usize) -> Vec<RouteOverview> {
     let groups = group_clips(routes);
     let mut result = Vec::with_capacity(groups.len());
 
@@ -1531,257 +1200,6 @@ fn group_routes_overview(routes: &[Route], max_points_per_drive: usize) -> Vec<R
     }
 
     result
-}
-
-// ---------------------------------------------------------------------------
-// ComputeAggregateStatsFromRoutes — streaming aggregate
-// ---------------------------------------------------------------------------
-
-/// Internal timestamp+index pair for lightweight grouping.
-struct RouteTimestamp {
-    ts: NaiveDateTime,
-    idx: usize,
-}
-
-/// Compute aggregate statistics directly from routes WITHOUT building full Drive
-/// objects. Drive count uses lightweight timestamp-gap + gear-split counting.
-fn compute_aggregate_stats_from_routes(routes: &[Route]) -> AggregateStats {
-    let mut s = AggregateStats::default();
-    if routes.is_empty() {
-        return s;
-    }
-
-    s.routes_count = routes.len();
-
-    // Deduplicate by normalized file path
-    let mut seen = HashMap::with_capacity(routes.len());
-    let mut timed: Vec<RouteTimestamp> = Vec::new();
-    for (i, r) in routes.iter().enumerate() {
-        let norm = r.file.replace('\\', "/");
-        if seen.insert(norm, ()).is_some() {
-            continue;
-        }
-        if let Some(ts) = parse_file_timestamp(&r.file) {
-            timed.push(RouteTimestamp { ts, idx: i });
-        }
-    }
-    timed.sort_by(|a, b| a.ts.cmp(&b.ts));
-
-    // Lightweight drive count + duration via timestamp + gear-state grouping
-    if !timed.is_empty() {
-        let mut group_start = 0;
-        for i in 1..=timed.len() {
-            let is_end = i == timed.len();
-            let is_gap = !is_end
-                && (timed[i].ts - timed[i - 1].ts).num_milliseconds() > DRIVE_GAP_MS;
-            if is_end || is_gap {
-                let group = &timed[group_start..i];
-                s.drives_count += count_gear_splits_in_group(routes, group);
-                let group_end = timed[i - 1].ts + chrono::Duration::minutes(1);
-                s.total_duration_ms += (group_end - timed[group_start].ts).num_milliseconds();
-                if !is_end {
-                    group_start = i;
-                }
-            }
-        }
-    }
-
-    // Per-route distance and autopilot stats.
-    // Totals include ALL routes; FSD analytics are SEI-only (Tessie excluded)
-    // to match Sentry-Drive's aggregate stats approach.
-    let mut total_distance_m: f64 = 0.0;
-    let mut sei_distance_m: f64 = 0.0;
-    let mut total_fsd_dist_m: f64 = 0.0;
-    let mut total_autosteer_dist_m: f64 = 0.0;
-    let mut total_tacc_dist_m: f64 = 0.0;
-
-    for ti in &timed {
-        let r = &routes[ti.idx];
-        let n = r.points.len();
-        if n < 2 {
-            continue;
-        }
-
-        let route_is_tessie = is_tessie(&r.source);
-        let clip_duration_ms: f64 = 60000.0;
-        let clip_start_ms = ti.ts.and_utc().timestamp_millis() as f64;
-        let has_ap = !route_is_tessie && r.autopilot_states.len() == n;
-        let has_gears = r.gear_states.len() == n;
-        let has_accel = r.accel_positions.len() == n;
-        let has_sei_speeds = r.speeds.len() == n && r.speeds.iter().any(|&sp| sp > 0.0);
-
-        let mut in_accel_press = false;
-
-        for i in 1..n {
-            let d = calc::geodesic_m(
-                r.points[i - 1][0],
-                r.points[i - 1][1],
-                r.points[i][0],
-                r.points[i][1],
-            );
-
-            if !has_sei_speeds {
-                let dt_sec = (clip_duration_ms / (n - 1) as f64) / 1000.0;
-                if dt_sec > 0.0 && d / dt_sec > 70.0 {
-                    continue;
-                }
-            }
-
-            total_distance_m += d;
-            if !route_is_tessie {
-                sei_distance_m += d;
-            }
-            let dt_ms = clip_duration_ms / (n - 1) as f64;
-
-            if has_ap {
-                let prev_ap = r.autopilot_states[i - 1];
-                let cur_ap = r.autopilot_states[i];
-
-                match cur_ap {
-                    x if x == AUTOPILOT_FSD => {
-                        s.fsd_engaged_ms += dt_ms as i64;
-                        total_fsd_dist_m += d;
-                    }
-                    x if x == AUTOPILOT_AUTOSTEER => {
-                        s.autosteer_engaged_ms += dt_ms as i64;
-                        total_autosteer_dist_m += d;
-                    }
-                    x if x == AUTOPILOT_TACC => {
-                        s.tacc_engaged_ms += dt_ms as i64;
-                        total_tacc_dist_m += d;
-                    }
-                    _ => {}
-                }
-
-                if prev_ap == AUTOPILOT_FSD && cur_ap != AUTOPILOT_FSD {
-                    let mut skip_disengage = false;
-                    if has_gears {
-                        let t_cur =
-                            clip_start_ms + (clip_duration_ms * i as f64 / (n - 1) as f64);
-                        for j in i..n {
-                            let t_j =
-                                clip_start_ms + (clip_duration_ms * j as f64 / (n - 1) as f64);
-                            if (t_j - t_cur) > 2000.0 {
-                                break;
-                            }
-                            if r.gear_states[j] == GEAR_PARK {
-                                skip_disengage = true;
-                                break;
-                            }
-                        }
-                    }
-                    if !skip_disengage {
-                        s.fsd_disengagements += 1;
-                    }
-                    in_accel_press = false;
-                }
-
-                if cur_ap == AUTOPILOT_FSD && has_accel {
-                    let mut accel_pct = r.accel_positions[i] as f64;
-                    if accel_pct <= 1.0 {
-                        accel_pct *= 100.0;
-                    }
-                    if !in_accel_press && accel_pct > 1.0 {
-                        in_accel_press = true;
-                    } else if in_accel_press && accel_pct <= 0.0 {
-                        s.fsd_accel_pushes += 1;
-                        in_accel_press = false;
-                    }
-                } else if cur_ap != AUTOPILOT_FSD {
-                    in_accel_press = false;
-                }
-            }
-        }
-    }
-
-    s.total_distance_km = total_distance_m / 1000.0;
-    s.total_distance_mi = total_distance_m / calc::M_PER_MILE;
-    s.fsd_distance_km = total_fsd_dist_m / 1000.0;
-    s.fsd_distance_mi = total_fsd_dist_m / calc::M_PER_MILE;
-    s.autosteer_distance_km = total_autosteer_dist_m / 1000.0;
-    s.autosteer_distance_mi = total_autosteer_dist_m / calc::M_PER_MILE;
-    s.tacc_distance_km = total_tacc_dist_m / 1000.0;
-    s.tacc_distance_mi = total_tacc_dist_m / calc::M_PER_MILE;
-
-    let sei_total_km = sei_distance_m / 1000.0;
-    if sei_total_km > 0.0 {
-        s.fsd_percent = round1(s.fsd_distance_km / sei_total_km * 100.0);
-        let total_assisted_km =
-            s.fsd_distance_km + s.autosteer_distance_km + s.tacc_distance_km;
-        s.assisted_percent = round1(total_assisted_km / sei_total_km * 100.0);
-    }
-
-    s
-}
-
-/// Count drives from gear runs within a time group without allocating Drive
-/// objects. Mirrors splitByGearState logic but only counts.
-fn count_gear_splits_in_group(routes: &[Route], group: &[RouteTimestamp]) -> usize {
-    if group.is_empty() {
-        return 0;
-    }
-
-    let has_gear_runs = group
-        .iter()
-        .any(|entry| !routes[entry.idx].gear_runs.is_empty());
-
-    if !has_gear_runs {
-        // Legacy fallback: count transitions through majority-park clips
-        let mut count: usize = 1;
-        let mut prev_all_park = false;
-        for entry in group {
-            let r = &routes[entry.idx];
-            if r.raw_frame_count > 0 && r.raw_park_count > 0 {
-                // Deliberately the stricter FAST threshold (0.6, not 0.5):
-                // this approximates from raw frame counts without
-                // per-segment splitting. See calc.rs for the rationale.
-                let is_all_park = r.raw_park_count as f64 / r.raw_frame_count as f64
-                    > calc::PARK_MAJORITY_FRACTION_FAST;
-                if prev_all_park && !is_all_park {
-                    count += 1;
-                }
-                prev_all_park = is_all_park;
-            } else {
-                prev_all_park = false;
-            }
-        }
-        return count;
-    }
-
-    // Mirror splitByGearState: count non-parked segments separated by park gaps
-    let mut count: usize = 0;
-    let mut in_drive = false;
-
-    for entry in group {
-        let r = &routes[entry.idx];
-        let total_frames: u32 = r.gear_runs.iter().map(|run| run.frames).sum();
-        if total_frames == 0 {
-            if !in_drive {
-                in_drive = true;
-                count += 1;
-            }
-            continue;
-        }
-        let sec_per_frame = 60.0 / total_frames as f64;
-        for run in &r.gear_runs {
-            if run.gear == GEAR_PARK {
-                let duration = run.frames as f64 * sec_per_frame;
-                if duration >= PARK_GAP_SECONDS {
-                    in_drive = false;
-                }
-            } else if !in_drive {
-                in_drive = true;
-                count += 1;
-            }
-        }
-    }
-
-    // If everything was parked, count as 1
-    if count == 0 {
-        1
-    } else {
-        count
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2742,8 +2160,8 @@ fn build_summary_from_aggregates(
 ///   * interior_temp_min/max: extreme across all clips' extremes.
 ///   * hvac_runtime_s: sum of per-clip estimates (each clip's value
 ///     is in seconds within that clip's 60 s window).
-///   * battery_pct_used: derived from start/end, rounded to one
-///     decimal so the UI doesn't have to deal with FP precision.
+///   * battery_pct_used: derived from start/end, rounded to two
+///     decimals so the UI doesn't have to deal with FP precision.
 struct DriveTelemetryRollup {
     battery_pct_start: Option<f64>,
     battery_pct_end: Option<f64>,
@@ -2877,93 +2295,6 @@ fn roll_up_telemetry(clips: &[SubClipSummary]) -> DriveTelemetryRollup {
     }
 }
 
-/// Summary-side implementation of `compute_aggregate_stats`. Drives the
-/// `/api/drives/stats` header cards.
-fn compute_aggregate_stats_summary_impl(summaries: &[RouteSummary]) -> AggregateStats {
-    let mut s = AggregateStats::default();
-    if summaries.is_empty() {
-        return s;
-    }
-    s.routes_count = summaries.len();
-
-    let groups = group_summary_clips(summaries);
-    s.drives_count = groups.len();
-
-    let mut total_duration_ms: i64 = 0;
-    for grp in &groups {
-        if grp.is_empty() {
-            continue;
-        }
-        // Sub-clip-aware end: the last sub-clip's segment length, not
-        // always a full minute. Matches build_summary_from_aggregates.
-        let start = grp[0].timestamp;
-        let last = &grp[grp.len() - 1];
-        let last_spf_ms = if last.total_frames > 0 {
-            60_000.0 / last.total_frames as f64
-        } else {
-            0.0
-        };
-        let last_segment_len_ms = ((last.end_frame - last.start_frame) as f64
-            * last_spf_ms)
-            .round() as i64;
-        let end = last.timestamp + chrono::Duration::milliseconds(last_segment_len_ms);
-        total_duration_ms += (end - start).num_milliseconds();
-    }
-    s.total_duration_ms = total_duration_ms;
-
-    // Totals include ALL routes (Tessie + SEI) — ground-truth mileage.
-    // FSD analytics use SEI-only data because Tessie's per-point autopilot
-    // inference is fuzzier than dashcam SEI telemetry; mixing them dilutes
-    // the score. Matches Sentry-Drive's `renderDriveStats` approach.
-    let mut total_m: f64 = 0.0;
-    let mut sei_total_m: f64 = 0.0;
-    for grp in &groups {
-        if grp.is_empty() {
-            continue;
-        }
-        let d = distance_from_summary_clips(grp);
-        total_m += d;
-        if !is_tessie(&grp[0].summary.source) {
-            sei_total_m += d;
-        }
-    }
-
-    let mut fsd_m: f64 = 0.0;
-    let mut autosteer_m: f64 = 0.0;
-    let mut tacc_m: f64 = 0.0;
-    for sum in summaries {
-        let a = &sum.aggregates;
-        if is_tessie(&sum.source) {
-            continue;
-        }
-        fsd_m += a.fsd_distance_m;
-        autosteer_m += a.autosteer_distance_m;
-        tacc_m += a.tacc_distance_m;
-        s.fsd_engaged_ms += a.fsd_engaged_ms;
-        s.autosteer_engaged_ms += a.autosteer_engaged_ms;
-        s.tacc_engaged_ms += a.tacc_engaged_ms;
-        s.fsd_disengagements += a.fsd_disengagements;
-        s.fsd_accel_pushes += a.fsd_accel_pushes;
-    }
-    s.total_distance_km = total_m / 1000.0;
-    s.total_distance_mi = total_m / calc::M_PER_MILE;
-    s.fsd_distance_km = fsd_m / 1000.0;
-    s.fsd_distance_mi = fsd_m / calc::M_PER_MILE;
-    s.autosteer_distance_km = autosteer_m / 1000.0;
-    s.autosteer_distance_mi = autosteer_m / calc::M_PER_MILE;
-    s.tacc_distance_km = tacc_m / 1000.0;
-    s.tacc_distance_mi = tacc_m / calc::M_PER_MILE;
-
-    let sei_total_km = sei_total_m / 1000.0;
-    if sei_total_km > 0.0 {
-        s.fsd_percent = round1(s.fsd_distance_km / sei_total_km * 100.0);
-        let total_assisted_km =
-            s.fsd_distance_km + s.autosteer_distance_km + s.tacc_distance_km;
-        s.assisted_percent = round1(total_assisted_km / sei_total_km * 100.0);
-    }
-    s
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -3032,7 +2363,7 @@ mod tests {
 
     #[test]
     fn test_group_clips_empty() {
-        let groups = group_clips(&[]);
+        let groups = group_clips(Vec::new());
         assert!(groups.is_empty());
     }
 
@@ -3061,7 +2392,7 @@ mod tests {
             "/cam/2025-01-15_12-30-45-front.mp4",
             vec![[37.0, -122.0]],
         )];
-        let groups = group_clips(&routes);
+        let groups = group_clips(routes);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
     }
@@ -3072,7 +2403,7 @@ mod tests {
             test_route("/cam/2025-01-15_12-00-00-front.mp4", vec![[37.0, -122.0]]),
             test_route("/cam/2025-01-15_13-00-00-front.mp4", vec![[37.1, -122.1]]),
         ];
-        let groups = group_clips(&routes);
+        let groups = group_clips(routes);
         // 1 hour gap > 5 min => 2 groups
         assert_eq!(groups.len(), 2);
     }
@@ -3251,13 +2582,6 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_aggregate_stats_empty() {
-        let stats = compute_aggregate_stats(&[]);
-        assert_eq!(stats.drives_count, 0);
-        assert_eq!(stats.total_distance_km, 0.0);
-    }
-
-    #[test]
     fn test_is_event_folder_path() {
         // Linux-style paths produced by scan_dir.
         assert!(is_event_folder_path("SavedClips/2026-05-17_18-47-59/2026-05-17_18-47-34-front.mp4"));
@@ -3319,7 +2643,7 @@ mod tests {
                 vec![[37.0, -122.0]],
             ),
         ];
-        let groups = group_clips(&routes);
+        let groups = group_clips(routes);
         assert_eq!(groups.len(), 1, "expected one drive after filtering");
         assert_eq!(groups[0].len(), 1, "expected one route in the drive");
         assert!(
@@ -3373,7 +2697,7 @@ mod tests {
             ));
         }
 
-        let groups = group_clips(&routes);
+        let groups = group_clips(routes);
         assert_eq!(
             groups.len(),
             1,
