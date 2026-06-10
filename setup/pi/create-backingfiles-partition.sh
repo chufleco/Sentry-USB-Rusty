@@ -12,7 +12,7 @@ function log_progress () {
 # install XFS tools if needed
 if ! hash mkfs.xfs
 then
-  apt-get -y --force-yes install xfsprogs
+  apt-get -y install xfsprogs
 fi
 
 function partition_prefix_for {

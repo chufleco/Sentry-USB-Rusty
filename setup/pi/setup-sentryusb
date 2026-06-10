@@ -378,7 +378,7 @@ function install_ble_daemon () {
   for pkg in python3-dbus python3-gi bluez; do
     if ! dpkg-query -W --showformat='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -q '^installed$'; then
       setup_progress "Installing $pkg..."
-      DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "$pkg" 2>/dev/null || \
+      DEBIAN_FRONTEND=noninteractive apt-get -y install "$pkg" 2>/dev/null || \
         setup_progress "WARNING: Failed to install $pkg"
     fi
   done
@@ -567,7 +567,7 @@ EOF
 function install_avahi_service () {
   setup_progress "Installing Avahi mDNS service for iOS app discovery..."
   if ! command -v avahi-daemon &>/dev/null; then
-    DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install avahi-daemon 2>/dev/null || \
+    DEBIAN_FRONTEND=noninteractive apt-get -y install avahi-daemon 2>/dev/null || \
       setup_progress "WARNING: Failed to install avahi-daemon"
   fi
   mkdir -p /etc/avahi/services
@@ -1063,7 +1063,7 @@ function cmd_install_ble {
   for pkg in python3-dbus python3-gi bluez avahi-daemon; do
     if ! dpkg-query -W --showformat='${db:Status-Status}\n' "$pkg" 2>/dev/null | grep -q '^installed$'; then
       setup_progress "Installing $pkg..."
-      DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "$pkg" || \
+      DEBIAN_FRONTEND=noninteractive apt-get -y install "$pkg" || \
         setup_progress "WARNING: failed to install $pkg"
     fi
   done
@@ -1850,10 +1850,10 @@ if [ -n "${INSTALL_USER_REQUESTED_PACKAGES:-}" ]
 then
   setup_progress "Installing user requested packages: ${INSTALL_USER_REQUESTED_PACKAGES}"
   read -r -a EXTRA_PACKAGES <<< "${INSTALL_USER_REQUESTED_PACKAGES[@]}"
-  # --force-yes was removed in apt 1.1; on Bookworm it makes apt-get exit
-  # non-zero before installing anything, so headless installs that set
-  # INSTALL_USER_REQUESTED_PACKAGES failed here. Plain -y is what this
-  # actually needs (assume-yes on prompts); the dangerous force flags
+  # apt's force-yes flag was removed in apt 1.1; on Bookworm it makes
+  # apt-get exit non-zero before installing anything, so headless installs
+  # that set INSTALL_USER_REQUESTED_PACKAGES failed here. Plain -y is what
+  # this actually needs (assume-yes on prompts); the dangerous force flags
   # aren't wanted for user package installs anyway.
   DEBIAN_FRONTEND=noninteractive apt-get -y install "${EXTRA_PACKAGES[@]}"
 fi

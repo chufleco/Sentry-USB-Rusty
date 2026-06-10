@@ -246,7 +246,7 @@ fi
 # some distros don't include mkfs.vfat
 if ! hash mkfs.vfat
 then
-  apt-get -y --force-yes install dosfstools
+  apt-get -y install dosfstools
 fi
 
 CAM_DISK_FILE_NAME="$BACKINGFILES_MOUNTPOINT/cam_disk.bin"

@@ -113,10 +113,10 @@ function check_archive_mountable () {
 
 function install_required_packages () {
   log_progress "Installing/updating required packages if needed"
-  apt-get -y --force-yes install hping3 cifs-utils
+  apt-get -y install hping3 cifs-utils
   if ! command -v nc > /dev/null
   then
-    apt-get -y --force-yes install netcat || apt-get -y --force-yes install netcat-openbsd
+    apt-get -y install netcat || apt-get -y install netcat-openbsd
   fi
   log_progress "Done"
 }

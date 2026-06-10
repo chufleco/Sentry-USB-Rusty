@@ -59,7 +59,7 @@ function check_xfs () {
   # install XFS tools if needed
   if ! hash mkfs.xfs
   then
-    apt-get -y --force-yes install xfsprogs
+    apt-get -y install xfsprogs
   fi
   truncate -s 1GB /tmp/xfs.img
   mkfs.xfs -m reflink=1 -f /tmp/xfs.img > /dev/null

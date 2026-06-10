@@ -31,7 +31,7 @@ function log_progress () {
   echo "configure-automount: $1"
 }
 
-apt-get -y --force-yes install autofs
+apt-get -y install autofs
 # the Raspbian Stretch autofs package does not include the /etc/auto.master.d folder
 if [ ! -d /etc/auto.master.d ]
 then

@@ -191,7 +191,7 @@ if systemctl --quiet is-enabled NetworkManager.service
 then
   # force-install iw because otherwise it will get autoremoved when
   # alsa-utils is removed later
-  apt-get -y --force-yes install iw || exit 1
+  apt-get -y install iw || exit 1
   if ! nm_add_ap
   then
     # NM won't allow adding connections when its keyfile plugin started
@@ -222,7 +222,7 @@ then
 
   # install required packages
   log_progress "installing dnsmasq and hostapd"
-  apt-get -y --force-yes install dnsmasq hostapd
+  apt-get -y install dnsmasq hostapd
 
   log_progress "configuring AP '$AP_SSID' with IP $IP"
   # create udev rule

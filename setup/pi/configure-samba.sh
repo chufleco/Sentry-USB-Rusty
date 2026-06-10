@@ -53,7 +53,7 @@ then
     ln -s /mutable/varlib/samba /var/lib/samba
   fi
 
-  DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install samba
+  DEBIAN_FRONTEND=noninteractive apt-get -y install samba
   service smbd start
   echo -e "raspberry\nraspberry\n" | smbpasswd -s -a pi
   service smbd stop

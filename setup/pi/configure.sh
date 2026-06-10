@@ -224,7 +224,7 @@ function check_teslafi_api () {
     if ! command -v jq &>/dev/null
       then
         log_progress "Installing required package for TeslaFi API: jq"
-        DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install jq
+        DEBIAN_FRONTEND=noninteractive apt-get -y install jq
     fi
     log_progress "TeslaFi API enabled."
   else
@@ -250,7 +250,7 @@ function check_tessie_api () {
       if ! command -v jq &>/dev/null
       then
         log_progress "Installing required package for Tessie API: jq"
-        DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install jq
+        DEBIAN_FRONTEND=noninteractive apt-get -y install jq
       fi
 
       log_progress "Tessie API enabled."
@@ -275,7 +275,7 @@ function check_and_configure_tesla_ble () {
       log_progress "Skipping required package for Tesla BLE API: bluez already installed."
     else
       log_progress "Installing required package for Tesla BLE API: bluez"
-      DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install bluez
+      DEBIAN_FRONTEND=noninteractive apt-get -y install bluez
     fi
 
     if [[ -n "$(apt-cache search pi-bluetooth)" ]]
@@ -285,7 +285,7 @@ function check_and_configure_tesla_ble () {
           log_progress "Skipping required package for Tesla BLE API: pi-bluetooth already installed."
         else
           log_progress "Installing required package for Tesla BLE API: pi-bluetooth"
-          DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install pi-bluetooth
+          DEBIAN_FRONTEND=noninteractive apt-get -y install pi-bluetooth
         fi
     else
         log_progress "Skipping required package for Tesla BLE API: pi-bluetooth does not exist for this device."
