@@ -334,7 +334,17 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     let _ = sentryusb_shell::run("mount", &["-o", "remount,rw", "/"]).await;
     let _ = sentryusb_shell::run("mount", &["/", "-o", "remount,rw"]).await;
 
-    let tmp = "/tmp/sentryusb-update";
+    // Stage the download on the SAME filesystem as the destination so the
+    // mv below is an atomic rename(2). The old staging path was /tmp
+    // (tmpfs): mv across filesystems falls back to unlink-dest + copy,
+    // and a power cut mid-copy — routine on a Pi that loses power the
+    // moment the car cuts accessory — left a partial (or no) binary at
+    // /opt/sentryusb and a service that can't start on the next boot.
+    // A power cut mid-download now only orphans the hidden .new file;
+    // the running binary is untouched until the rename. Bonus: the
+    // ~15 MB binary no longer transits tmpfs RAM on a 1 GB device.
+    sentryusb_shell::run("mkdir", &["-p", "/opt/sentryusb"]).await?;
+    let tmp = "/opt/sentryusb/.sentryusb-update.new";
     sentryusb_shell::run_with_timeout(
         std::time::Duration::from_secs(120),
         "curl", &["-fsSL", &url, "-o", tmp],
@@ -396,7 +406,9 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     .await
     .is_ok();
     if head_ok {
-        let telemetry_tmp = "/tmp/sentryusb-tesla-telemetry-update";
+        // Staged next to its destination (not /tmp) so the mv below is an
+        // atomic same-fs rename — see the main-binary staging note above.
+        let telemetry_tmp = "/opt/sentryusb/.sentryusb-tesla-telemetry-update.new";
         match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
             "curl",
@@ -545,7 +557,9 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     .await
     .is_ok();
     if head_ok_action {
-        let action_tmp = "/tmp/sentryusb-ble-action-update";
+        // Staged next to its destination for the same atomic-rename
+        // reason as the two binaries above.
+        let action_tmp = "/opt/sentryusb/.sentryusb-ble-action-update.new";
         match sentryusb_shell::run_with_timeout(
             std::time::Duration::from_secs(120),
             "curl",
@@ -625,19 +639,36 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
 
     // Determine the tag to record. Use the requested target if any (it
     // matches the binary we just installed); otherwise resolve /latest.
+    // Resolve via the shared HTTP client, like check_for_update already
+    // does — this was the last curl|grep|sed bash pipeline left here, and
+    // it interpolated the (config-controlled) repo name into a shell
+    // string. reqwest + serde needs no quoting at all.
     let tag = match target_version {
         Some(v) => v,
         None => {
-            let tag_cmd = format!(
-                "curl -fsSL --max-time 10 https://api.github.com/repos/{}/releases/latest 2>/dev/null \
-                 | grep '\"tag_name\"' | head -1 | sed 's/.*\"tag_name\": *\"\\([^\"]*\\)\".*/\\1/'",
+            let api_url = format!(
+                "https://api.github.com/repos/{}/releases/latest",
                 repo
             );
-            sentryusb_shell::run("bash", &["-c", &tag_cmd])
+            match crate::http_client()
+                .get(&api_url)
+                .header("User-Agent", "sentryusb-updater")
+                .timeout(std::time::Duration::from_secs(10))
+                .send()
                 .await
-                .unwrap_or_default()
-                .trim()
-                .to_string()
+            {
+                Ok(resp) => resp
+                    .json::<serde_json::Value>()
+                    .await
+                    .ok()
+                    .and_then(|v| {
+                        v.get("tag_name")
+                            .and_then(|t| t.as_str())
+                            .map(|s| s.trim().to_string())
+                    })
+                    .unwrap_or_default(),
+                Err(_) => String::new(),
+            }
         }
     };
 
