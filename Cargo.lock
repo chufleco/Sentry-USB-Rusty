@@ -2531,6 +2531,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "chrono",
+ "futures",
  "hex",
  "reqwest",
  "ring",
