@@ -61,6 +61,16 @@ pub fn write_file(path: &str, new_config: &SetupConfig) -> Result<()> {
     if let Some(bad) = new_config.keys().find(|k| !is_valid_key(k)) {
         anyhow::bail!("refusing to write config: invalid key {:?}", bad);
     }
+    // Values can't contain a newline: `quote()` would emit a literal
+    // multi-line bash string, but `parse_file()` is line-based and reads
+    // back only the first line — so the value silently truncates on the
+    // next load (and the trailing lines become stray config). Reject the
+    // write rather than persist something that won't round-trip. (A
+    // textarea-backed field like NOTIFICATION_COMMAND_* is the realistic
+    // source of a newline.)
+    if let Some((k, _)) = new_config.iter().find(|(_, v)| v.contains(['\n', '\r'])) {
+        anyhow::bail!("refusing to write config: value for {:?} contains a newline", k);
+    }
     let content = fs::read_to_string(path)
         .with_context(|| format!("failed to open config file: {}", path))?;
 
@@ -313,6 +323,17 @@ mod tests {
         let mut ok = SetupConfig::new();
         ok.insert("GOOD".to_string(), "2".to_string());
         assert!(write_file(path.to_str().unwrap(), &ok).is_ok());
+
+        // A newline in a VALUE can't round-trip the line-based parser, so
+        // write_file must reject it rather than silently truncate on reload.
+        let mut nl = SetupConfig::new();
+        nl.insert("NOTIFICATION_COMMAND_START".to_string(), "line1\nline2".to_string());
+        assert!(
+            write_file(path.to_str().unwrap(), &nl).is_err(),
+            "newline value must be rejected"
+        );
+        let after2 = std::fs::read_to_string(&path).unwrap();
+        assert!(!after2.contains("line2"), "config must be unchanged on rejected value");
 
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_dir(&dir);
