@@ -742,7 +742,8 @@ fn split_by_gear_state_legacy(group: Vec<TimedRoute>) -> Vec<Vec<TimedRoute>> {
 /// Returns true if the clip is majority Park (legacy heuristic).
 fn clip_is_mostly_parked_legacy(clip: &TimedRoute) -> bool {
     if clip.route.raw_frame_count > 0 {
-        return (clip.route.raw_park_count as f64 / clip.route.raw_frame_count as f64) > 0.5;
+        return (clip.route.raw_park_count as f64 / clip.route.raw_frame_count as f64)
+            > calc::PARK_MAJORITY_FRACTION;
     }
     if clip.route.gear_states.is_empty() {
         return false;
@@ -1731,8 +1732,11 @@ fn count_gear_splits_in_group(routes: &[Route], group: &[RouteTimestamp]) -> usi
         for entry in group {
             let r = &routes[entry.idx];
             if r.raw_frame_count > 0 && r.raw_park_count > 0 {
-                let is_all_park =
-                    r.raw_park_count as f64 / r.raw_frame_count as f64 > 0.6;
+                // Deliberately the stricter FAST threshold (0.6, not 0.5):
+                // this approximates from raw frame counts without
+                // per-segment splitting. See calc.rs for the rationale.
+                let is_all_park = r.raw_park_count as f64 / r.raw_frame_count as f64
+                    > calc::PARK_MAJORITY_FRACTION_FAST;
                 if prev_all_park && !is_all_park {
                     count += 1;
                 }
@@ -2488,7 +2492,8 @@ fn split_summary_by_gear_state_legacy<'a>(
     let mut current: Vec<SubClipSummary<'a>> = Vec::new();
     for clip in group {
         let mostly_park = if clip.summary.raw_frame_count > 0 {
-            (clip.summary.raw_park_count as f64 / clip.summary.raw_frame_count as f64) > 0.5
+            (clip.summary.raw_park_count as f64 / clip.summary.raw_frame_count as f64)
+                > calc::PARK_MAJORITY_FRACTION
         } else {
             false
         };

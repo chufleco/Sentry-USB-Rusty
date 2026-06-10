@@ -5,14 +5,27 @@
 
 set -e
 
-# Build frontend (if web/ directory exists in parent project)
-SENTRY_USB_DIR="$(dirname "$0")/../Sentry-USB"
-if [ -d "$SENTRY_USB_DIR/web" ] && [ -f "$SENTRY_USB_DIR/web/package.json" ]; then
-    echo "Building frontend..."
-    (cd "$SENTRY_USB_DIR/web" && npm run build)
+# Build frontend. Prefer this repo's own web/ (current layout); fall back
+# to the legacy ../Sentry-USB/web sibling for old checkouts. static/ is
+# gitignored (never committed — a stale committed copy once silently
+# shipped an old UI), so this step is what populates it; without it a
+# bare cargo build embeds the "frontend not built" placeholder that
+# crates/sentryusb/build.rs writes.
+WEB_DIR="$(dirname "$0")/web"
+if [ ! -f "$WEB_DIR/package.json" ]; then
+    WEB_DIR="$(dirname "$0")/../Sentry-USB/web"
+fi
+if [ -d "$WEB_DIR" ] && [ -f "$WEB_DIR/package.json" ]; then
+    echo "Building frontend from $WEB_DIR..."
+    (cd "$WEB_DIR" && npm run build)
     echo "Copying frontend to static/"
-    rm -rf crates/sentryusb/static/*
-    cp -r "$SENTRY_USB_DIR/web/dist/"* crates/sentryusb/static/
+    # Full wipe (not /*) so a stale placeholder index.html and old
+    # pre-compressed .br/.gz siblings can't survive into the embed.
+    rm -rf crates/sentryusb/static
+    mkdir -p crates/sentryusb/static
+    cp -r "$WEB_DIR/dist/"* crates/sentryusb/static/
+else
+    echo "WARNING: no web/ found — binary will embed the 'frontend not built' placeholder."
 fi
 
 # Pre-compress static assets so embed.rs can serve raw .br / .gz bytes
