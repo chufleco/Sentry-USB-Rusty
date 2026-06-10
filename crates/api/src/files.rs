@@ -359,8 +359,25 @@ pub async fn upload_file(
                     .to_string();
                 filename = Some(fname);
 
-                // Stream to a temp file to avoid holding the entire upload in RAM
-                let tmp = std::env::temp_dir().join(format!("sentryusb-upload-{}", std::process::id()));
+                // Stream to a temp file to avoid holding the entire upload in
+                // RAM. The name must be unique per upload: keying only on the
+                // PID meant two concurrent uploads to the same server wrote the
+                // same temp file and corrupted each other (last writer's bytes
+                // landed under both destination names). Add a monotonic counter
+                // + nanosecond clock so overlapping requests never collide.
+                static UPLOAD_SEQ: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let seq = UPLOAD_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let nanos = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                let tmp = std::env::temp_dir().join(format!(
+                    "sentryusb-upload-{}-{}-{}",
+                    std::process::id(),
+                    seq,
+                    nanos
+                ));
                 let mut file = match tokio::fs::File::create(&tmp).await {
                     Ok(f) => f,
                     Err(e) => {
