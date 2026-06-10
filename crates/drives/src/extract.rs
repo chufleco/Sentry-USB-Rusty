@@ -111,12 +111,15 @@ fn find_mdat_box(f: &mut File) -> Result<(u64, u64)> {
             box_size = file_size - pos;
         }
 
+        // A box smaller than its own header is corrupt; without this
+        // guard `box_size - header_size` underflows for an mdat (huge
+        // bogus size → the NAL scanner chews garbage to EOF) and the
+        // skip loop stalls or wraps for other boxes.
+        if box_size < header_size {
+            break;
+        }
         if is_mdat {
             return Ok((pos + header_size, box_size - header_size));
-        }
-
-        if box_size < 8 {
-            break;
         }
         pos += box_size;
     }

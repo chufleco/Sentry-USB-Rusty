@@ -217,8 +217,15 @@ impl Processor {
                         errors.push(format!("{}: extract failed — {}", file, e));
                     }
                     // Mark processed anyway — clip has no extractable GPS,
-                    // retrying won't change that.
-                    self.store.mark_processed(file)?;
+                    // retrying won't change that. Tolerate a mark failure
+                    // like the save-error path above does: propagating it
+                    // aborted the whole run AND left status.running stuck
+                    // true (the early return skipped the reset below), so
+                    // the UI showed "processing" forever. The unmarked file
+                    // is simply retried next cycle.
+                    if let Err(me) = self.store.mark_processed(file) {
+                        warn!("failed to mark {} processed: {}", file, me);
+                    }
                 }
             }
 

@@ -32,8 +32,11 @@ pub fn window_for_route_file(file: &str) -> Option<(i64, i64)> {
     // Tesla writes the filename using the car's local clock, and the
     // Pi writes telemetry samples using its own local clock — on the
     // same install these are the same zone, so reading both as
-    // `Local` keeps the comparison consistent.
-    let local = Local.from_local_datetime(&naive).single()?;
+    // `Local` keeps the comparison consistent. `earliest()` rather
+    // than `single()`: during the DST fall-back hour local times are
+    // ambiguous and `single()` returned None, silently skipping
+    // telemetry for every clip in that hour once a year.
+    let local = Local.from_local_datetime(&naive).earliest()?;
     let start = local.timestamp();
     Some((start, start + CLIP_WINDOW_SECS))
 }

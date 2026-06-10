@@ -375,6 +375,10 @@ fn insert_imported_route(
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
 
+    // Telemetry columns come from the JSON (the exporter writes them) so
+    // an export→import round-trip preserves the BLE rollups — they used
+    // to be dropped here, and the OR REPLACE then nulled them on any
+    // re-imported row.
     tx.execute(
         "INSERT OR REPLACE INTO routes(
             file, date_dir, point_count, raw_park_count, raw_frame_count,
@@ -386,7 +390,13 @@ fn insert_imported_route(
             fsd_distance_m, autosteer_distance_m, tacc_distance_m, assisted_distance_m,
             fsd_disengagements, fsd_accel_pushes,
             start_lat, start_lon, end_lat, end_lon,
-            source, external_signature, tessie_autopilot_percent)
+            source, external_signature, tessie_autopilot_percent,
+            battery_pct_start, battery_pct_end,
+            interior_temp_min, interior_temp_max, exterior_temp_avg,
+            hvac_runtime_s,
+            tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+            odometer_mi_start, odometer_mi_end,
+            location_name_start, location_name_end)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -396,7 +406,10 @@ fn insert_imported_route(
             ?23, ?24, ?25, ?26,
             ?27, ?28,
             ?29, ?30, ?31, ?32,
-            ?33, ?34, ?35)",
+            ?33, ?34, ?35,
+            ?36, ?37, ?38, ?39, ?40, ?41,
+            ?42, ?43, ?44, ?45,
+            ?46, ?47, ?48, ?49)",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -407,6 +420,12 @@ fn insert_imported_route(
             a.fsd_disengagements, a.fsd_accel_pushes,
             a.start_lat, a.start_lng, a.end_lat, a.end_lng,
             r.source, r.external_signature, r.tessie_autopilot_percent,
+            r.battery_pct_start, r.battery_pct_end,
+            r.interior_temp_min, r.interior_temp_max, r.exterior_temp_avg,
+            r.hvac_runtime_s,
+            r.tire_fl_psi, r.tire_fr_psi, r.tire_rl_psi, r.tire_rr_psi,
+            r.odometer_mi_start, r.odometer_mi_end,
+            r.location_name_start, r.location_name_end,
         ],
     )?;
     Ok(())
@@ -432,9 +451,9 @@ pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
         }
         out
     };
-    // Belt & suspenders — SQL ORDER BY already sorts but the UI will
-    // sometimes insert paths with different case through the API; sort
-    // case-insensitively here to match Go's deterministic output.
+    // Belt & suspenders — SQL ORDER BY (BINARY) already sorts; this
+    // byte-wise re-sort just pins deterministic output even if the
+    // query ever changes.
     processed_files.sort();
 
     let drive_tags = {
@@ -913,6 +932,43 @@ mod import_diagnostics_tests {
         assert_eq!(stats.routes, 1);
         assert_eq!(diag.seen, 1);
         assert!(!diag.has_problems(), "clean import should not flag problems");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Telemetry fields in the JSON (as the exporter writes them) must land
+    /// in the routes columns — they used to be dropped on import, so a
+    /// backup restore lost every BLE telemetry badge.
+    #[test]
+    fn import_preserves_telemetry_columns() {
+        let route = r#"{"file":"2025-01-15_12-00-00/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.1,-122.1]],"batteryPctStart":80.5,"batteryPctEnd":79.0,"hvacRuntimeS":30,"odometerMiStart":1000.5,"odometerMiEnd":1001.0,"locationNameStart":"Home St","tireFlPsi":42.5}"#;
+        let json = build_json(route);
+        let path = std::env::temp_dir().join("sentryusb-diag-telemetry.json");
+        std::fs::write(&path, &json).unwrap();
+
+        let mut conn = fresh_conn();
+        let (stats, _diag) = import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+        assert_eq!(stats.routes, 1);
+
+        let (bs, be, hvac, odo_s, odo_e, loc, fl): (
+            Option<f64>, Option<f64>, Option<i64>, Option<f64>, Option<f64>,
+            Option<String>, Option<f64>,
+        ) = conn
+            .query_row(
+                "SELECT battery_pct_start, battery_pct_end, hvac_runtime_s, \
+                        odometer_mi_start, odometer_mi_end, location_name_start, tire_fl_psi \
+                 FROM routes WHERE file = '2025-01-15_12-00-00/clip.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+            )
+            .unwrap();
+        assert_eq!(bs, Some(80.5));
+        assert_eq!(be, Some(79.0));
+        assert_eq!(hvac, Some(30));
+        assert_eq!(odo_s, Some(1000.5));
+        assert_eq!(odo_e, Some(1001.0));
+        assert_eq!(loc.as_deref(), Some("Home St"));
+        assert_eq!(fl, Some(42.5));
 
         let _ = std::fs::remove_file(&path);
     }

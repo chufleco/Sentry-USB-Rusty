@@ -1552,6 +1552,12 @@ fn insert_or_update_route(
     // the prior `Vec<Box<dyn ToSql>>` + `Vec<&dyn ToSql>` pattern which
     // heap-allocated 35 small boxes plus two Vecs per insert. Called once
     // per ingested clip (50+/min during Tesla recording).
+    // The v6+ telemetry columns ride along from the Route so restore
+    // paths (replace_data, JSON import) preserve them — they used to be
+    // silently dropped, so an export→import round-trip lost every BLE
+    // telemetry badge. On the live ingest path the Route carries None
+    // here and write_route_telemetry recomputes them right after, in
+    // the same transaction.
     tx.execute(
         "INSERT INTO routes(
             file, date_dir, point_count, raw_park_count, raw_frame_count,
@@ -1563,7 +1569,13 @@ fn insert_or_update_route(
             fsd_distance_m, autosteer_distance_m, tacc_distance_m, assisted_distance_m,
             fsd_disengagements, fsd_accel_pushes,
             start_lat, start_lon, end_lat, end_lon,
-            source, external_signature, tessie_autopilot_percent)
+            source, external_signature, tessie_autopilot_percent,
+            battery_pct_start, battery_pct_end,
+            interior_temp_min, interior_temp_max, exterior_temp_avg,
+            hvac_runtime_s,
+            tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+            odometer_mi_start, odometer_mi_end,
+            location_name_start, location_name_end)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -1573,7 +1585,10 @@ fn insert_or_update_route(
             ?23, ?24, ?25, ?26,
             ?27, ?28,
             ?29, ?30, ?31, ?32,
-            ?33, ?34, ?35)
+            ?33, ?34, ?35,
+            ?36, ?37, ?38, ?39, ?40, ?41,
+            ?42, ?43, ?44, ?45,
+            ?46, ?47, ?48, ?49)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -1608,7 +1623,21 @@ fn insert_or_update_route(
             end_lon             = excluded.end_lon,
             source              = excluded.source,
             external_signature  = excluded.external_signature,
-            tessie_autopilot_percent = excluded.tessie_autopilot_percent",
+            tessie_autopilot_percent = excluded.tessie_autopilot_percent,
+            battery_pct_start   = excluded.battery_pct_start,
+            battery_pct_end     = excluded.battery_pct_end,
+            interior_temp_min   = excluded.interior_temp_min,
+            interior_temp_max   = excluded.interior_temp_max,
+            exterior_temp_avg   = excluded.exterior_temp_avg,
+            hvac_runtime_s      = excluded.hvac_runtime_s,
+            tire_fl_psi         = excluded.tire_fl_psi,
+            tire_fr_psi         = excluded.tire_fr_psi,
+            tire_rl_psi         = excluded.tire_rl_psi,
+            tire_rr_psi         = excluded.tire_rr_psi,
+            odometer_mi_start   = excluded.odometer_mi_start,
+            odometer_mi_end     = excluded.odometer_mi_end,
+            location_name_start = excluded.location_name_start,
+            location_name_end   = excluded.location_name_end",
         params![
             norm_file,
             &r.date,
@@ -1645,6 +1674,20 @@ fn insert_or_update_route(
             &r.source,
             &r.external_signature,
             r.tessie_autopilot_percent,
+            r.battery_pct_start,
+            r.battery_pct_end,
+            r.interior_temp_min,
+            r.interior_temp_max,
+            r.exterior_temp_avg,
+            r.hvac_runtime_s,
+            r.tire_fl_psi,
+            r.tire_fr_psi,
+            r.tire_rl_psi,
+            r.tire_rr_psi,
+            r.odometer_mi_start,
+            r.odometer_mi_end,
+            &r.location_name_start,
+            &r.location_name_end,
         ],
     )?;
     Ok(())

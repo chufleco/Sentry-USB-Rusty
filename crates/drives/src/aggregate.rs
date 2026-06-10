@@ -5,8 +5,8 @@
 //! for pre-v2 rows, and the refactored summary endpoints read the stored
 //! scalars instead of re-deriving them.
 //!
-//! Semantics match `ComputeAggregateStatsFromRoutes`'s per-route inner loop
-//! exactly (null-island filter + GPS-teleport guard, no group-level median):
+//! Semantics (null-island filter + GPS-teleport guard, no group-level
+//! median — matches the Go implementation this was ported from):
 //!   * Null-island points (|lat| < 1 && |lon| < 1) are excluded from the pair
 //!     loop.
 //!   * When no SEI speeds are present we use a per-pair GPS derivation d/dt
