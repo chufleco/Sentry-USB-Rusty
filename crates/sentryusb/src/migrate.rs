@@ -216,7 +216,7 @@ fi
 # ── Install BLE Python dependencies if missing ──
 for pkg in python3-dbus python3-gi bluez; do
   if ! dpkg-query -W --showformat='${{db:Status-Status}}\n' "$pkg" 2>/dev/null | grep -q '^installed$'; then
-    DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "$pkg" 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get -y install "$pkg" 2>/dev/null || true
   fi
 done
 
