@@ -8,7 +8,7 @@ import {
   Clock,
   Camera,
   Activity,
-  Cable,
+  EthernetPort,
   HeartPulse,
   Timer,
   Zap,
@@ -669,7 +669,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         <>
           <div className="tile-row">
             <span className="inline-flex text-slate-500">
-              <Cable className="h-3.5 w-3.5" />
+              <EthernetPort className="h-3.5 w-3.5" />
             </span>
             <span className="text-xs font-medium text-slate-200">
               {status.ether_speed}
@@ -698,7 +698,7 @@ function NetworkTile({ status }: { status: PiStatus }) {
         // disconnected state without taking the tile's halo over.
         <div className="tile-row">
           <span className="inline-flex text-slate-600">
-            <Cable className="h-3.5 w-3.5" />
+            <EthernetPort className="h-3.5 w-3.5" />
           </span>
           <span className="text-xs text-slate-600">Ethernet</span>
           <span className="ml-auto text-[10px] text-slate-600">Not connected</span>

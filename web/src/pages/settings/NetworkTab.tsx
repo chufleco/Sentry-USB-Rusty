@@ -1,4 +1,4 @@
-import { Wifi, Cable } from "lucide-react"
+import { Wifi, EthernetPort } from "lucide-react"
 import { PrefCard } from "@/components/settings/PrefCard"
 import { Row } from "@/components/ui/StatusTile"
 import { Pill } from "@/components/ui/Pill"
@@ -51,7 +51,7 @@ export function NetworkTab({ status }: Props) {
       </PrefCard>
 
       <PrefCard
-        icon={<Cable className="h-3.5 w-3.5" />}
+        icon={<EthernetPort className="h-3.5 w-3.5" />}
         halo={ethConnected ? "accent" : "slate"}
         title="Ethernet"
         badge={
