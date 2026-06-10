@@ -8,3 +8,8 @@ Sentry-USB-OLD
 .cursorignore
 server/ble/__pycache__
 .claude
+
+# Embedded web UI — built by build.sh / CI (npm run build -> web/dist -> here).
+# Never commit: a stale committed copy silently ships an old UI. build.rs writes
+# a placeholder index.html when this is absent so a bare cargo build still compiles.
+/crates/sentryusb/static/
