@@ -137,6 +137,13 @@ AUTH_FAIL_WINDOW = 300  # seconds
 
 mainloop = None
 
+# Cap on a characteristic's reassembly buffer. Writes accumulate until they
+# parse as JSON; a peer that streams bytes which never complete a JSON object
+# would otherwise grow the buffer without bound. 64 KB is far above any real
+# WiFi-config / auth / API-proxy request; past it we drop the buffer and start
+# over rather than let a misbehaving (or hostile) peer exhaust memory.
+MAX_WRITE_BUFFER = 64 * 1024
+
 
 def detect_api_base():
     """Detect which port the Go server is listening on.
@@ -220,11 +227,27 @@ def record_auth_failure(device):
 
 
 def clear_peer_auth(device):
-    """Drop a peer's authenticated + rate-limit state (on disconnect)."""
+    """Drop a peer's *authentication* on disconnect, but PRESERVE its
+    failed-PIN lockout.
+
+    Clearing the failure history here would let a BLE-range attacker reset
+    the brute-force counter at will — connect, try AUTH_MAX_FAILS PINs,
+    disconnect, reconnect, repeat — defeating the lockout entirely. The
+    authenticated set MUST be cleared (a reconnecting/spoofed address can't
+    inherit a prior session's authentication), but the failure window has to
+    outlive the connection to mean anything. It self-drains after
+    AUTH_FAIL_WINDOW; we prune expired timestamps here so the dict stays
+    bounded without dropping an active lockout."""
     if not device:
         return
-    authenticated_peers.discard(str(device))
-    auth_failures.pop(str(device), None)
+    device = str(device)
+    authenticated_peers.discard(device)
+    now = time.monotonic()
+    recent = [t for t in auth_failures.get(device, []) if now - t < AUTH_FAIL_WINDOW]
+    if recent:
+        auth_failures[device] = recent
+    else:
+        auth_failures.pop(device, None)
 
 
 def is_authenticated(options):
@@ -660,16 +683,22 @@ class WifiScanCharacteristic(Characteristic):
     def ReadValue(self, options):
         offset = int(options.get('offset', 0))
 
+        # Auth gate BEFORE the Read Blob continuation: the continuation
+        # used to be served unauthenticated, so any BLE peer could read
+        # the tail of a cached scan another (authenticated) client had
+        # triggered. Low-sensitivity data (nearby SSIDs), but there's no
+        # reason to leak it — the legitimate continuation reader is the
+        # same authenticated device that did the offset=0 read.
+        if not is_authenticated(options):
+            data = json.dumps({'error': 'not_authenticated'}).encode()
+            return dbus.Array([dbus.Byte(b) for b in data], signature='y')
+
         # Read Blob continuation — return remaining bytes from previous read
         if offset > 0 and self._read_blob_data is not None:
             log.debug(f'WiFi scan Read Blob offset={offset}/{len(self._read_blob_data)}')
             return dbus.Array(
                 [dbus.Byte(b) for b in self._read_blob_data[offset:]],
                 signature='y')
-
-        if not is_authenticated(options):
-            data = json.dumps({'error': 'not_authenticated'}).encode()
-            return dbus.Array([dbus.Byte(b) for b in data], signature='y')
 
         # If cached results exist from a completed scan, return them
         if self._cached_networks is not None:
@@ -772,6 +801,9 @@ class WifiConfigCharacteristic(Characteristic):
             config = json.loads(self.write_buffer.decode())
             self.write_buffer = bytearray()
         except (json.JSONDecodeError, UnicodeDecodeError):
+            if len(self.write_buffer) > MAX_WRITE_BUFFER:
+                log.warning('WiFi config buffer exceeded cap — discarding')
+                self.write_buffer = bytearray()
             return
 
         if not is_authenticated(options):
@@ -879,6 +911,9 @@ class AuthCharacteristic(Characteristic):
             msg = json.loads(self.write_buffer.decode())
             self.write_buffer = bytearray()
         except (json.JSONDecodeError, UnicodeDecodeError):
+            if len(self.write_buffer) > MAX_WRITE_BUFFER:
+                log.warning('Auth buffer exceeded cap — discarding')
+                self.write_buffer = bytearray()
             return
 
         action = msg.get('action', '')
@@ -952,6 +987,9 @@ class APIRequestCharacteristic(Characteristic):
             request = json.loads(self.write_buffer.decode())
             self.write_buffer = bytearray()
         except (json.JSONDecodeError, UnicodeDecodeError):
+            if len(self.write_buffer) > MAX_WRITE_BUFFER:
+                log.warning('API request buffer exceeded cap — discarding')
+                self.write_buffer = bytearray()
             return
 
         if not is_authenticated(options):
