@@ -15,11 +15,16 @@ pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute
         // service; uploading it would burn the user's cloud storage budget
         // and the cloud has no way to distinguish it later (encrypt.rs
         // strips `source` from the payload). NULL source = native dashcam.
+        // `start_ts` is always NULL (insert_or_update_route binds it NULL),
+        // so it can't actually order anything — without a tiebreaker the
+        // upload order is undefined. `file ASC` makes it deterministic, and
+        // since Tesla clip paths embed the timestamp it's also chronological
+        // (oldest-first), which is the intent. Matches `pending_queue`.
         let mut stmt = conn.prepare(
             "SELECT file, cloud_route_id FROM routes \
              WHERE cloud_uploaded_at IS NULL \
                AND (source IS NULL OR source != 'tessie') \
-             ORDER BY start_ts ASC LIMIT ?1",
+             ORDER BY file ASC LIMIT ?1",
         )?;
         let iter = stmt.query_map(params![limit], |row| {
             Ok((
