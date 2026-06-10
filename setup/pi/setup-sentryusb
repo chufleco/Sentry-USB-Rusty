@@ -1850,7 +1850,12 @@ if [ -n "${INSTALL_USER_REQUESTED_PACKAGES:-}" ]
 then
   setup_progress "Installing user requested packages: ${INSTALL_USER_REQUESTED_PACKAGES}"
   read -r -a EXTRA_PACKAGES <<< "${INSTALL_USER_REQUESTED_PACKAGES[@]}"
-  DEBIAN_FRONTEND=noninteractive apt-get -y --force-yes install "${EXTRA_PACKAGES[@]}"
+  # --force-yes was removed in apt 1.1; on Bookworm it makes apt-get exit
+  # non-zero before installing anything, so headless installs that set
+  # INSTALL_USER_REQUESTED_PACKAGES failed here. Plain -y is what this
+  # actually needs (assume-yes on prompts); the dangerous force flags
+  # aren't wanted for user package installs anyway.
+  DEBIAN_FRONTEND=noninteractive apt-get -y install "${EXTRA_PACKAGES[@]}"
 fi
 
 setup_progress "Running post-setup tasks"
