@@ -167,11 +167,19 @@ fn cached_json_response(body: String) -> axum::response::Response {
 /// decoding, no ORDER-BY sorter allocation.
 pub async fn list_drives(State(state): State<AppState>) -> axum::response::Response {
     use axum::response::IntoResponse;
-    match state.drives.store.get_cached_drives_json() {
-        Ok(json) => cached_json_response(json),
-        Err(e) => {
+    // spawn_blocking: a cache miss runs the grouper over every route
+    // (~400ms on a Pi 5 for 7k routes) — keep that off the async workers.
+    let store = state.drives.store.clone();
+    match tokio::task::spawn_blocking(move || store.get_cached_drives_json()).await {
+        Ok(Ok(json)) => cached_json_response(json),
+        Ok(Err(e)) => {
             crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
         }
+        Err(e) => crate::json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("drive list task failed: {}", e),
+        )
+        .into_response(),
     }
 }
 
@@ -502,7 +510,19 @@ pub async fn reprocess_all(
 pub async fn drive_stats(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match state.drives.store.get_cached_drive_stats_json() {
+    // spawn_blocking: cache misses run the grouper — see list_drives.
+    let store = state.drives.store.clone();
+    let result =
+        match tokio::task::spawn_blocking(move || store.get_cached_drive_stats_json()).await {
+            Ok(r) => r,
+            Err(e) => {
+                return crate::json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!("drive stats task failed: {}", e),
+                );
+            }
+        };
+    match result {
         Ok(json) => match serde_json::from_str::<serde_json::Value>(&json) {
             Ok(mut v) => {
                 v["processed_count"] = state.drives.store.processed_count().into();
@@ -545,11 +565,20 @@ pub async fn fsd_analytics(
     };
 
     if period == "week" {
-        return match state.drives.store.get_cached_fsd_analytics_json() {
-            Ok(json) => cached_json_response(json),
-            Err(e) => {
+        // spawn_blocking: cache misses run the grouper — see list_drives.
+        let store = state.drives.store.clone();
+        return match tokio::task::spawn_blocking(move || store.get_cached_fsd_analytics_json())
+            .await
+        {
+            Ok(Ok(json)) => cached_json_response(json),
+            Ok(Err(e)) => {
                 crate::json_error(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()).into_response()
             }
+            Err(e) => crate::json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("fsd analytics task failed: {}", e),
+            )
+            .into_response(),
         };
     }
 

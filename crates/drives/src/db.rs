@@ -130,6 +130,11 @@ pub struct DriveStore {
     /// rebuilding on every `add_route` call avoids O(n²) work when the
     /// processor adds hundreds of clips in a batch.
     drive_cache_dirty: AtomicBool,
+    /// Serializes cache rebuilds so concurrent dirty reads don't each run
+    /// the CPU-heavy grouper; the second caller waits, then serves the
+    /// fresh cache without recomputing. Lock order: this is always taken
+    /// BEFORE `conn` and never while holding it — deadlock-free.
+    rebuild_lock: Mutex<()>,
 }
 
 impl DriveStore {
@@ -160,6 +165,7 @@ impl DriveStore {
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(true),
+            rebuild_lock: Mutex::new(()),
         };
 
         store.load_locked(IMPORT_SOURCE_CANDIDATES)?;
@@ -179,6 +185,7 @@ impl DriveStore {
             route_count: AtomicI64::new(0),
             processed_count: AtomicI64::new(0),
             drive_cache_dirty: AtomicBool::new(false),
+            rebuild_lock: Mutex::new(()),
         };
         // Still run migrate + backfill so tests exercise the real schema.
         let guard = store.conn.lock().unwrap();
@@ -990,17 +997,81 @@ impl DriveStore {
         Ok(())
     }
 
+    /// Rebuild the drive caches while holding the connection lock only for
+    /// the short read-snapshot and write-back phases. The heavy middle —
+    /// grouping 7k+ summaries, stats, FSD analytics, JSON serialization
+    /// (~400ms on a Pi 5, seconds on a Zero 2 W) — runs with NO lock held,
+    /// so telemetry inserts and unrelated API queries don't stall behind it
+    /// (previously every DB user queued for the entire rebuild).
+    ///
+    /// `rebuild_lock` serializes concurrent rebuilds: the second caller
+    /// blocks until the first finishes, then sees a clean flag and returns
+    /// without recomputing. Lock order is rebuild_lock → conn, never the
+    /// reverse, so this cannot deadlock with any with_locked_conn user.
+    /// `force` skips the it-was-rebuilt-while-we-waited early exit — used
+    /// by getters that found a missing/placeholder cache entry despite a
+    /// clean dirty flag (e.g. the legacy "{}" fsd_analytics_cache), where
+    /// only an actual rebuild repairs the entry.
+    fn rebuild_caches_off_lock(&self, force: bool) -> Result<()> {
+        let _rebuild = self.rebuild_lock.lock().unwrap();
+
+        // A concurrent caller may have rebuilt while we waited for the
+        // rebuild lock — if the flag is clean and a cache exists, done.
+        if !force && !self.drive_cache_dirty.load(Ordering::Acquire) {
+            let conn = self.conn.lock().unwrap();
+            if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
+                if !json.is_empty() {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Snapshot point: clear the dirty flag BEFORE opening the read
+        // snapshot. A mutation landing in the gap is still visible to the
+        // snapshot (it begins after) AND re-dirties the flag — worst case
+        // one redundant rebuild, never a missed one. Clearing later would
+        // let a mid-rebuild mutation be swallowed.
+        self.drive_cache_dirty.store(false, Ordering::Release);
+
+        // Phase 1: snapshot inputs. On a file-backed store this uses a
+        // dedicated READ-ONLY connection — WAL lets it scan the summary
+        // rows concurrently with the shared connection's writers, so the
+        // heaviest read (7k+ rows, ~70ms on a Pi 5, far more on a Zero
+        // 2 W) doesn't block telemetry inserts or API queries at all.
+        // The explicit transaction pins all three queries (summaries,
+        // tags, markers) to one consistent snapshot.
+        let inputs = if self.path == ":memory:" {
+            // A second connection to ":memory:" would be a different,
+            // empty database — fall back to the shared one (tests only).
+            let conn = self.conn.lock().unwrap();
+            select_cache_inputs(&conn)?
+        } else {
+            let rconn = open_readonly_connection(&self.path)?;
+            let tx = rconn.unchecked_transaction()?;
+            let inputs = select_cache_inputs(&tx)?;
+            drop(tx);
+            inputs
+        };
+
+        // Phase 2 (no lock): the expensive part.
+        let artifacts = compute_drive_caches(inputs)?;
+
+        // Phase 3 (locked, fast): persist.
+        let conn = self.conn.lock().unwrap();
+        write_drive_caches(&conn, &artifacts)
+    }
+
     /// Return the pre-computed drives list as a JSON string. On a cache hit
     /// (the common case after startup) this is a single-row meta-table
     /// lookup — no grouper work, no BLOB decoding, no sorter allocation.
     ///
     /// On a cache miss (first request after startup or after routes/tags
     /// change), builds the cache from route summaries + tags and stores it
-    /// in the `meta` table for subsequent requests.
+    /// in the `meta` table for subsequent requests — holding the connection
+    /// lock only for the snapshot and write phases, not the compute.
     pub fn get_cached_drives_json(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
-
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            let conn = self.conn.lock().unwrap();
             if let Some(json) = schema::meta_get(&conn, "drive_list_cache")? {
                 if !json.is_empty() {
                     return Ok(json);
@@ -1008,31 +1079,35 @@ impl DriveStore {
             }
         }
 
-        rebuild_drive_list_cache(&conn)?;
-        self.drive_cache_dirty.store(false, Ordering::Release);
+        // force when the flag was clean (the entry itself was missing or
+        // empty) — the stampede early-exit would otherwise skip the repair.
+        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        self.rebuild_caches_off_lock(force)?;
+        let conn = self.conn.lock().unwrap();
         Ok(schema::meta_get(&conn, "drive_list_cache")?.unwrap_or_else(|| "[]".to_string()))
     }
 
     /// Return the pre-computed drive stats as a JSON string. `processed_count`
     /// is stored as 0 in the cache; callers must inject the live value.
     pub fn get_cached_drive_stats_json(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            let conn = self.conn.lock().unwrap();
             if let Some(json) = schema::meta_get(&conn, "drive_stats_cache")? {
                 if !json.is_empty() {
                     return Ok(json);
                 }
             }
         }
-        rebuild_drive_list_cache(&conn)?;
-        self.drive_cache_dirty.store(false, Ordering::Release);
+        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        self.rebuild_caches_off_lock(force)?;
+        let conn = self.conn.lock().unwrap();
         Ok(schema::meta_get(&conn, "drive_stats_cache")?.unwrap_or_else(|| "{}".to_string()))
     }
 
     /// Return the pre-computed FSD analytics as a JSON string.
     pub fn get_cached_fsd_analytics_json(&self) -> Result<String> {
-        let conn = self.conn.lock().unwrap();
         if !self.drive_cache_dirty.load(Ordering::Acquire) {
+            let conn = self.conn.lock().unwrap();
             if let Some(json) = schema::meta_get(&conn, "fsd_analytics_cache")? {
                 // Treat "{}" as a cache miss: older builds could persist an
                 // empty-object placeholder which then masks real data forever.
@@ -1041,8 +1116,9 @@ impl DriveStore {
                 }
             }
         }
-        rebuild_drive_list_cache(&conn)?;
-        self.drive_cache_dirty.store(false, Ordering::Release);
+        let force = !self.drive_cache_dirty.load(Ordering::Acquire);
+        self.rebuild_caches_off_lock(force)?;
+        let conn = self.conn.lock().unwrap();
         Ok(schema::meta_get(&conn, "fsd_analytics_cache")?.unwrap_or_else(|| "{}".to_string()))
     }
 
@@ -1178,20 +1254,35 @@ fn read_import_history_inner(conn: &Connection) -> Result<Vec<ImportHistoryEntry
 /// Build the grouped drive list and store it as JSON in the `meta` table,
 /// along with the route count and tag row count used to validate the cache
 /// on the next startup.
-fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
-    // Use the BLOB-free summary grouper so this cache and the
-    // `single_drive` endpoint (which also resolves drive IDs through
-    // the summary grouper) agree on drive count, boundaries, and IDs.
-    // The previous BLOB-grouper cache could split a clip mid-park-gap
-    // while the summary grouper kept the whole clip in one drive,
-    // producing different drive lists for /api/drives vs
-    // /api/drives/{id} and causing clicked drives to load wrong points.
-    //
-    // Heap win: ~5 MB instead of ~300 MB on a 5500-route DB (no BLOB
-    // decode here). Numerical drift on noisy GPS is fractions of a
-    // percent, invisible after the UI's 0.1-mi / whole-percent rounding.
+/// Inputs one cache rebuild needs, snapshotted under a single lock hold so
+/// the validity markers (route_count / tags_count / max_updated_at)
+/// describe exactly the data the cache is built from. If the DB changes
+/// after the snapshot, the markers stop matching live counts and
+/// `is_drive_cache_valid` treats the cache as stale — self-correcting.
+struct DriveCacheInputs {
+    summaries: Vec<RouteSummary>,
+    tags: std::collections::HashMap<String, Vec<String>>,
+    tags_count: i64,
+    max_updated_at: i64,
+}
+
+/// Everything one rebuild produces. Computed WITHOUT the connection lock
+/// (the grouper + serialization are pure CPU — ~400ms for 7k routes on a
+/// Pi 5, seconds on a Zero 2 W), then persisted under a short lock.
+struct DriveCacheArtifacts {
+    drives_json: String,
+    stats_json: String,
+    fsd_json: String,
+    route_count: i64,
+    tags_count: i64,
+    max_updated_at: i64,
+    drives_total: usize,
+    visible_total: usize,
+}
+
+/// Rebuild phase 1 — locked, read-only, fast: snapshot the rebuild inputs.
+fn select_cache_inputs(conn: &Connection) -> Result<DriveCacheInputs> {
     let summaries = select_all_route_summaries(conn)?;
-    let route_count = summaries.len() as i64;
 
     let mut tags = std::collections::HashMap::<String, Vec<String>>::new();
     let mut tags_count: i64 = 0;
@@ -1207,6 +1298,37 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
         }
     }
 
+    // MAX(updated_at) lets the validity check detect in-place route updates
+    // (same row count, different aggregates — e.g. archiveloop reprocess,
+    // or a grouper change shipped via OTA without bumping
+    // DRIVE_LIST_CACHE_ALGO_VERSION). Without this marker, the cache stays
+    // "valid" while the live grouper would produce a different drive list.
+    // Read in the same lock hold as the data so the marker can never be
+    // newer than the snapshot it describes.
+    let max_updated_at: i64 = conn
+        .query_row("SELECT COALESCE(MAX(updated_at), 0) FROM routes", [], |r| r.get(0))
+        .unwrap_or(0);
+
+    Ok(DriveCacheInputs { summaries, tags, tags_count, max_updated_at })
+}
+
+/// Rebuild phase 2 — NO lock held: grouping, stats, analytics, serialization.
+fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts> {
+    let DriveCacheInputs { summaries, tags, tags_count, max_updated_at } = inputs;
+    let route_count = summaries.len() as i64;
+
+    // Use the BLOB-free summary grouper so this cache and the
+    // `single_drive` endpoint (which also resolves drive IDs through
+    // the summary grouper) agree on drive count, boundaries, and IDs.
+    // The previous BLOB-grouper cache could split a clip mid-park-gap
+    // while the summary grouper kept the whole clip in one drive,
+    // producing different drive lists for /api/drives vs
+    // /api/drives/{id} and causing clicked drives to load wrong points.
+    //
+    // Heap win: ~5 MB instead of ~300 MB on a 5500-route DB (no BLOB
+    // decode here). Numerical drift on noisy GPS is fractions of a
+    // percent, invisible after the UI's 0.1-mi / whole-percent rounding.
+    //
     // Group with original (un-hidden) IDs first — these are what
     // `find_drive_files` looks up against, so the cached list must
     // hold the same IDs even after the Tessie-overlap filter strips
@@ -1220,21 +1342,8 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
         visible.len(),
         tags_count
     );
-    let json = serde_json::to_string(&visible)
+    let drives_json = serde_json::to_string(&visible)
         .map_err(|e| anyhow::anyhow!("drive cache serialize: {}", e))?;
-    // MAX(updated_at) lets the validity check detect in-place route updates
-    // (same row count, different aggregates — e.g. archiveloop reprocess,
-    // or a grouper change shipped via OTA without bumping
-    // DRIVE_LIST_CACHE_ALGO_VERSION). Without this marker, the cache stays
-    // "valid" while the live grouper would produce a different drive list.
-    let max_updated_at: i64 = conn
-        .query_row("SELECT COALESCE(MAX(updated_at), 0) FROM routes", [], |r| r.get(0))
-        .unwrap_or(0);
-    schema::meta_set(conn, "drive_list_cache", &json)?;
-    schema::meta_set(conn, "drive_list_cache_route_count", &route_count.to_string())?;
-    schema::meta_set(conn, "drive_list_cache_tags_count", &tags_count.to_string())?;
-    schema::meta_set(conn, "drive_list_cache_algo", DRIVE_LIST_CACHE_ALGO_VERSION)?;
-    schema::meta_set(conn, "drive_list_cache_max_updated_at", &max_updated_at.to_string())?;
 
     // Cache drive stats from grouped drives so `/api/drives` and
     // `/api/drives/stats` are consistent on drive count and mileage.
@@ -1294,21 +1403,51 @@ fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
         "tacc_distance_mi":      r(tacc_distance_mi),
         "assisted_percent":      assisted_percent,
     })).map_err(|e| anyhow::anyhow!("stats cache serialize: {}", e))?;
-    schema::meta_set(conn, "drive_stats_cache", &stats_json)?;
 
-    // Cache FSD analytics — reuses the already-grouped drives list.
+    // FSD analytics — reuses the already-grouped drives list.
     let fsd = crate::grouper::fsd_analytics_from_drives(&drives);
     let fsd_json = serde_json::to_string(&fsd)
         .map_err(|e| anyhow::anyhow!("fsd analytics cache serialize: {}", e))?;
-    schema::meta_set(conn, "fsd_analytics_cache", &fsd_json)?;
 
+    Ok(DriveCacheArtifacts {
+        drives_json,
+        stats_json,
+        fsd_json,
+        route_count,
+        tags_count,
+        max_updated_at,
+        drives_total: drives.len(),
+        visible_total: visible.len(),
+    })
+}
+
+/// Rebuild phase 3 — locked, fast: persist the artifacts + the validity
+/// markers describing the snapshot they were built from.
+fn write_drive_caches(conn: &Connection, a: &DriveCacheArtifacts) -> Result<()> {
+    schema::meta_set(conn, "drive_list_cache", &a.drives_json)?;
+    schema::meta_set(conn, "drive_list_cache_route_count", &a.route_count.to_string())?;
+    schema::meta_set(conn, "drive_list_cache_tags_count", &a.tags_count.to_string())?;
+    schema::meta_set(conn, "drive_list_cache_algo", DRIVE_LIST_CACHE_ALGO_VERSION)?;
+    schema::meta_set(conn, "drive_list_cache_max_updated_at", &a.max_updated_at.to_string())?;
+    schema::meta_set(conn, "drive_stats_cache", &a.stats_json)?;
+    schema::meta_set(conn, "fsd_analytics_cache", &a.fsd_json)?;
     info!(
         "[drives] Drive list cache rebuilt ({} drives, {} visible after Tessie/SEI hide, from {} routes)",
-        drives.len(),
-        visible.len(),
-        route_count
+        a.drives_total,
+        a.visible_total,
+        a.route_count
     );
     Ok(())
+}
+
+/// Single-lock-context rebuild for callers that already hold the
+/// connection (startup's `load_locked`, where nothing else is running
+/// yet). Request paths use [`DriveStore::rebuild_caches_off_lock`]
+/// instead, which keeps the heavy compute phase off the connection lock.
+fn rebuild_drive_list_cache(conn: &Connection) -> Result<()> {
+    let inputs = select_cache_inputs(conn)?;
+    let artifacts = compute_drive_caches(inputs)?;
+    write_drive_caches(conn, &artifacts)
 }
 
 /// True when the persisted drive list cache matches the current DB contents.
@@ -2017,6 +2156,67 @@ mod tests {
         assert_eq!(routes[0].accel_positions, vec![0.5, 0.6]);
         assert_eq!(routes[0].raw_frame_count, 2);
         assert_eq!(routes[0].gear_runs.len(), 1);
+    }
+
+    #[test]
+    fn off_lock_rebuild_works_on_file_backed_store() {
+        // The in-memory tests exercise the shared-connection fallback;
+        // this pins the real path: snapshot via a dedicated read-only
+        // connection (WAL), compute unlocked, write back. Mirrors the
+        // temp-file pattern syncguard's tests use (no tempfile dep).
+        let path = std::env::temp_dir().join(format!(
+            "sentryusb-offlock-test-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path_str = path.to_str().unwrap().to_string();
+
+        let store = DriveStore::open(&path_str).unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("a/2025-02-02_09-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[15.0, 16.0], &[0.0, 0.0], 0, 2, &[])
+            .unwrap();
+        let json = store.get_cached_drives_json().unwrap();
+        assert!(json.contains("2025-02-02"), "file-backed rebuild should serve the drive: {json}");
+        assert!(!store.drive_cache_dirty.load(Ordering::Acquire));
+
+        drop(store);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(format!("{}-wal", path_str));
+        let _ = std::fs::remove_file(format!("{}-shm", path_str));
+    }
+
+    #[test]
+    fn off_lock_rebuild_serves_fresh_cache_and_redirties_on_mutation() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("a/2025-01-01_10-00-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .unwrap();
+        // add_route marked the cache dirty; the getter must rebuild via the
+        // off-lock path and serve a list containing the new drive.
+        let json = store.get_cached_drives_json().unwrap();
+        assert!(json.contains("2025-01-01"), "cache should contain the drive: {json}");
+        assert!(!store.drive_cache_dirty.load(Ordering::Acquire));
+
+        // A further mutation re-dirties; the next read rebuilds again and
+        // reflects it (second route is 2.5h later — a separate drive).
+        store
+            .add_route("a/2025-01-01_12-30-00-front.mp4", "a", &pts, &[4, 4], &[0, 0], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .unwrap();
+        assert!(store.drive_cache_dirty.load(Ordering::Acquire));
+        let json2 = store.get_cached_drives_json().unwrap();
+        assert!(
+            json2.matches("\"id\"").count() > json.matches("\"id\"").count(),
+            "rebuilt cache should reflect the new route: {json2}"
+        );
+
+        // Stats + FSD caches were written by the same rebuild.
+        let stats = store.get_cached_drive_stats_json().unwrap();
+        assert!(stats.contains("drives_count"));
     }
 
     #[test]
