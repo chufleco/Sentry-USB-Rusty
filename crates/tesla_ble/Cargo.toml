@@ -55,6 +55,10 @@ tracing-subscriber = { workspace = true }
 btleplug = "0.12"
 futures = "0.3"
 prost = "0.14"
+# Used only through build.rs's `.extern_path(".google.protobuf", "::prost_types")`
+# and the generated code (the protos reference google.protobuf.Timestamp), so
+# it never appears in a `use` in hand-written source — cargo-machete flags it as
+# unused, but removing it breaks codegen. See the ignore list at the bottom.
 prost-types = "0.14"
 sha1 = "0.11"
 sha2 = "0.11"
@@ -82,3 +86,10 @@ protoc-bin-vendored = "3"
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+
+# prost-types is consumed only by build.rs codegen + the generated protobuf
+# (google.protobuf.Timestamp), never by a `use` in hand-written source, so
+# cargo-machete's static scan can't see it. Ignore it to keep the dead-deps
+# check signal clean.
+[package.metadata.cargo-machete]
+ignored = ["prost-types"]
