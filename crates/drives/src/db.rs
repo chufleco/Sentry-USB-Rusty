@@ -40,6 +40,12 @@ pub const LEGACY_JSON_PATH: &str = "/root/drive-data.json";
 
 /// Archive-side JSON copy for CIFS/NFS mounts.
 pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
+
+/// Meta-table key: `route_count` at the last successful archive sync.
+/// `sync_to_archive` skips the multi-minute JSON export when the live
+/// count still matches this baseline (the CIFS/NFS analogue of the
+/// shell script's drives_count short-circuit for rsync/rclone).
+const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -962,6 +968,14 @@ impl DriveStore {
     /// Regenerate the JSON mirror and copy it to `/mnt/archive/drive-data.json`
     /// with the size-guard applied. No-op if `/mnt/archive` is not a
     /// mounted filesystem.
+    ///
+    /// Called at the tail of every processing run (see `Processor::do_process`)
+    /// — the CIFS/NFS analogue of post-archive-process.sh's rsync/rclone
+    /// blocks. Skips the multi-minute export when no new routes landed
+    /// since the last successful sync (`ARCHIVE_SYNC_ROUTE_COUNT_KEY`
+    /// baseline). The baseline only advances on a successful copy, so
+    /// routes mapped while away from the archive (snapshotloop with
+    /// DRIVE_MAP_WHILE_AWAY) are shipped on the next mounted cycle.
     pub fn sync_to_archive(&self) -> Result<()> {
         if !Path::new("/mnt/archive").exists() {
             return Ok(());
@@ -972,36 +986,90 @@ impl DriveStore {
             }
         }
 
-        self.export_json_for_sync()?;
-        sync_to_path(
+        self.sync_to_archive_at(
             DEFAULT_JSON_MIRROR_PATH,
             ARCHIVE_DATA_PATH,
             syncguard::DEFAULT_CACHE_PATH,
         )
     }
 
+    /// Path-parameterized core of [`sync_to_archive`] (testable off-Pi).
+    fn sync_to_archive_at(&self, mirror: &str, archive: &str, cache: &str) -> Result<()> {
+        // Reflash recovery first: an empty store with an archive copy means
+        // the Pi (or its backing drive) was wiped — pull the backup down for
+        // the next-boot importer instead of pushing an empty export over it.
+        if self.restore_from_archive_at(archive, mirror)? {
+            return Ok(());
+        }
+
+        let routes_now = self.route_count();
+        if routes_now == 0 {
+            // Nothing worth pushing. An empty export must never reach the
+            // archive: on a freshly-wiped /mutable the size-guard cache is
+            // gone and the guard fails open, so this is the only thing
+            // standing between a fresh install and a clobbered backup.
+            return Ok(());
+        }
+
+        // No-op short-circuit, mirroring the shell script's rsync path:
+        // skip the export + copy when the route count hasn't moved since
+        // the last successful sync. Tag-only edits don't bump the count
+        // and stay stale for one cycle — same accepted trade-off as the
+        // shell's drives_count check.
+        let last_synced: Option<i64> = {
+            let conn = self.conn.lock().unwrap();
+            schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok())
+        };
+        if last_synced == Some(routes_now) && Path::new(archive).exists() {
+            info!(
+                "[drives] No new routes since last archive sync (route_count={}); skipping drive-data.json export",
+                routes_now
+            );
+            return Ok(());
+        }
+
+        self.export_json_to_file(mirror)?;
+        sync_to_path(mirror, archive, cache)?;
+
+        let conn = self.conn.lock().unwrap();
+        schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
+        Ok(())
+    }
+
     /// Copy `/mnt/archive/drive-data.json` to `/backingfiles/drive-data.json`
     /// so the next `Load()` picks it up via the one-shot importer.
     /// Useful after reflashing a Pi that still has an archive backup.
-    pub fn restore_from_archive(&self) -> Result<()> {
-        if !Path::new(ARCHIVE_DATA_PATH).exists() {
-            return Ok(());
+    /// Returns `true` if a restore happened.
+    pub fn restore_from_archive(&self) -> Result<bool> {
+        self.restore_from_archive_at(ARCHIVE_DATA_PATH, DEFAULT_JSON_MIRROR_PATH)
+    }
+
+    /// Path-parameterized core of [`restore_from_archive`] (testable off-Pi).
+    fn restore_from_archive_at(&self, archive: &str, mirror: &str) -> Result<bool> {
+        if !Path::new(archive).exists() {
+            return Ok(false);
         }
         // Don't restore if we already have local data — the importer
         // would skip it anyway, and we'd rather not churn disk.
-        if Path::new(DEFAULT_JSON_MIRROR_PATH).exists() {
-            return Ok(());
+        if Path::new(mirror).exists() {
+            return Ok(false);
         }
-        if let Some(dir) = Path::new(DEFAULT_JSON_MIRROR_PATH).parent() {
+        // Only restore into an empty store. A populated store with a
+        // missing mirror just hasn't exported yet; copying a stale archive
+        // snapshot over would feed old data to the next-boot importer.
+        if self.route_count() > 0 {
+            return Ok(false);
+        }
+        if let Some(dir) = Path::new(mirror).parent() {
             if !dir.as_os_str().is_empty() && dir != Path::new("/") {
                 std::fs::create_dir_all(dir)?;
             }
         }
         // Stream the copy (tmp + rename for atomicity) — the archive JSON
         // can be hundreds of MB; never buffer it in RAM.
-        let tmp = format!("{}.tmp", DEFAULT_JSON_MIRROR_PATH);
-        let copied = std::fs::copy(ARCHIVE_DATA_PATH, &tmp)?;
-        if let Err(e) = std::fs::rename(&tmp, DEFAULT_JSON_MIRROR_PATH) {
+        let tmp = format!("{}.tmp", mirror);
+        let copied = std::fs::copy(archive, &tmp)?;
+        if let Err(e) = std::fs::rename(&tmp, mirror) {
             let _ = std::fs::remove_file(&tmp);
             return Err(e.into());
         }
@@ -1009,7 +1077,7 @@ impl DriveStore {
             "[drives] Restored drive-data.json from archive ({} bytes); next Load() will import it",
             copied
         );
-        Ok(())
+        Ok(true)
     }
 
     /// Rebuild the drive caches while holding the connection lock only for
@@ -2550,5 +2618,117 @@ mod tests {
         assert_eq!(store.processed_count(), 1);
         assert!(!store.is_processed("old.mp4").unwrap());
         assert!(store.is_processed("new.mp4").unwrap());
+    }
+
+    // -- sync_to_archive_at / restore_from_archive_at ------------------------
+
+    /// Unique temp directory cleaned up on drop (same no-tempfile-dep
+    /// pattern as syncguard's tests).
+    struct TmpDir(std::path::PathBuf);
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let nanos = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!(
+                "sentryusb-syncarch-{}-{}-{}",
+                tag,
+                std::process::id(),
+                nanos
+            ));
+            std::fs::create_dir_all(&p).unwrap();
+            TmpDir(p)
+        }
+        fn path(&self, name: &str) -> String {
+            self.0.join(name).to_str().unwrap().to_string()
+        }
+    }
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn add_test_route(store: &DriveStore, name: &str) {
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route(name, "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn archive_sync_pushes_then_skips_until_new_routes() {
+        let dir = TmpDir::new("push-skip");
+        let (mirror, archive, cache) =
+            (dir.path("mirror.json"), dir.path("archive.json"), dir.path("cache"));
+        let store = DriveStore::open_memory().unwrap();
+        add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
+
+        // First sync: exports the mirror and copies it to the archive.
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        let pushed = std::fs::read_to_string(&archive).unwrap();
+        assert_eq!(pushed, std::fs::read_to_string(&mirror).unwrap());
+        assert!(pushed.contains("2025-01-15"));
+
+        // Same route count again: short-circuits, archive untouched.
+        std::fs::write(&archive, "sentinel").unwrap();
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel");
+
+        // New route moves the baseline: archive rewritten.
+        add_test_route(&store, "a/2025-01-15_11-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        let repushed = std::fs::read_to_string(&archive).unwrap();
+        assert_ne!(repushed, "sentinel");
+        assert!(repushed.contains("11-00-00"));
+    }
+
+    #[test]
+    fn archive_sync_noop_on_empty_store() {
+        let dir = TmpDir::new("empty");
+        let (mirror, archive, cache) =
+            (dir.path("mirror.json"), dir.path("archive.json"), dir.path("cache"));
+        let store = DriveStore::open_memory().unwrap();
+
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert!(!Path::new(&archive).exists(), "empty store must not create an archive copy");
+        assert!(!Path::new(&mirror).exists(), "empty store must not export a mirror");
+    }
+
+    #[test]
+    fn archive_sync_restores_into_empty_store_without_clobbering() {
+        let dir = TmpDir::new("restore");
+        let (mirror, archive, cache) =
+            (dir.path("mirror.json"), dir.path("archive.json"), dir.path("cache"));
+        let store = DriveStore::open_memory().unwrap();
+        std::fs::write(&archive, "precious-backup").unwrap();
+
+        // Empty store + archive copy + no mirror → reflash recovery:
+        // pull the backup down, never push over it.
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&mirror).unwrap(), "precious-backup");
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "precious-backup");
+
+        // Next cycle (mirror now present, store still empty): still no push.
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "precious-backup");
+    }
+
+    #[test]
+    fn archive_sync_prefers_push_when_store_has_data() {
+        let dir = TmpDir::new("stale-archive");
+        let (mirror, archive, cache) =
+            (dir.path("mirror.json"), dir.path("archive.json"), dir.path("cache"));
+        let store = DriveStore::open_memory().unwrap();
+        add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
+        std::fs::write(&archive, "stale-go-era-copy").unwrap();
+
+        // Populated store + missing mirror is the post-port CIFS state:
+        // restore must NOT trigger; the stale archive copy gets replaced.
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        let pushed = std::fs::read_to_string(&archive).unwrap();
+        assert_ne!(pushed, "stale-go-era-copy");
+        assert!(pushed.contains("2025-01-15"));
     }
 }

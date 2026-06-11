@@ -255,6 +255,25 @@ impl Processor {
         // Final checkpoint on the way out.
         let _ = self.store.save();
 
+        // Mirror drive data to a mounted CIFS/NFS archive — the counterpart
+        // of post-archive-process.sh's rsync/rclone sync blocks (the Go
+        // server did this in SyncToArchive; the call site was lost in the
+        // port). Must run BEFORE `running` flips false below: the
+        // post-archive script polls /api/drives/status until running=false
+        // and archiveloop unmounts /mnt/archive only after that script
+        // exits, so this ordering keeps the mount up for the whole copy.
+        // No-op when /mnt/archive isn't mounted (rsync/rclone setups,
+        // manual runs, away-mode snapshot processing) and when no new
+        // routes landed since the last successful sync.
+        {
+            let store = self.store.clone();
+            match tokio::task::spawn_blocking(move || store.sync_to_archive()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => warn!("drive-data archive sync failed: {}", e),
+                Err(e) => warn!("drive-data archive sync task failed: {}", e),
+            }
+        }
+
         {
             let mut status = self.status.lock().await;
             status.running = false;
