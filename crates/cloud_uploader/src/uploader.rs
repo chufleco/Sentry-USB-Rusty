@@ -98,7 +98,7 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
     let mut total_stored: u32 = 0;
     loop {
 
-        let pending = db_ext::select_pending(&state.store, BATCH_LIMIT)
+        let mut pending = db_ext::select_pending(&state.store, BATCH_LIMIT)
             .context("select pending routes")?;
         if pending.is_empty() {
             break;
@@ -109,7 +109,11 @@ async fn sweep_once(state: Arc<CloudStateInner>) -> Result<u32> {
         // can rewrap without a cloud round-trip.
         let mut wrapped_by_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         let mut estimated_body_bytes: usize = 64;
-        for p in &pending {
+        for p in &mut pending {
+            // Attach the clip's temperature samples so the cloud can
+            // chart the drive's temperature series — the telemetry DB
+            // never leaves the Pi otherwise.
+            p.route.temp_samples = db_ext::temp_samples_for_route(&state.store, &p.file);
             let encrypted = encrypt::encrypt_route(
                 &p.route,
                 &unlocked.pi_key,

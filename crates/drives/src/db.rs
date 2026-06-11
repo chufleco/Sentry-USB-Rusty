@@ -2134,6 +2134,7 @@ fn build_route_from_row(r: RouteRow) -> Result<Route> {
         tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
         odometer_mi_start, odometer_mi_end,
         location_name_start, location_name_end,
+        temp_samples: Vec::new(),
     })
 }
 

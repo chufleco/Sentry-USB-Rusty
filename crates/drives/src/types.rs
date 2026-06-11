@@ -155,9 +155,31 @@ pub struct Route {
     pub location_name_start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location_name_end: Option<String>,
+    /// Per-clip temperature samples (see [`TempSample`]). Populated at
+    /// cloud-upload time from `telemetry_samples`; empty on Pis without
+    /// BLE telemetry and absent from their wire JSON.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub temp_samples: Vec<TempSample>,
 }
 
 fn u32_is_zero(n: &u32) -> bool { *n == 0 }
+
+/// One telemetry temperature sample inside a clip's 60s window —
+/// uploaded with the route blob so the cloud can chart the drive's
+/// interior/exterior temperature series (the cloud has no access to
+/// the local telemetry DB). Keys are single letters to keep the wire
+/// compact at one to two samples per clip.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TempSample {
+    /// Unix seconds.
+    pub t: i64,
+    /// Interior temperature, °C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub i: Option<f32>,
+    /// Exterior temperature, °C.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub e: Option<f32>,
+}
 
 /// FSD event location (disengagement or accel push).
 #[derive(Debug, Clone, Serialize, Deserialize)]

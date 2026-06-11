@@ -655,6 +655,7 @@ fn split_clip_at_park_gaps(clip: &TimedRoute) -> Vec<ClipSegment> {
                     odometer_mi_end: clip.route.odometer_mi_end,
                     location_name_start: clip.route.location_name_start.clone(),
                     location_name_end: clip.route.location_name_end.clone(),
+                    temp_samples: clip.route.temp_samples.clone(),
                 },
                 timestamp: clip.timestamp + offset,
             },

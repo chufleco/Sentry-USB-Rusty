@@ -183,6 +183,12 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         "gr": gr,
     });
     let obj = out.as_object_mut().unwrap();
+    // Accel pushes — present only when computable (frame-aligned accel
+    // data), so a summary recomputed from reduced data can't overwrite
+    // a real count with zero.
+    if let Some(acp) = clip_accel_pushes(route) {
+        obj.insert("acp".into(), serde_json::json!(acp));
+    }
     if let Some(bs) = route.battery_pct_start.filter(|v| v.is_finite()) {
         obj.insert("bs".into(), serde_json::json!(round1(bs)));
     }
@@ -196,6 +202,51 @@ pub fn route_summary_json(route: &Route) -> serde_json::Value {
         obj.insert("le".into(), serde_json::json!(truncate_chars(le, 80)));
     }
     out
+}
+
+/// Accelerator pushes while FSD is engaged, per clip — same rules as
+/// the Pi-local aggregator: a press starts when the pedal exceeds 1%
+/// at least 3s after FSD engaged, and counts once the pedal returns to
+/// 0%. Frame-indexed over the autopilot-state bytes; requires the
+/// accel array to be frame-aligned. The web client implements the same
+/// rule for locally-derived summaries — keep them identical.
+fn clip_accel_pushes(route: &Route) -> Option<u64> {
+    let ap = &route.autopilot_states;
+    let n = ap.len();
+    if n == 0 || route.accel_positions.len() != n {
+        return None;
+    }
+    let dt_ms = 60_000.0 / n as f64;
+    let mut pushes: u64 = 0;
+    let mut in_press = false;
+    let mut engage_idx: isize = -1;
+    for i in 0..n {
+        let is_fsd = ap[i] == AUTOPILOT_FSD;
+        if is_fsd && (i == 0 || ap[i - 1] != AUTOPILOT_FSD) {
+            engage_idx = i as isize;
+            in_press = false;
+        }
+        if !is_fsd {
+            in_press = false;
+            continue;
+        }
+        let mut accel_pct = route.accel_positions[i] as f64;
+        if accel_pct <= 1.0 {
+            accel_pct *= 100.0;
+        }
+        let since_engage_ms = if engage_idx >= 0 {
+            (i as isize - engage_idx) as f64 * dt_ms
+        } else {
+            0.0
+        };
+        if !in_press && accel_pct > 1.0 && since_engage_ms >= 3000.0 {
+            in_press = true;
+        } else if in_press && accel_pct <= 0.0 {
+            pushes += 1;
+            in_press = false;
+        }
+    }
+    Some(pushes)
 }
 
 /// `String.prototype.slice(0, n)` equivalent — char-boundary-safe.
@@ -610,6 +661,31 @@ mod tests {
         assert_eq!(v["ls"], serde_json::json!("Home"));
         assert!(v.get("be").is_none());
         assert!(v.get("le").is_none());
+    }
+
+    /// Pins the acp rule (and its omission) against the web's
+    /// clipAccelPushes — both sides must produce identical summaries.
+    #[test]
+    fn route_summary_acp_counts_fsd_accel_pushes() {
+        let mut route = sample_route();
+        route.points = vec![[53.5, -113.5]; 20];
+        route.speeds = vec![10.0; 20];
+        // All 20 frames FSD; dt = 3000ms/frame, engage at frame 0.
+        route.autopilot_states = vec![1u8; 20];
+        // Two presses: frames 2-3 and 10-11, each returning to 0 after.
+        let mut accel = vec![0.0f32; 20];
+        accel[2] = 0.5;
+        accel[3] = 0.5;
+        accel[10] = 0.6;
+        accel[11] = 0.6;
+        route.accel_positions = accel;
+        let v = route_summary_json(&route);
+        assert_eq!(v["acp"], serde_json::json!(2));
+
+        // Misaligned accel array -> acp omitted, never zero.
+        route.accel_positions = vec![0.0; 5];
+        let v2 = route_summary_json(&route);
+        assert!(v2.get("acp").is_none());
     }
 
     /// Routes without BLE telemetry should still serialize compactly —

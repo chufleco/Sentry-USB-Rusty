@@ -714,6 +714,7 @@ impl<'a> serde::Serialize for RouteStream<'a> {
                 odometer_mi_end,
                 location_name_start,
                 location_name_end,
+        temp_samples: Vec::new(),
             };
             seq.serialize_element(&route)?;
             // `route` drops here — its ~10 KB of decoded BLOBs goes back

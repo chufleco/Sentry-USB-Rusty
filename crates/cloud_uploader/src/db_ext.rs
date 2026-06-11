@@ -1,7 +1,8 @@
 use anyhow::Result;
 use rusqlite::params;
 
-use sentryusb_drives::{DriveStore, types::Route};
+use sentryusb_drives::aggregate_telemetry::window_for_route_file;
+use sentryusb_drives::{DriveStore, types::Route, types::TempSample};
 
 pub struct PendingRoute {
     pub file: String,
@@ -64,6 +65,37 @@ pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute
         });
     }
     Ok(out)
+}
+
+/// Temperature samples inside a clip's 60s window, for the cloud blob.
+/// Empty when the filename has no parseable timestamp, BLE telemetry
+/// never ran, or no sample landed in the window.
+pub fn temp_samples_for_route(store: &DriveStore, file: &str) -> Vec<TempSample> {
+    let Some((start, end)) = window_for_route_file(file) else {
+        return Vec::new();
+    };
+    store
+        .with_locked_conn(|conn| -> Result<Vec<TempSample>> {
+            let mut stmt = conn.prepare_cached(
+                "SELECT ts, interior_temp_c, exterior_temp_c FROM telemetry_samples \
+                 WHERE ts BETWEEN ?1 AND ?2 \
+                   AND (interior_temp_c IS NOT NULL OR exterior_temp_c IS NOT NULL) \
+                 ORDER BY ts ASC",
+            )?;
+            let rows = stmt.query_map(params![start, end], |r| {
+                Ok(TempSample {
+                    t: r.get(0)?,
+                    i: r.get(1)?,
+                    e: r.get(2)?,
+                })
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+        .unwrap_or_default()
 }
 
 pub fn cache_route_id(store: &DriveStore, file: &str, route_id: &str) -> Result<()> {
