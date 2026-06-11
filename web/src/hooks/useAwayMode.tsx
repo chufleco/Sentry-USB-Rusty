@@ -3,6 +3,9 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 interface AwayModeStatus {
     state: "idle" | "active"
     has_rtc?: boolean
+    /** False when no AP profile exists (AP unchecked/removed in setup).
+     *  Undefined until the first status poll resolves. */
+    ap_configured?: boolean
     ap_ssid?: string
     ap_ip?: string
     expires_at?: string

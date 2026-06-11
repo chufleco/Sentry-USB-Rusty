@@ -13,8 +13,16 @@ const AWAY_PRESETS = [
   { value: 480, label: "8h" },
 ]
 
-export function AwayModeControl() {
+interface Props {
+  /** Re-launches the Setup Wizard so the user can configure the AP. */
+  onOpenWizard?: () => void
+}
+
+export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const { status, enable, disable } = useAwayMode()
+  // Undefined means the first status poll hasn't resolved (or an older
+  // backend) — assume configured so the card doesn't flash disabled.
+  const apConfigured = status.ap_configured !== false
   const [selectedDuration, setSelectedDuration] = useState(240)
   const [customHours, setCustomHours] = useState("")
   const [customMinutes, setCustomMinutes] = useState("")
@@ -74,6 +82,17 @@ export function AwayModeControl() {
             <LiveDot /> Active
           </Pill>
         ) : null
+      }
+      disabled={
+        !apConfigured
+          ? {
+              reason:
+                "Enable the WiFi Access Point in the Setup Wizard to use Away Mode.",
+              cta: onOpenWizard
+                ? { label: "Open Setup Wizard", onClick: onOpenWizard }
+                : undefined,
+            }
+          : undefined
       }
     >
       {status.has_rtc === false && (

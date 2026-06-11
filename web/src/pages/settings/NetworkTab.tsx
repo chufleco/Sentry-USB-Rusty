@@ -10,9 +10,12 @@ import type { PiStatus } from "@/lib/api"
 
 interface Props {
   status: PiStatus | null
+  /** Forwarded to AwayModeControl so its disabled-state CTA can re-launch
+   *  the Setup Wizard. */
+  onOpenWizard?: () => void
 }
 
-export function NetworkTab({ status }: Props) {
+export function NetworkTab({ status, onOpenWizard }: Props) {
   const wifiConnected = !!status?.wifi_ssid
   const ethConnected =
     !!status?.ether_speed && status.ether_speed !== "Unknown!"
@@ -77,7 +80,7 @@ export function NetworkTab({ status }: Props) {
       <BlePairButton />
 
       {/* Remote access */}
-      <AwayModeControl />
+      <AwayModeControl onOpenWizard={onOpenWizard} />
       <CloudPairingSection />
     </div>
   )

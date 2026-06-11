@@ -60,7 +60,11 @@ function nm_add_ap () {
   # set up access point on the virtual interface using networkmanager
   nmcli con delete SENTRYUSB_AP &> /dev/null || true
   nmcli con delete TESLAUSB_AP &> /dev/null || true
-  nmcli con add type wifi ifname ap0 mode ap con-name SENTRYUSB_AP ssid "$AP_SSID" || return 1
+  # autoconnect is set at add time: a profile created with the default
+  # (autoconnect=yes) can be auto-activated by NM before a later "con modify"
+  # lands, leaving the AP broadcasting right out of setup. Away Mode controls
+  # when it comes up.
+  nmcli con add type wifi ifname ap0 mode ap con-name SENTRYUSB_AP autoconnect no ssid "$AP_SSID" || return 1
   # don't set band and channel, because that is controlled by the $WLAN interface
   #nmcli con modify SENTRYUSB_AP 802-11-wireless.band bg
   #nmcli con modify SENTRYUSB_AP 802-11-wireless.channel 6
@@ -70,8 +74,6 @@ function nm_add_ap () {
   nmcli con modify SENTRYUSB_AP ipv4.addr "$IP/24" || return 1
   nmcli con modify SENTRYUSB_AP ipv4.method shared || return 1
   nmcli con modify SENTRYUSB_AP ipv6.method disabled || return 1
-  # Don't auto-start the AP — Away Mode controls when it comes up
-  nmcli con modify SENTRYUSB_AP connection.autoconnect no || return 1
   # Remove stale if-up.d script from previous installs — it doesn't fire on
   # NetworkManager/netplan systems (e.g. Pi 5 with Debian Trixie).
   rm -f /etc/network/if-up.d/sentryusb-ap
@@ -203,6 +205,17 @@ then
       log_progress "STOP: Failed to configure AP"
       exit 1
     fi
+  fi
+  # Setup only installs the profile — Away Mode owns bringing the AP up.
+  # Drop the scaffolding ap0 (it pins the shared radio to the AP channel and
+  # its existence triggers archiveloop's wifi_cycle), and make sure the
+  # connection is down in case NM activated it during configuration. Skipped
+  # while an Away Mode session is running so re-running setup doesn't kill
+  # the AP the user is connected through.
+  if [ ! -f /mutable/sentryusb_away_mode.json ]
+  then
+    nmcli con down SENTRYUSB_AP 2>/dev/null || true
+    iw dev ap0 del 2>/dev/null || true
   fi
   log_progress "AP configured"
   exit 0

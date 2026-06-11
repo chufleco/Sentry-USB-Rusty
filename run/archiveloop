@@ -322,13 +322,18 @@ function wifi_cycle () {
     sleep 1
   done
 
-  # Recreate ap0
-  if ! iw dev ap0 info &>/dev/null; then
-    iw dev wlan0 interface add ap0 type __ap 2>/dev/null || true
+  # Recreate ap0 and bring the AP back ONLY while an Away Mode session is
+  # active. In normal mode the whole point of the cycle is to remove ap0 so
+  # wlan0 can scan — unconditionally re-upping the AP here used to resurrect
+  # it after the user had disabled Away Mode.
+  if away_mode_active; then
+    if ! iw dev ap0 info &>/dev/null; then
+      iw dev wlan0 interface add ap0 type __ap 2>/dev/null || true
+    fi
+    iw wlan0 set power_save off 2>/dev/null || true
+    iw ap0 set power_save off 2>/dev/null || true
+    nmcli con up SENTRYUSB_AP 2>/dev/null || true
   fi
-  iw wlan0 set power_save off 2>/dev/null || true
-  iw ap0 set power_save off 2>/dev/null || true
-  nmcli con up SENTRYUSB_AP 2>/dev/null || true
 }
 
 function wait_for_archive_to_be_reachable () {

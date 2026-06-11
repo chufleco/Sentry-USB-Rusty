@@ -54,6 +54,7 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
 
         match nm_add_ap(&ssid, &pass, &ip, emitter).await {
             Ok(()) => {
+                teardown_ap_scaffolding().await;
                 emitter.progress("AP configured via NetworkManager.");
                 return Ok(());
             }
@@ -66,6 +67,7 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
                 // require the plugin to be healthy.
                 nm_write_ap_file(&ssid, &pass, &ip, emitter).await
                     .context("failed to configure AP (both nmcli and keyfile paths failed)")?;
+                teardown_ap_scaffolding().await;
                 emitter.progress("AP configured via keyfile fallback.");
                 return Ok(());
             }
@@ -84,6 +86,64 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
         return Ok(());
     }
     configure_hostapd_path(&ssid, &pass, &ip, emitter).await
+}
+
+/// Tear down the AP scaffolding the NM configure paths leave behind.
+///
+/// Setup only installs the connection profile — Away Mode owns bringing the
+/// AP up. The ap0 interface created so `nmcli con add` succeeds must not
+/// outlive setup: it pins the shared radio to the AP channel (hurting wlan0
+/// scans) and its mere existence used to trigger archiveloop's `wifi_cycle`
+/// into bringing the AP up with Away Mode off. The `con down` also covers NM
+/// having auto-activated the profile during configuration. Skipped while an
+/// Away Mode session is running so re-running setup doesn't kill the AP the
+/// user is connected through.
+async fn teardown_ap_scaffolding() {
+    if Path::new("/mutable/sentryusb_away_mode.json").exists() {
+        return;
+    }
+    let _ = sentryusb_shell::run("nmcli", &["con", "down", "SENTRYUSB_AP"]).await;
+    let _ = sentryusb_shell::run("iw", &["dev", "ap0", "del"]).await;
+}
+
+/// Remove the WiFi AP configuration entirely.
+///
+/// Called when setup runs without AP settings, so unchecking "Enable WiFi
+/// Access Point" in the wizard actually removes the feature instead of
+/// silently leaving the old profile (and a possibly-broadcasting AP) behind.
+pub async fn deconfigure_ap(emitter: &SetupEmitter) -> Result<()> {
+    let keyfile = "/etc/NetworkManager/system-connections/SENTRYUSB_AP.nmconnection";
+    let dispatcher = "/etc/NetworkManager/dispatcher.d/10-sentryusb-ap";
+
+    let profile_exists =
+        sentryusb_shell::run("nmcli", &["-t", "con", "show", "SENTRYUSB_AP"]).await.is_ok();
+    let ap0_exists = sentryusb_shell::run("iw", &["dev", "ap0", "info"]).await.is_ok();
+    if !profile_exists && !ap0_exists && !Path::new(keyfile).exists() && !Path::new(dispatcher).exists() {
+        return Ok(());
+    }
+
+    emitter.begin_phase("wifi_ap", "WiFi access point");
+    emitter.progress("Removing WiFi access point configuration");
+
+    // End any Away Mode session: with the profile gone the flag file would
+    // only make the dispatcher and archiveloop chase an AP that no longer
+    // exists.
+    let _ = std::fs::remove_file("/mutable/sentryusb_away_mode.json");
+    let _ = std::fs::remove_file("/mutable/sentryusb_away_mode.json.tmp");
+
+    let _ = sentryusb_shell::run("nmcli", &["con", "down", "SENTRYUSB_AP"]).await;
+    let _ = sentryusb_shell::run("nmcli", &["con", "delete", "SENTRYUSB_AP"]).await;
+    // `con delete` can fail under the same read-only-root keyfile quirk the
+    // add path works around — remove the file directly and reload.
+    let _ = std::fs::remove_file(keyfile);
+    let _ = sentryusb_shell::run("nmcli", &["con", "reload"]).await;
+
+    let _ = sentryusb_shell::run("iw", &["dev", "ap0", "del"]).await;
+    let _ = std::fs::remove_file(dispatcher);
+    let _ = std::fs::remove_file("/etc/network/if-up.d/sentryusb-ap");
+
+    emitter.progress("WiFi access point removed.");
+    Ok(())
 }
 
 /// Primary NM path: `nmcli con add` + modifications.
@@ -112,9 +172,12 @@ async fn nm_add_ap(
     let _ = sentryusb_shell::run("nmcli", &["con", "delete", "SENTRYUSB_AP"]).await;
     let _ = sentryusb_shell::run("nmcli", &["con", "delete", "TESLAUSB_AP"]).await;
 
+    // autoconnect is set at add time: a profile created with the default
+    // (autoconnect=yes) can be auto-activated by NM in the window before a
+    // later `con modify`, leaving the AP broadcasting right out of setup.
     sentryusb_shell::run(
         "nmcli", &["con", "add", "type", "wifi", "ifname", "ap0", "mode", "ap",
-                   "con-name", "SENTRYUSB_AP", "ssid", ssid],
+                   "con-name", "SENTRYUSB_AP", "autoconnect", "no", "ssid", ssid],
     ).await.context("nmcli con add failed")?;
 
     sentryusb_shell::run(
@@ -134,10 +197,6 @@ async fn nm_add_ap(
     ).await?;
     sentryusb_shell::run(
         "nmcli", &["con", "modify", "SENTRYUSB_AP", "ipv6.method", "disabled"],
-    ).await?;
-    // Don't auto-start — Away Mode brings the AP up only when enabled.
-    sentryusb_shell::run(
-        "nmcli", &["con", "modify", "SENTRYUSB_AP", "connection.autoconnect", "no"],
     ).await?;
 
     // Clean up stale if-up.d script from previous installs.

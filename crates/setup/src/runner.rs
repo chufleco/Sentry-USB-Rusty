@@ -227,11 +227,17 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     // Samba.
     crate::system::configure_samba(&env, &emitter).await?;
 
-    // WiFi AP — only when both SSID and a valid password are set.
+    // WiFi AP — only when both SSID and a valid password are set. When the
+    // wizard box is unchecked (no SSID), remove any previously configured AP
+    // so deactivation actually takes effect.
     let has_ap_ssid = env.config.get("AP_SSID").is_some_and(|v| !v.is_empty());
     let has_ap_pass = env.config.get("AP_PASS").is_some_and(|v| v.len() >= 8);
     if has_ap_ssid && has_ap_pass {
         crate::network::configure_ap(&env, &emitter).await?;
+    } else if !has_ap_ssid {
+        // No SSID at all = explicit uncheck. (SSID with a bad password is
+        // left alone, as before — configure_ap would reject it anyway.)
+        crate::network::deconfigure_ap(&emitter).await?;
     }
 
     // SSH hardening.

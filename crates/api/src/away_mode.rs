@@ -5,8 +5,8 @@
 //!  - Persistent 30s countdown so Pis without an RTC recover accurately across
 //!    reboots via `remaining_sec` in the flag file.
 //!  - RestoreFromFile: on startup, resume the active session if time remains.
-//!  - Response shape: {state, has_rtc, ap_ssid, ap_ip, expires_at,
-//!    enabled_at, remaining_sec}.
+//!  - Response shape: {state, has_rtc, ap_configured, ap_ssid, ap_ip,
+//!    expires_at, enabled_at, remaining_sec}.
 //!  - AP connection profile name is `SENTRYUSB_AP` (Go's convention).
 
 use std::sync::{Mutex, OnceLock};
@@ -127,8 +127,50 @@ fn away_mode_log(msg: &str) {
     }
 }
 
+/// Find the WiFi client device (never ap0). Prefers the device backing an
+/// active connection, falls back to any managed wifi device — mirrors
+/// `find_wifi_device` in the setup crate.
+async fn find_wlan_device() -> Option<String> {
+    for cmd in [
+        "nmcli -t -f TYPE,DEVICE c show --active | grep 802-11-wireless | grep -v ':ap0$' | cut -c17- | head -n1",
+        "nmcli -t -f DEVICE,TYPE device status | grep ':wifi$' | grep -v '^ap0:' | cut -d: -f1 | head -n1",
+    ] {
+        if let Ok(out) = sentryusb_shell::run("bash", &["-c", cmd]).await {
+            let dev = out.trim().to_string();
+            if !dev.is_empty() {
+                return Some(dev);
+            }
+        }
+    }
+    None
+}
+
+/// Create the ap0 virtual interface if it doesn't exist. The AP profile is
+/// bound to ap0, but the interface is deleted whenever the AP is off (it
+/// pins the shared radio to the AP channel), so every start recreates it.
+async fn ensure_ap0() -> Result<(), String> {
+    if sentryusb_shell::run("iw", &["dev", "ap0", "info"]).await.is_ok() {
+        return Ok(());
+    }
+    let wlan = find_wlan_device()
+        .await
+        .ok_or_else(|| "no wifi client device found".to_string())?;
+    sentryusb_shell::run("iw", &["dev", &wlan, "interface", "add", "ap0", "type", "__ap"])
+        .await
+        .map_err(|e| format!("creating ap0 on {}: {}", wlan, e))?;
+    // Both interfaces share the radio — don't let one sleep because the
+    // other is idle.
+    let _ = sentryusb_shell::run("iw", &[&wlan, "set", "power_save", "off"]).await;
+    let _ = sentryusb_shell::run("iw", &["ap0", "set", "power_save", "off"]).await;
+    Ok(())
+}
+
 fn start_ap_bg() {
     tokio::spawn(async {
+        if let Err(e) = ensure_ap0().await {
+            away_mode_log(&format!("Failed to create ap0: {}", e));
+            warn!("[away-mode] Failed to create ap0: {}", e);
+        }
         match sentryusb_shell::run("nmcli", &["con", "up", AP_PROFILE]).await {
             Ok(_) => {
                 away_mode_log("AP started");
@@ -144,10 +186,33 @@ fn start_ap_bg() {
 
 fn stop_ap_bg() {
     tokio::spawn(async {
-        let _ = sentryusb_shell::run("nmcli", &["con", "down", AP_PROFILE]).await;
-        away_mode_log("AP stopped");
-        info!("[away-mode] AP stopped");
+        match sentryusb_shell::run("nmcli", &["con", "down", AP_PROFILE]).await {
+            Ok(_) => {
+                away_mode_log("AP stopped");
+                info!("[away-mode] AP stopped");
+            }
+            Err(e) => {
+                // Not fatal: `con down` also fails when the AP was already
+                // down (e.g. expiry cleanup after a reboot).
+                away_mode_log(&format!("nmcli con down failed (AP may already be down): {}", e));
+                warn!("[away-mode] nmcli con down failed: {}", e);
+            }
+        }
+        // Always remove ap0: it locks the shared radio to the AP channel
+        // (blocking wlan0 scans), and a leftover ap0 is what used to make
+        // archiveloop's wifi_cycle resurrect the AP after disable.
+        let _ = sentryusb_shell::run("iw", &["dev", "ap0", "del"]).await;
     });
+}
+
+/// Whether the SENTRYUSB_AP connection profile exists. Setup creates it
+/// (AP enabled in the wizard) and deletes it (AP unchecked) — the UI uses
+/// this to grey out the Away Mode card when the feature is unconfigured.
+async fn ap_profile_exists() -> bool {
+    sentryusb_shell::run("nmcli", &["-t", "con", "show", AP_PROFILE])
+        .await
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(false)
 }
 
 async fn get_ap_info() -> (String, String) {
@@ -296,11 +361,7 @@ pub async fn enable(
         );
     }
     // Verify the AP profile exists before we promise anything.
-    if sentryusb_shell::run("nmcli", &["-t", "con", "show", AP_PROFILE])
-        .await
-        .map(|o| o.trim().is_empty())
-        .unwrap_or(true)
-    {
+    if !ap_profile_exists().await {
         return crate::json_error(
             StatusCode::PRECONDITION_FAILED,
             "AP not configured. Run setup with AP settings first.",
@@ -381,6 +442,9 @@ pub async fn status(State(_s): State<AppState>) -> (StatusCode, Json<serde_json:
         status_snapshot_sync(&inner)
     };
     let (ssid, ip) = get_ap_info().await;
+    // A wifi AP profile always carries an SSID, so a non-empty SSID doubles
+    // as the "profile exists" signal — no second nmcli round-trip needed.
+    snap["ap_configured"] = serde_json::Value::Bool(!ssid.is_empty());
     if !ssid.is_empty() {
         snap["ap_ssid"] = serde_json::Value::String(ssid);
         snap["ap_ip"] = serde_json::Value::String(ip);
