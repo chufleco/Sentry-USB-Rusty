@@ -1,5 +1,6 @@
 import { Wifi, EthernetPort } from "lucide-react"
 import { PrefCard } from "@/components/settings/PrefCard"
+import { SectionErrorBoundary } from "@/components/ErrorBoundary"
 import { Row } from "@/components/ui/StatusTile"
 import { Pill } from "@/components/ui/Pill"
 import CloudPairingSection from "@/components/CloudPairingSection"
@@ -75,13 +76,24 @@ export function NetworkTab({ status, onOpenWizard }: Props) {
       </PrefCard>
 
       {/* Tesla BLE — enable the telemetry / keep-awake features, then pair.
-          Kept adjacent so "enable" sits right next to "pair". */}
-      <BleEnableToggle />
-      <BlePairButton />
+          Kept adjacent so "enable" sits right next to "pair".
+          The self-fetching sections each get an error boundary (this tab
+          doesn't use PrefGrid, which wraps its children automatically): a
+          render crash in one card must not blank the whole app. */}
+      <SectionErrorBoundary>
+        <BleEnableToggle />
+      </SectionErrorBoundary>
+      <SectionErrorBoundary>
+        <BlePairButton />
+      </SectionErrorBoundary>
 
       {/* Remote access */}
-      <AwayModeControl onOpenWizard={onOpenWizard} />
-      <CloudPairingSection />
+      <SectionErrorBoundary>
+        <AwayModeControl onOpenWizard={onOpenWizard} />
+      </SectionErrorBoundary>
+      <SectionErrorBoundary>
+        <CloudPairingSection />
+      </SectionErrorBoundary>
     </div>
   )
 }

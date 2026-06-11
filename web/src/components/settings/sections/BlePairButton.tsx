@@ -355,7 +355,9 @@ export function BlePairButton() {
       const res = await fetch("/api/system/ble-adapters")
       if (res.ok) {
         const d = (await res.json()) as BleAdaptersResp
-        setAdapters(d)
+        // Render code maps over `available` unconditionally — a 200 with an
+        // unexpected JSON shape must not put crashing data into state.
+        if (Array.isArray(d?.available)) setAdapters(d)
       }
     } catch {
       /* leave previous value */

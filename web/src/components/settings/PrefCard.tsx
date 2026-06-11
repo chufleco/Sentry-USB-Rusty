@@ -1,6 +1,7 @@
-import { useLayoutEffect, useRef, type ReactNode } from "react"
+import { Children, useLayoutEffect, useRef, type ReactNode } from "react"
 import { cn } from "@/lib/utils"
 import type { Halo } from "@/components/ui/StatusTile"
+import { SectionErrorBoundary } from "@/components/ErrorBoundary"
 
 /**
  * Configures the "feature unavailable" overlay drawn over the card body when
@@ -244,7 +245,13 @@ export function PrefGrid({ children, min = 340 }: { children: ReactNode; min?: n
 
   return (
     <div ref={ref} className="relative">
-      {children}
+      {/* Each section gets its own boundary so one crashing card degrades to
+          a fallback card instead of unmounting the whole app. Boundaries add
+          no DOM node, so the flattened-children measurement is unaffected;
+          a fallback renders as a single measurable card. */}
+      {Children.map(children, (child) => (
+        <SectionErrorBoundary>{child}</SectionErrorBoundary>
+      ))}
     </div>
   )
 }
