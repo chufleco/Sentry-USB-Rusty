@@ -78,7 +78,10 @@ use rusqlite::{params, Connection, OptionalExtension};
 /// Also: `software_version` columns on both tables are kept for
 /// forward-compat but no longer written â€” Tesla doesn't expose
 /// `car_version` over BLE state queries.
-pub const CURRENT_SCHEMA_VERSION: i32 = 14;
+/// v14 -> v15: add clip-boundary state columns to `routes`
+/// (V15_ROUTE_BOUNDARY_COLUMNS) so FSD disengagements and accel pushes
+/// resolve across clip seams in the drive grouper.
+pub const CURRENT_SCHEMA_VERSION: i32 = 15;
 
 /// v1 DDL. Each statement is idempotent (`IF NOT EXISTS`) so `migrate()`
 /// is safe on every startup. Column shapes and names match Go exactly â€”
@@ -325,6 +328,17 @@ pub const V10_ROUTE_COLUMNS: &[(&str, &str)] = &[
     ("location_name_end", "TEXT"),
 ];
 
+/// v15 clip-boundary state on `routes` (see `RouteAggregates`): lets the
+/// drive grouper resolve FSD disengagements and accel pushes across the
+/// 60s clip seams instead of each clip guessing in isolation — mirrors
+/// the cloud summary v4 `dPnd`/`pk1` boundary fields.
+pub const V15_ROUTE_BOUNDARY_COLUMNS: &[(&str, &str)] = &[
+    ("fsd_pend_ms_end", "REAL"),
+    ("park_ms_start", "REAL"),
+    ("fsd_at_end", "INTEGER"),
+    ("fsd_accel_pushes_early", "INTEGER"),
+];
+
 /// v9 rollups on `routes`. Odometer start/end let the UI show a
 /// per-trip mileage delta that's more accurate than GPS distance
 /// (GPS over-estimates curves, drops in tunnels, can drift).
@@ -468,6 +482,7 @@ pub fn migrate(conn: &Connection) -> Result<()> {
         .chain(V7_ROUTE_TPMS_COLUMNS.iter())
         .chain(V9_ROUTE_COLUMNS.iter())
         .chain(V10_ROUTE_COLUMNS.iter())
+        .chain(V15_ROUTE_BOUNDARY_COLUMNS.iter())
     {
         if existing.contains(*name) {
             continue;
@@ -663,7 +678,7 @@ mod tests {
         migrate(&conn).unwrap();
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14"),
+            Some("15"),
         );
         assert!(meta_get(&conn, "created_at").unwrap().is_some());
     }
@@ -701,7 +716,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 
@@ -733,7 +748,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 
@@ -767,7 +782,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 
@@ -874,7 +889,7 @@ mod tests {
         assert!(surviving_processed.starts_with("RecentClips/"));
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 
@@ -925,7 +940,7 @@ mod tests {
         assert_eq!(count_routes(&conn), 1, "fresh-DB seed must not run v5 cleanup");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 
@@ -978,7 +993,44 @@ mod tests {
         assert_eq!(table_exists, 1, "v6 must create telemetry_samples");
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn migrate_from_v14_adds_v15_boundary_columns() {
+        // Stand up a v14 DB (everything but the v15 boundary columns) and
+        // confirm migrate adds them.
+        let conn = open();
+        for stmt in V1_SCHEMA {
+            conn.execute(stmt, []).unwrap();
+        }
+        for stmt in V6_NEW_TABLES {
+            conn.execute(stmt, []).unwrap();
+        }
+        for (name, typ) in V2_ROUTE_AGGREGATE_COLUMNS
+            .iter()
+            .chain(V3_ROUTE_CLOUD_COLUMNS.iter())
+            .chain(V4_ROUTE_TESSIE_COLUMNS.iter())
+            .chain(V6_ROUTE_TELEMETRY_COLUMNS.iter())
+            .chain(V7_ROUTE_TPMS_COLUMNS.iter())
+            .chain(V9_ROUTE_COLUMNS.iter())
+            .chain(V10_ROUTE_COLUMNS.iter())
+        {
+            conn.execute(&format!("ALTER TABLE routes ADD COLUMN {} {}", name, typ), [])
+                .unwrap();
+        }
+        meta_set(&conn, "schema_version", "14").unwrap();
+
+        migrate(&conn).unwrap();
+
+        let cols = list_route_columns(&conn).unwrap();
+        for (name, _) in V15_ROUTE_BOUNDARY_COLUMNS {
+            assert!(cols.contains(*name), "routes.{} missing after v15", name);
+        }
+        assert_eq!(
+            meta_get(&conn, "schema_version").unwrap().as_deref(),
+            Some("15")
         );
     }
 
@@ -1021,7 +1073,7 @@ mod tests {
         }
         assert_eq!(
             meta_get(&conn, "schema_version").unwrap().as_deref(),
-            Some("14")
+            Some("15")
         );
     }
 

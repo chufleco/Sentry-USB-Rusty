@@ -273,8 +273,12 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 start_lat            = ?15,
                 start_lon            = ?16,
                 end_lat              = ?17,
-                end_lon              = ?18
-             WHERE file = ?19",
+                end_lon              = ?18,
+                fsd_pend_ms_end      = ?19,
+                park_ms_start        = ?20,
+                fsd_at_end           = ?21,
+                fsd_accel_pushes_early = ?22
+             WHERE file = ?23",
         )?;
         for (file, a) in &decoded {
             stmt.execute(params![
@@ -296,6 +300,10 @@ fn backfill_one_batch(conn: &mut Connection) -> Result<i64> {
                 a.start_lng,
                 a.end_lat,
                 a.end_lng,
+                a.fsd_pend_ms_end,
+                a.park_ms_start,
+                a.fsd_at_end as i64,
+                a.fsd_accel_pushes_early,
                 file,
             ])
             .with_context(|| format!("update {}", file))?;

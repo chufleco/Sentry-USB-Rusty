@@ -1251,13 +1251,14 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
         .map(|d| d.format("%Y-%m-%d").to_string())
         .unwrap_or_default();
 
-    // Filter drives in period. Tessie drives are excluded from FSD analytics
-    // entirely — their autopilot data is inferred, not from dashcam SEI
-    // telemetry, so mixing them would dilute the score.
+    // Filter drives in period. Imported drives (tessie, teslascope, …)
+    // are excluded from FSD analytics entirely — their autopilot data is
+    // inferred or absent, not dashcam SEI telemetry, so mixing them
+    // would dilute the score.
     let period_drives: Vec<&DriveSummary> = summaries
         .iter()
         .filter(|d| {
-            if is_tessie(&d.source) {
+            if is_imported(&d.source) {
                 return false;
             }
             if let Some(ps) = period_start {
@@ -1551,10 +1552,18 @@ fn parse_iso_seconds(s: &str) -> Option<i64> {
 // ---------------------------------------------------------------------------
 
 /// Returns true when a source tag indicates a Tessie-imported drive.
-/// FSD analytics exclude Tessie because its per-point autopilot inference
-/// is fuzzier than dashcam SEI telemetry — mixing them dilutes the score.
+/// Used by the Tessie-overlap hiding pass, which is specifically about
+/// Tessie duplicating SEI windows.
 fn is_tessie(source: &Option<String>) -> bool {
     source.as_deref() == Some("tessie")
+}
+
+/// Returns true for ANY imported source (tessie, teslascope, future
+/// importers): a non-NULL source other than "sei". FSD analytics are
+/// dashcam-only — imported autopilot data is inferred or absent, so
+/// mixing it dilutes the score. Matches Sentry-Drive's isImportedSource.
+fn is_imported(source: &Option<String>) -> bool {
+    matches!(source.as_deref(), Some(s) if s != "sei")
 }
 
 
@@ -2054,6 +2063,19 @@ fn build_summary_from_aggregates(
     let mut seen_files: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut unique_clip_count: usize = 0;
 
+    // v15 clip-seam state, mirroring the cloud summary v4 aggregator
+    // (SentryCloud grouper.js): a pending disengagement open at one
+    // clip's end is decided by the NEXT clip's first 2s — Park inside
+    // the remaining grace window means FSD parked the car (no count),
+    // anything else is a driver disengagement. Carried only across
+    // whole-clip boundaries: a mid-clip park split means the pending
+    // already resolved as Park.
+    let mut pend_prev_ms: Option<f64> = None;
+    // Whether the previous clip ended FSD-engaged across a whole-clip
+    // boundary — gates `fsd_accel_pushes_early` (pushes inside a
+    // continuation clip's start-anchored grace window are real).
+    let mut prev_fsd_at_end = false;
+
     for clip in clips {
         let a = &clip.summary.aggregates;
         let f = clip.fraction;
@@ -2079,7 +2101,22 @@ fn build_summary_from_aggregates(
             }
             fsd_disengagements += a.fsd_disengagements;
             fsd_accel_pushes += a.fsd_accel_pushes;
+            if clip.start_frame == 0 {
+                if let Some(p) = pend_prev_ms {
+                    let rem = 2000.0 - p;
+                    let parked = a.park_ms_start.is_some_and(|pk| pk <= rem);
+                    if !parked {
+                        fsd_disengagements += 1;
+                    }
+                }
+                if prev_fsd_at_end {
+                    fsd_accel_pushes += a.fsd_accel_pushes_early;
+                }
+            }
         }
+        let whole_clip_end = clip.end_frame == clip.total_frames;
+        pend_prev_ms = if whole_clip_end { a.fsd_pend_ms_end } else { None };
+        prev_fsd_at_end = whole_clip_end && a.fsd_at_end;
 
         if start_point.is_none() {
             if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
@@ -2089,6 +2126,13 @@ fn build_summary_from_aggregates(
         if let (Some(lat), Some(lng)) = (a.end_lat, a.end_lng) {
             end_point = Some([lat, lng]);
         }
+    }
+
+    // Pending still open after the drive's last clip: recording stopped
+    // before any Park arrived, so it was a real driver disengagement —
+    // matches Sentry-Drive's end-of-drive flush.
+    if pend_prev_ms.is_some() {
+        fsd_disengagements += 1;
     }
 
     let avg_speed_mps = if speed_count > 0.0 {

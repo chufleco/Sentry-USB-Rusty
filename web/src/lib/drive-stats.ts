@@ -55,18 +55,22 @@ export function computeFilteredStats(
     totalDistanceMi += d.distanceMi
     totalDistanceKm += d.distanceKm
     totalDurationMs += d.durationMs
-    if (d.source === "tessie") {
+    // Anything with a non-SEI source (tessie, teslascope, future
+    // importers) is imported data — counted in the top-line totals,
+    // excluded from FSD analytics. Matches the backend's SEI-only rule
+    // and Sentry-Drive's isImportedSource. The strip's "TESSIE" tile
+    // counts every imported drive.
+    if (d.source && d.source !== "sei") {
       tessieCount += 1
       continue
     }
-    // Every FSD/AP-attributed metric is SEI-only. Tessie's autopilot
+    // Every FSD/AP-attributed metric is SEI-only. Imported autopilot
     // distance/time fields carry *inferred* numbers (not from dashcam
     // SEI telemetry), so summing them into the numerator while the
     // denominator stays SEI-only produces >100% nonsense — and even
-    // when both sides included Tessie, the formula would still report
+    // when both sides included them, the formula would still report
     // inferred-vs-measured as a single blended score, which the
-    // backend explicitly avoids. Backend equivalent: SEI-only sums
-    // in crates/drives/src/db.rs:1065-1080.
+    // backend explicitly avoids.
     seiTotalDistanceKm += d.distanceKm
     fsdEngagedMs += d.fsdEngagedMs
     fsdDistanceMi += d.fsdDistanceMi

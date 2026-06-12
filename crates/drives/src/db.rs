@@ -86,14 +86,22 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // v5 (2026-06-09): distance moved from spherical haversine to WGS-84
 // geodesic (Andoyer–Lambert) in calc.rs, so every per-drive distance shifts
 // 0.1–0.3%. Stale v4 caches hold haversine-era mileage and must rebuild.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "5";
+//
+// v6 (2026-06-12): clip-boundary resolution for FSD disengagements and
+// accel pushes in the grouper (see V15_ROUTE_BOUNDARY_COLUMNS), plus
+// FSD analytics narrowed from "not tessie" to SEI-only sources. Stale
+// v5 caches hold seam-inflated disengagement counts.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "6";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
 /// recompute of the persisted `routes` aggregate columns when the math that
 /// produced them changes. Bump on any change to compute_route_aggregates'
 /// numeric output. "geodesic-1" = the WGS-84 distance migration.
-const AGGREGATE_FORMULA_VERSION: &str = "geodesic-1";
+/// "boundary-2" = clip-boundary state export (v15 columns) + the
+/// engaged-at-start accel-push grace fix + pending-disengagement flush
+/// no longer counting at clip seams.
+const AGGREGATE_FORMULA_VERSION: &str = "boundary-2";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -355,7 +363,9 @@ impl DriveStore {
                 let n = mg.execute(
                     "UPDATE routes SET max_speed_mps = NULL, avg_speed_mps = NULL, \
                      assisted_distance_m = NULL, fsd_distance_m = NULL, \
-                     autosteer_distance_m = NULL, tacc_distance_m = NULL",
+                     autosteer_distance_m = NULL, tacc_distance_m = NULL, \
+                     fsd_pend_ms_end = NULL, park_ms_start = NULL, \
+                     fsd_at_end = NULL, fsd_accel_pushes_early = NULL",
                     [],
                 )?;
                 info!(
@@ -1755,9 +1765,13 @@ fn compute_drive_caches(inputs: DriveCacheInputs) -> Result<DriveCacheArtifacts>
     let total_distance_mi: f64 = drives.iter().map(|d| d.distance_mi).sum();
     let total_duration_ms: i64 = drives.iter().map(|d| d.duration_ms).sum();
 
+    // SEI = native dashcam only. Anything with a non-SEI source string
+    // (tessie, teslascope, future importers) is imported data with fuzzy
+    // or absent per-point autopilot telemetry — counted in totals, never
+    // in FSD analytics. Matches Sentry-Drive's isImportedSource rule.
     let sei_drives: Vec<_> = drives
         .iter()
-        .filter(|d| d.source.as_deref() != Some("tessie"))
+        .filter(|d| !matches!(d.source.as_deref(), Some(s) if s != "sei"))
         .collect();
     let sei_total_km: f64 = sei_drives.iter().map(|d| d.distance_km).sum();
     let fsd_distance_km: f64 = sei_drives.iter().map(|d| d.fsd_distance_km).sum();
@@ -1953,7 +1967,8 @@ fn insert_or_update_route(
             hvac_runtime_s,
             tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
             odometer_mi_start, odometer_mi_end,
-            location_name_start, location_name_end)
+            location_name_start, location_name_end,
+            fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -1966,7 +1981,8 @@ fn insert_or_update_route(
             ?33, ?34, ?35,
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
-            ?46, ?47, ?48, ?49)
+            ?46, ?47, ?48, ?49,
+            ?50, ?51, ?52, ?53)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -2015,7 +2031,11 @@ fn insert_or_update_route(
             odometer_mi_start   = excluded.odometer_mi_start,
             odometer_mi_end     = excluded.odometer_mi_end,
             location_name_start = excluded.location_name_start,
-            location_name_end   = excluded.location_name_end",
+            location_name_end   = excluded.location_name_end,
+            fsd_pend_ms_end     = excluded.fsd_pend_ms_end,
+            park_ms_start       = excluded.park_ms_start,
+            fsd_at_end          = excluded.fsd_at_end,
+            fsd_accel_pushes_early = excluded.fsd_accel_pushes_early",
         params![
             norm_file,
             &r.date,
@@ -2066,6 +2086,10 @@ fn insert_or_update_route(
             r.odometer_mi_end,
             &r.location_name_start,
             &r.location_name_end,
+            a.fsd_pend_ms_end,
+            a.park_ms_start,
+            a.fsd_at_end as i64,
+            a.fsd_accel_pushes_early,
         ],
     )?;
     Ok(())
@@ -2251,7 +2275,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 hvac_runtime_s,
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
-                location_name_start, location_name_end
+                location_name_start, location_name_end,
+                fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early
          FROM routes
          ORDER BY file",
     )?;
@@ -2309,6 +2334,13 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<String>>(37)?,
                 row.get::<_, Option<String>>(38)?,
             ),
+            // v15 clip-boundary state
+            (
+                row.get::<_, Option<f64>>(39)?,
+                row.get::<_, Option<f64>>(40)?,
+                row.get::<_, Option<i64>>(41)?,
+                row.get::<_, Option<i64>>(42)?,
+            ),
         ))
     })?;
 
@@ -2349,6 +2381,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
             (odometer_mi_start, odometer_mi_end),
             (location_name_start, location_name_end),
+            (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -2376,6 +2409,10 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 assisted_distance_m: assisted_distance_m.unwrap_or(0.0),
                 fsd_disengagements: fsd_disengagements.unwrap_or(0) as i32,
                 fsd_accel_pushes: fsd_accel_pushes.unwrap_or(0) as i32,
+                fsd_pend_ms_end,
+                park_ms_start,
+                fsd_at_end: fsd_at_end.unwrap_or(0) != 0,
+                fsd_accel_pushes_early: fsd_accel_pushes_early.unwrap_or(0) as i32,
                 start_lat,
                 start_lng: start_lon,
                 end_lat,
@@ -2715,6 +2752,105 @@ mod tests {
         let conn = store.conn.lock().unwrap();
         let ver = meta_get(&conn, "aggregate_formula_version").unwrap();
         assert_eq!(ver.as_deref(), Some(AGGREGATE_FORMULA_VERSION));
+    }
+
+    /// 61-point clip (dt = 1000 ms) for boundary tests: per-point AP and
+    /// gear arrays, valid GPS, no gear_runs (no mid-clip park splitting).
+    fn add_boundary_clip(store: &DriveStore, file: &str, ap: Vec<u8>, gears: Vec<u8>) {
+        let n = 61;
+        let mut pts: Vec<GpsPoint> = Vec::with_capacity(n);
+        for i in 0..n {
+            pts.push([37.7749 + (i as f64) * 0.00001, -122.4194]);
+        }
+        let speeds = vec![10.0f32; n];
+        let accel = vec![0.0f32; n];
+        store
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn disengagement_boundary_resolved_across_clips() {
+        use crate::extract::{AUTOPILOT_FSD, AUTOPILOT_OFF, GEAR_PARK};
+        let store = DriveStore::open_memory().unwrap();
+
+        // Drive 1: clip ends with a pending disengagement (FSD off at
+        // 59s), next clip parks within the remaining grace window →
+        // "FSD parked the car", NOT a disengagement.
+        let pend_ap: Vec<u8> = (0..61)
+            .map(|i| if i < 59 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        let mut park_gears = vec![4u8; 61];
+        park_gears[0] = GEAR_PARK;
+        park_gears[1] = GEAR_PARK;
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4", pend_ap.clone(), vec![4; 61]);
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_10-01-00-front.mp4", vec![AUTOPILOT_OFF; 61], park_gears);
+
+        // Drive 2 (2.5h later, separate drive): same pending end, but the
+        // next clip never parks → a real driver disengagement.
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_13-00-00-front.mp4", pend_ap, vec![4; 61]);
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_13-01-00-front.mp4", vec![AUTOPILOT_OFF; 61], vec![4; 61]);
+
+        let drives: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drives_json().unwrap()).unwrap();
+        let arr = drives.as_array().unwrap();
+        assert_eq!(arr.len(), 2, "expected two drives: {drives}");
+        let dis_for = |start: &str| -> i64 {
+            arr.iter()
+                .find(|d| d["startTime"].as_str().unwrap_or("").starts_with(start))
+                .unwrap_or_else(|| panic!("drive {start} missing: {drives}"))
+                ["fsdDisengagements"]
+                .as_i64()
+                .unwrap()
+        };
+        assert_eq!(
+            dis_for("2025-01-01T10:00"), 0,
+            "park within grace across the clip seam must cancel the disengagement"
+        );
+        assert_eq!(
+            dis_for("2025-01-01T13:00"), 1,
+            "no park across the seam must count the disengagement"
+        );
+    }
+
+    #[test]
+    fn trailing_pending_disengagement_counts_at_drive_end() {
+        use crate::extract::{AUTOPILOT_FSD, AUTOPILOT_OFF};
+        let store = DriveStore::open_memory().unwrap();
+        // Single-clip drive ending with a pending disengagement and no
+        // Park before recording stops — matches Sentry-Drive's flush rule.
+        let pend_ap: Vec<u8> = (0..61)
+            .map(|i| if i < 59 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4", pend_ap, vec![4; 61]);
+        let drives: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drives_json().unwrap()).unwrap();
+        assert_eq!(drives[0]["fsdDisengagements"].as_i64(), Some(1), "{drives}");
+    }
+
+    #[test]
+    fn non_sei_sources_excluded_from_fsd_stats() {
+        use crate::extract::AUTOPILOT_FSD;
+        let store = DriveStore::open_memory().unwrap();
+        // One FSD-heavy clip... imported from Teslascope. Totals must
+        // include its distance; FSD analytics must not (dashcam-only),
+        // matching Sentry-Drive's "anything non-SEI is imported" rule.
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4", vec![AUTOPILOT_FSD; 61], vec![4; 61]);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE routes SET source = 'teslascope'", []).unwrap();
+        }
+        store.drive_cache_dirty.store(true, Ordering::Release);
+        let stats: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drive_stats_json().unwrap()).unwrap();
+        assert!(
+            stats["total_distance_km"].as_f64().unwrap() > 0.0,
+            "imported drives still count toward totals: {stats}"
+        );
+        assert_eq!(
+            stats["fsd_distance_km"].as_f64(), Some(0.0),
+            "imported drives must not feed FSD analytics: {stats}"
+        );
     }
 
     #[test]

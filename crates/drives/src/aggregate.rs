@@ -79,10 +79,67 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
 
     // Autopilot event tracking — reset per-clip; matches GroupSummaries' inner
     // loop, which also resets these between clips.
+    //
+    // Engaged-at-start clips anchor the engage timestamp to the clip
+    // start: for a continuation clip the true engagement is even older
+    // (grace long satisfied), and for a drive's first clip this matches
+    // the merged-walk behavior of measuring from the first sample. Pushes
+    // that begin inside the 3s window of an engaged-from-start clip are
+    // ambiguous in isolation and export via `fsd_accel_pushes_early`.
+    let engaged_from_start = has_ap && r.autopilot_states[0] == AUTOPILOT_FSD;
     let mut in_accel_press = false;
-    let mut fsd_engage_idx: isize = -1;
+    let mut accel_press_early = false;
+    let mut fsd_engage_idx: isize = if engaged_from_start { 0 } else { -1 };
     let mut pending_disengage = false;
     let mut pending_disengage_idx: usize = 0;
+
+    // Park intervals in REAL clip time from gear_runs, exactly like the
+    // cloud summary v4 producer (cloud_uploader/encrypt.rs). The per-point
+    // gear array is aligned to DEDUPLICATED GPS points under a uniform-dt
+    // assumption, which distorts worst exactly when the car is stopping to
+    // park — points collapse while real seconds keep passing — so the 2s
+    // Park grace misses cancellations that Sentry-Drive (real per-point
+    // timestamps) catches. gear_runs are frame-domain (real time); when a
+    // clip predates gear_runs, fall back to the point-domain gear array.
+    let mut park_iv: Vec<(f64, f64)> = Vec::new();
+    {
+        let gear_total: i64 = r.gear_runs.iter().map(|run| run.frames as i64).sum();
+        if gear_total > 0 {
+            let per_gear_ms = 60_000.0 / gear_total as f64;
+            let mut acc: i64 = 0;
+            for run in &r.gear_runs {
+                let frames = run.frames as i64;
+                if run.gear == GEAR_PARK && frames > 0 {
+                    park_iv.push((acc as f64 * per_gear_ms, (acc + frames) as f64 * per_gear_ms));
+                }
+                acc += frames;
+            }
+        } else if has_gears {
+            // Fallback: point-domain runs of Park under uniform dt.
+            let mut run_start: Option<usize> = None;
+            for i in 0..n {
+                let is_park = r.gear_states[i] == GEAR_PARK;
+                match (is_park, run_start) {
+                    (true, None) => run_start = Some(i),
+                    (false, Some(s)) => {
+                        park_iv.push((s as f64 * dt_ms, i as f64 * dt_ms));
+                        run_start = None;
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(s) = run_start {
+                park_iv.push((s as f64 * dt_ms, 60_000.0));
+            }
+        }
+    }
+    let is_park_at = |ms: f64| park_iv.iter().any(|iv| ms >= iv.0 && ms < iv.1);
+
+    // v15 boundary state for the drive grouper (see RouteAggregates).
+    agg.fsd_at_end = has_ap && r.autopilot_states[n - 1] == AUTOPILOT_FSD;
+    if let Some(iv) = park_iv.iter().find(|iv| iv.0 < 2000.0) {
+        agg.park_ms_start = Some(iv.0);
+    }
 
     let mut speed_sum = 0.0f64;
 
@@ -153,10 +210,13 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
                 in_accel_press = false;
             }
 
-            // Resolve any pending FSD disengagement.
+            // Resolve any pending FSD disengagement. Park is checked
+            // against the real-time park intervals (gear_runs domain) at
+            // this sample's nominal time, matching the cloud v4 rule.
             if pending_disengage {
+                let t_ms = i as f64 * dt_ms;
                 let time_since_ms = (i - pending_disengage_idx) as f64 * dt_ms;
-                if has_gears && r.gear_states[i] == GEAR_PARK && time_since_ms <= 2000.0 {
+                if is_park_at(t_ms) && time_since_ms <= 2000.0 {
                     pending_disengage = false;
                 } else if time_since_ms > 2000.0 || cur_ap == AUTOPILOT_FSD {
                     agg.fsd_disengagements += 1;
@@ -182,10 +242,23 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
                 } else {
                     0.0
                 };
-                if !in_accel_press && accel_pct > 1.0 && time_since_engage_ms >= 3000.0 {
-                    in_accel_press = true;
+                if !in_accel_press && accel_pct > 1.0 {
+                    if time_since_engage_ms >= 3000.0 {
+                        in_accel_press = true;
+                        accel_press_early = false;
+                    } else if engaged_from_start && fsd_engage_idx == 0 {
+                        // Within the start-anchored grace of an
+                        // engaged-from-start clip — real iff the previous
+                        // clip ended engaged, which only the grouper knows.
+                        in_accel_press = true;
+                        accel_press_early = true;
+                    }
                 } else if in_accel_press && accel_pct <= 0.0 {
-                    agg.fsd_accel_pushes += 1;
+                    if accel_press_early {
+                        agg.fsd_accel_pushes_early += 1;
+                    } else {
+                        agg.fsd_accel_pushes += 1;
+                    }
                     in_accel_press = false;
                 }
             } else if cur_ap != AUTOPILOT_FSD {
@@ -194,11 +267,17 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
         }
     }
 
-    // Flush pending disengagement at end of clip (match GroupSummaries).
+    // Pending disengagement still open at clip end: the 2s Park grace
+    // spans the clip seam, so export the elapsed window for the grouper
+    // to resolve against the NEXT clip (mirrors the cloud summary v4
+    // `dPnd` rule). Expiry inside the clip was already counted in-loop;
+    // a Park inside the window already canceled it there too.
     if pending_disengage {
-        let last_is_park = has_gears && r.gear_states[n - 1] == GEAR_PARK;
-        if !last_is_park {
+        let elapsed_ms = (n - 1 - pending_disengage_idx) as f64 * dt_ms;
+        if elapsed_ms > 2000.0 {
             agg.fsd_disengagements += 1;
+        } else {
+            agg.fsd_pend_ms_end = Some(elapsed_ms);
         }
     }
 
@@ -330,6 +409,108 @@ mod tests {
         };
         let agg = compute_route_aggregates(&r);
         assert_eq!(agg.fsd_disengagements, 0);
+    }
+
+    /// 61-point route (dt_ms = 1000) with the given per-point AP/gear/accel
+    /// arrays. Pads/truncates inputs to 61.
+    fn boundary_route(ap: Vec<u8>, gears: Vec<u8>, accel: Vec<f32>) -> Route {
+        let n = 61;
+        let mut points = Vec::with_capacity(n);
+        for i in 0..n {
+            points.push([37.7749 + (i as f64) * 0.00001, -122.4194]);
+        }
+        let fit_u8 = |mut v: Vec<u8>, fill: u8| {
+            v.resize(n, fill);
+            v
+        };
+        let mut accel = accel;
+        if !accel.is_empty() {
+            accel.resize(n, 0.0);
+        }
+        Route {
+            file: "test.mp4".to_string(),
+            date: "2025-01-01".to_string(),
+            points,
+            gear_states: if gears.is_empty() { vec![] } else { fit_u8(gears, 4) },
+            autopilot_states: if ap.is_empty() { vec![] } else { fit_u8(ap, AUTOPILOT_OFF) },
+            speeds: vec![],
+            accel_positions: accel,
+            raw_park_count: 0,
+            raw_frame_count: 61,
+            gear_runs: vec![],
+            source: None,
+            external_signature: None,
+            tessie_autopilot_percent: None,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn disengage_near_clip_end_exports_pending_instead_of_counting() {
+        // FSD through frame 58, off at 59-60 — the 2s Park grace can't
+        // resolve before the clip ends. Pre-v15 this flushed as a counted
+        // disengagement (over-counting at every clip seam where the Park
+        // arrives in the NEXT clip); now it must export the pending state
+        // for the grouper to resolve.
+        let ap: Vec<u8> = (0..61)
+            .map(|i| if i < 59 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        let agg = compute_route_aggregates(&boundary_route(ap, vec![4; 61], vec![]));
+        assert_eq!(agg.fsd_disengagements, 0, "pending must not count at clip end");
+        let pend = agg.fsd_pend_ms_end.expect("pending state must export");
+        assert!((pend - 1000.0).abs() < 1.0, "elapsed should be ~1000ms, got {pend}");
+        assert!(!agg.fsd_at_end, "clip ends disengaged");
+    }
+
+    #[test]
+    fn park_ms_start_and_fsd_at_end_export() {
+        // Park on frames 0-1 then Drive; FSD engaged on the final frame.
+        let mut gears = vec![4u8; 61];
+        gears[0] = GEAR_PARK;
+        gears[1] = GEAR_PARK;
+        let mut ap = vec![AUTOPILOT_OFF; 61];
+        ap[59] = AUTOPILOT_FSD;
+        ap[60] = AUTOPILOT_FSD;
+        let agg = compute_route_aggregates(&boundary_route(ap, gears, vec![]));
+        assert_eq!(agg.park_ms_start, Some(0.0));
+        assert!(agg.fsd_at_end);
+        // Park later than 2s from clip start must NOT export.
+        let mut gears_late = vec![4u8; 61];
+        gears_late[30] = GEAR_PARK;
+        let agg2 =
+            compute_route_aggregates(&boundary_route(vec![AUTOPILOT_OFF; 61], gears_late, vec![]));
+        assert_eq!(agg2.park_ms_start, None);
+    }
+
+    #[test]
+    fn accel_push_counts_when_fsd_engaged_at_clip_start() {
+        // FSD engaged from frame 0 (continuation clip). Push at 30s,
+        // released at 33s — well past any grace. Pre-v15 the engage
+        // timestamp was unset for engaged-at-start clips, the 3s grace
+        // never elapsed, and every such push was silently dropped.
+        let mut accel = vec![0.0f32; 61];
+        for i in 30..33 {
+            accel[i] = 30.0;
+        }
+        let agg =
+            compute_route_aggregates(&boundary_route(vec![AUTOPILOT_FSD; 61], vec![4; 61], accel));
+        assert_eq!(agg.fsd_accel_pushes, 1);
+        assert_eq!(agg.fsd_accel_pushes_early, 0);
+    }
+
+    #[test]
+    fn early_accel_push_lands_in_early_counter() {
+        // Engaged from frame 0, push begins 1s in — within the 3s engage
+        // grace measured from clip start. Whether it's a real push depends
+        // on the previous clip (engaged continuation or fresh engagement),
+        // which only the grouper knows — so it exports separately.
+        let mut accel = vec![0.0f32; 61];
+        accel[1] = 30.0;
+        accel[2] = 30.0;
+        let agg =
+            compute_route_aggregates(&boundary_route(vec![AUTOPILOT_FSD; 61], vec![4; 61], accel));
+        assert_eq!(agg.fsd_accel_pushes, 0);
+        assert_eq!(agg.fsd_accel_pushes_early, 1);
     }
 
     #[test]

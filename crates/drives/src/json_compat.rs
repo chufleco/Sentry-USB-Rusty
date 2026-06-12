@@ -506,7 +506,8 @@ fn insert_imported_route(
             hvac_runtime_s,
             tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
             odometer_mi_start, odometer_mi_end,
-            location_name_start, location_name_end)
+            location_name_start, location_name_end,
+            fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -519,7 +520,8 @@ fn insert_imported_route(
             ?33, ?34, ?35,
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
-            ?46, ?47, ?48, ?49)",
+            ?46, ?47, ?48, ?49,
+            ?50, ?51, ?52, ?53)",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -536,6 +538,7 @@ fn insert_imported_route(
             r.tire_fl_psi, r.tire_fr_psi, r.tire_rl_psi, r.tire_rr_psi,
             r.odometer_mi_start, r.odometer_mi_end,
             r.location_name_start, r.location_name_end,
+            a.fsd_pend_ms_end, a.park_ms_start, a.fsd_at_end as i64, a.fsd_accel_pushes_early,
         ],
     )?;
     Ok(())

@@ -475,6 +475,28 @@ pub struct RouteAggregates {
     pub assisted_distance_m: f64,
     pub fsd_disengagements: i32,
     pub fsd_accel_pushes: i32,
+    /// v15 clip-boundary state. A per-clip aggregate can't see across the
+    /// 60s seam, so edge transitions export STATE for the drive grouper to
+    /// resolve — mirroring the cloud summary v4 boundary fields
+    /// (`dPnd`/`pk1`) so local and cloud counts agree.
+    ///
+    /// Pending FSD disengagement still open at clip end: elapsed ms since
+    /// the FSD→off transition (0..=2000). The grouper checks the next
+    /// clip's `park_ms_start` against the remaining grace window — Park
+    /// inside it means "FSD parked the car" (not a disengagement),
+    /// anything else counts.
+    pub fsd_pend_ms_end: Option<f64>,
+    /// First Park gear sample within 2000 ms of clip start, in clip-ms.
+    pub park_ms_start: Option<f64>,
+    /// FSD engaged on the clip's final sample — the next clip is an
+    /// engaged continuation, so its `fsd_accel_pushes_early` are real.
+    pub fsd_at_end: bool,
+    /// Accel pushes that began <3000 ms into a clip that started already
+    /// FSD-engaged. In-clip the 3s engage grace can't be proven satisfied
+    /// (the engagement began in an earlier clip), so these export
+    /// separately and the grouper counts them only when the previous clip
+    /// ended FSD-engaged.
+    pub fsd_accel_pushes_early: i32,
     /// Start/End points are the first/last non-null-island Points on the
     /// clip. `None` when the clip has no valid points — explicit Option
     /// rather than overloading (0, 0) as a sentinel.
