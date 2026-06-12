@@ -12,10 +12,6 @@ pub struct PendingRoute {
 
 pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute>> {
     let files: Vec<(String, Option<String>)> = store.with_locked_conn(|conn| -> Result<_> {
-        // Skip Tessie-imported routes. Tessie data already lives in Tessie's
-        // service; uploading it would burn the user's cloud storage budget
-        // and the cloud has no way to distinguish it later (encrypt.rs
-        // strips `source` from the payload). NULL source = native dashcam.
         // `start_ts` is always NULL (insert_or_update_route binds it NULL),
         // so it can't actually order anything — without a tiebreaker the
         // upload order is undefined. `file ASC` makes it deterministic, and
@@ -24,7 +20,6 @@ pub fn select_pending(store: &DriveStore, limit: i64) -> Result<Vec<PendingRoute
         let mut stmt = conn.prepare(
             "SELECT file, cloud_route_id FROM routes \
              WHERE cloud_uploaded_at IS NULL \
-               AND (source IS NULL OR source != 'tessie') \
              ORDER BY file ASC LIMIT ?1",
         )?;
         let iter = stmt.query_map(params![limit], |row| {
@@ -139,16 +134,14 @@ pub fn mark_permanent_skip(store: &DriveStore, file: &str) -> Result<()> {
 /// reliably populated BLE column (every clip whose 60s window crossed at
 /// least one sample has it). Skip-sentinel rows (`= -1`) are never
 /// reset — those were rejected by the cloud for size and re-uploading
-/// won't help. Tessie-sourced rows are also skipped because they aren't
-/// in the upload eligibility set anyway.
+/// won't help.
 pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
     store.with_locked_conn(|conn| -> Result<_> {
         let changed = conn.execute(
             "UPDATE routes SET cloud_uploaded_at = NULL \
              WHERE cloud_uploaded_at IS NOT NULL \
                AND cloud_uploaded_at > 0 \
-               AND battery_pct_start IS NOT NULL \
-               AND (source IS NULL OR source != 'tessie')",
+               AND battery_pct_start IS NOT NULL",
             [],
         )?;
         Ok(changed as i64)
@@ -160,8 +153,7 @@ pub fn pending_count(store: &DriveStore) -> i64 {
         .with_locked_conn(|conn| {
             conn.query_row(
                 "SELECT count(*) FROM routes \
-                 WHERE cloud_uploaded_at IS NULL \
-                   AND (source IS NULL OR source != 'tessie')",
+                 WHERE cloud_uploaded_at IS NULL",
                 [],
                 |row| row.get::<_, i64>(0),
             )
@@ -206,7 +198,6 @@ pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> 
                     updated_at \
              FROM routes \
              WHERE cloud_uploaded_at IS NULL \
-               AND (source IS NULL OR source != 'tessie') \
              ORDER BY start_ts ASC, file ASC LIMIT ?1",
         )?;
         let iter = stmt.query_map(params![limit], |row| {
