@@ -6,9 +6,18 @@
 //!   (hundreds of MB for large files). Strips a UTF-8 BOM if present.
 //!   Refuses imports that would shrink the DB below 50%.
 //! * Export walks the DB in deterministic order (routes by `file`,
-//!   processed by `file`, tags by `drive_key`+`tag`) so two exports of
-//!   the same state produce byte-identical JSON. That matters for rsync
-//!   diffs and for Sentry Studio's change-detection.
+//!   processed by `file`, tags by `drive_key`+`tag`, telemetry by `ts`)
+//!   so two exports of the same state produce byte-identical JSON. That
+//!   matters for rsync diffs and for Sentry Studio's change-detection.
+//! * The export is the full user-data backup: alongside the original
+//!   `processedFiles`/`routes`/`driveTags` sections it carries
+//!   `telemetrySamples` (raw BLE sampler rows — charging history and the
+//!   drive temp/battery/tire chart series are derived from these and
+//!   have no other persistence), `chargeTags`, and `chargeCosts`.
+//!   Device-local state (`meta`, `charge_uploads`, `mutable_dirty`) is
+//!   deliberately excluded — restoring another install's sync cursors
+//!   would corrupt cloud sync. Output is compact (not pretty-printed);
+//!   telemetry runs to hundreds of thousands of rows.
 
 use std::io::Write;
 
@@ -31,12 +40,21 @@ const SYNCGUARD_MIN_ROUTES: usize = 1000;
 const SYNCGUARD_SHRINK_RATIO: f64 = 0.5;
 
 /// What `import_json` reports back to the caller.
+///
+/// The telemetry/charge fields are `#[serde(default)]` so import-history
+/// records persisted before the full-DB export still deserialize.
 #[derive(Debug, Default, Clone, Copy, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ImportStats {
     pub routes: usize,
     pub processed_files: usize,
     pub drive_tags: usize,
+    #[serde(default)]
+    pub telemetry_samples: usize,
+    #[serde(default)]
+    pub charge_tags: usize,
+    #[serde(default)]
+    pub charge_costs: usize,
 }
 
 /// Per-route problems discovered during a JSON import. The route is still
@@ -151,6 +169,9 @@ where
         routes: usize,
         processed_files: usize,
         drive_tags: usize,
+        telemetry_samples: usize,
+        charge_tags: usize,
+        charge_costs: usize,
         on_progress: &'tx dyn Fn(usize),
         diag: &'tx mut ImportDiagnostics,
         seen_files: &'tx mut HashSet<String>,
@@ -213,6 +234,52 @@ where
         }
     }
 
+    /// Deserializes the `telemetrySamples` JSON array element-by-element,
+    /// same streaming pattern as `RouteSeq` — a year of samples is
+    /// hundreds of thousands of rows and must never materialize at once.
+    struct SampleSeq<'a, 'tx: 'a>(&'a mut Ctx<'tx>);
+
+    impl<'de, 'a, 'tx: 'a> DeserializeSeed<'de> for SampleSeq<'a, 'tx> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+
+    impl<'de, 'a, 'tx: 'a> Visitor<'de> for SampleSeq<'a, 'tx> {
+        type Value = ();
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("telemetrySamples array")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            let mut stmt = self
+                .0
+                .tx
+                .prepare(&format!(
+                    "INSERT OR IGNORE INTO telemetry_samples ({}) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
+                             ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)",
+                    TELEMETRY_COLUMNS
+                ))
+                .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+            while let Some(s) = seq.next_element::<TelemetrySampleJson>()? {
+                stmt.execute(params![
+                    s.ts, s.source, s.battery_pct, s.battery_temp_c, s.interior_temp_c,
+                    s.exterior_temp_c, s.hvac_on,
+                    s.tire_fl_psi, s.tire_fr_psi, s.tire_rl_psi, s.tire_rr_psi,
+                    s.odometer_mi, s.software_version, s.location_name,
+                    s.charger_power_kw, s.charger_actual_current_a, s.charger_voltage_v,
+                    s.charge_rate_mph, s.charge_energy_added_kwh, s.charge_limit_soc,
+                    s.battery_range_mi, s.latitude, s.longitude,
+                    s.charge_minutes_to_full, s.charging_state,
+                ])
+                .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                self.0.telemetry_samples += 1;
+            }
+            Ok(())
+        }
+    }
+
     /// Top-level visitor for the drive-data.json object.
     struct TopLevel<'a, 'tx: 'a>(&'a mut Ctx<'tx>);
 
@@ -260,6 +327,39 @@ where
                         }
                         ctx.drive_tags = tags.len();
                     }
+                    "telemetrySamples" => {
+                        map.next_value_seed(SampleSeq(&mut *ctx))?;
+                    }
+                    "chargeTags" => {
+                        let tags: HashMap<i64, Vec<String>> = map.next_value()?;
+                        let mut stmt = ctx.tx
+                            .prepare(
+                                "INSERT OR IGNORE INTO charge_tags(session_ts, tag) \
+                                 VALUES(?1, ?2)",
+                            )
+                            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                        for (k, vs) in &tags {
+                            for v in vs {
+                                stmt.execute(params![k, v])
+                                    .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                                ctx.charge_tags += 1;
+                            }
+                        }
+                    }
+                    "chargeCosts" => {
+                        let costs: HashMap<i64, ChargeCostJson> = map.next_value()?;
+                        let mut stmt = ctx.tx
+                            .prepare(
+                                "INSERT OR IGNORE INTO charge_costs(session_ts, amount, currency) \
+                                 VALUES(?1, ?2, ?3)",
+                            )
+                            .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                        for (k, c) in &costs {
+                            stmt.execute(params![k, c.amount, c.currency])
+                                .map_err(|e| serde::de::Error::custom(e.to_string()))?;
+                            ctx.charge_costs += 1;
+                        }
+                    }
                     _ => {
                         // Unknown top-level key — skip without allocating.
                         map.next_value::<serde_json::Value>()?;
@@ -279,6 +379,9 @@ where
         routes: 0,
         processed_files: 0,
         drive_tags: 0,
+        telemetry_samples: 0,
+        charge_tags: 0,
+        charge_costs: 0,
         on_progress: &on_progress,
         diag: &mut diag,
         seen_files: &mut seen_files,
@@ -293,6 +396,9 @@ where
         routes: ctx.routes,
         processed_files: ctx.processed_files,
         drive_tags: ctx.drive_tags,
+        telemetry_samples: ctx.telemetry_samples,
+        charge_tags: ctx.charge_tags,
+        charge_costs: ctx.charge_costs,
     };
 
     // Corruption guard: refuse to replace a large store with a much smaller
@@ -322,11 +428,15 @@ where
     // Aggregate summary at INFO so a healthy import emits one line.
     info!(
         "import_json: complete path={} routes={} processed_files={} drive_tags={} \
+         telemetry_samples={} charge_tags={} charge_costs={} \
          empty_points={} empty_date={} duplicate_files_in_json={}",
         path,
         stats.routes,
         stats.processed_files,
         stats.drive_tags,
+        stats.telemetry_samples,
+        stats.charge_tags,
+        stats.charge_costs,
         diag.empty_points,
         diag.empty_date,
         diag.duplicate_files_in_json,
@@ -431,6 +541,89 @@ fn insert_imported_route(
     Ok(())
 }
 
+/// One raw `telemetry_samples` row in the export. Every column the BLE
+/// sampler writes rides through, so a restore rebuilds charging history
+/// and the per-drive chart series exactly — those are derived live from
+/// this table and have no other persistence. Nulls are omitted, which
+/// shrinks the sparse body-controller rows to ~40 bytes each.
+///
+/// Field order here, the SELECT in `TelemetrySampleStream`, and the
+/// INSERT in `insert_imported_sample` must stay in sync — the round-trip
+/// test covers every column to catch drift.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TelemetrySampleJson {
+    ts: i64,
+    #[serde(default)]
+    source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    battery_pct: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    battery_temp_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interior_temp_c: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exterior_temp_c: Option<f64>,
+    /// 0/1 as stored — kept integer so the round-trip is exact.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    hvac_on: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tire_fl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tire_fr_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tire_rl_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tire_rr_psi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    odometer_mi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    software_version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charger_power_kw: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charger_actual_current_a: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charger_voltage_v: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_rate_mph: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_energy_added_kwh: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_limit_soc: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    battery_range_mi: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    latitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    longitude: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charge_minutes_to_full: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    charging_state: Option<String>,
+}
+
+/// Column list shared by the export SELECT and the import INSERT —
+/// ordinal positions match `TelemetrySampleJson` field order.
+const TELEMETRY_COLUMNS: &str =
+    "ts, source, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c, hvac_on, \
+     tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi, \
+     odometer_mi, software_version, location_name, \
+     charger_power_kw, charger_actual_current_a, charger_voltage_v, \
+     charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
+     latitude, longitude, charge_minutes_to_full, charging_state";
+
+/// Manual cost override for one charge session in the export.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ChargeCostJson {
+    amount: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    currency: Option<String>,
+}
+
 /// Export the DB contents as `drive-data.json`. Produces deterministic,
 /// byte-identical output for the same DB state so rsync / archive
 /// diff-detection works correctly.
@@ -470,6 +663,46 @@ pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
         out
     };
 
+    // Charge-session tags and manual cost overrides — small tables,
+    // collected up front like drive_tags. BTreeMap keys (the numeric
+    // session timestamps) serialize in sorted order for determinism.
+    let charge_tags = {
+        let mut stmt = conn
+            .prepare("SELECT session_ts, tag FROM charge_tags ORDER BY session_ts, tag")?;
+        let rows =
+            stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))?;
+        let mut out: std::collections::BTreeMap<i64, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            let (k, t) = r?;
+            out.entry(k).or_default().push(t);
+        }
+        out
+    };
+    let charge_costs = {
+        let mut stmt = conn
+            .prepare("SELECT session_ts, amount, currency FROM charge_costs ORDER BY session_ts")?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                ChargeCostJson { amount: row.get(1)?, currency: row.get(2)? },
+            ))
+        })?;
+        let mut out: std::collections::BTreeMap<i64, ChargeCostJson> =
+            std::collections::BTreeMap::new();
+        for r in rows {
+            let (k, c) = r?;
+            out.insert(k, c);
+        }
+        out
+    };
+
+    // The sample stream can't know it's empty until it runs, so probe the
+    // count up front — an empty table omits the key entirely, keeping
+    // pre-telemetry exports byte-stable.
+    let telemetry_count: i64 =
+        conn.query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))?;
+
     // Use a BTreeMap (ordered) → HashMap transition for serialization
     // so drive_tags keys serialize in sorted order. serde_json writes
     // BTreeMap keys in their natural order.
@@ -480,6 +713,12 @@ pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
         routes: RouteStream<'a>,
         #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
         drive_tags: &'a std::collections::BTreeMap<String, Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        telemetry_samples: Option<TelemetrySampleStream<'a>>,
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        charge_tags: &'a std::collections::BTreeMap<i64, Vec<String>>,
+        #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+        charge_costs: &'a std::collections::BTreeMap<i64, ChargeCostJson>,
     }
 
     // `route_err` is an out-parameter: if SQLite barfs partway through
@@ -494,8 +733,15 @@ pub fn export_json<W: Write>(conn: &Connection, writer: &mut W) -> Result<()> {
         processed_files: &processed_files,
         routes: RouteStream { conn, error: &route_err },
         drive_tags: &drive_tags,
+        telemetry_samples: (telemetry_count > 0)
+            .then_some(TelemetrySampleStream { conn, error: &route_err }),
+        charge_tags: &charge_tags,
+        charge_costs: &charge_costs,
     };
-    let ser_result = serde_json::to_writer_pretty(writer, &out);
+    // Compact (not pretty) on purpose: telemetry runs to hundreds of
+    // thousands of rows and pretty-printing would roughly double the
+    // file size and the export time on the Pi.
+    let ser_result = serde_json::to_writer(writer, &out);
 
     if let Some(e) = route_err.into_inner() {
         return Err(anyhow::Error::from(e).context("export_json: streaming route read failed"));
@@ -719,6 +965,83 @@ impl<'a> serde::Serialize for RouteStream<'a> {
             seq.serialize_element(&route)?;
             // `route` drops here — its ~10 KB of decoded BLOBs goes back
             // to the allocator before we loop.
+        }
+        seq.end()
+    }
+}
+
+/// Streams `telemetry_samples` rows into the JSON output one at a time,
+/// same pattern as [`RouteStream`] — at 60s sampling cadence the table
+/// reaches hundreds of thousands of rows, so materializing it would
+/// dwarf the rest of the export's working memory.
+struct TelemetrySampleStream<'a> {
+    conn: &'a Connection,
+    error: &'a std::cell::RefCell<Option<rusqlite::Error>>,
+}
+
+impl<'a> serde::Serialize for TelemetrySampleStream<'a> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::{Error as SerError, SerializeSeq};
+
+        let mut stmt = self
+            .conn
+            .prepare(&format!(
+                "SELECT {} FROM telemetry_samples ORDER BY ts",
+                TELEMETRY_COLUMNS
+            ))
+            .map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("telemetry prepare failed")
+            })?;
+
+        let mut rows = stmt.query([]).map_err(|e| {
+            *self.error.borrow_mut() = Some(e);
+            S::Error::custom("telemetry query failed")
+        })?;
+
+        let mut seq = serializer.serialize_seq(None)?;
+        loop {
+            let row_opt = rows.next().map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("telemetry row fetch failed")
+            })?;
+            let Some(row) = row_opt else { break };
+
+            let sample = (|| -> rusqlite::Result<TelemetrySampleJson> {
+                Ok(TelemetrySampleJson {
+                    ts: row.get(0)?,
+                    source: row.get(1)?,
+                    battery_pct: row.get(2)?,
+                    battery_temp_c: row.get(3)?,
+                    interior_temp_c: row.get(4)?,
+                    exterior_temp_c: row.get(5)?,
+                    hvac_on: row.get(6)?,
+                    tire_fl_psi: row.get(7)?,
+                    tire_fr_psi: row.get(8)?,
+                    tire_rl_psi: row.get(9)?,
+                    tire_rr_psi: row.get(10)?,
+                    odometer_mi: row.get(11)?,
+                    software_version: row.get(12)?,
+                    location_name: row.get(13)?,
+                    charger_power_kw: row.get(14)?,
+                    charger_actual_current_a: row.get(15)?,
+                    charger_voltage_v: row.get(16)?,
+                    charge_rate_mph: row.get(17)?,
+                    charge_energy_added_kwh: row.get(18)?,
+                    charge_limit_soc: row.get(19)?,
+                    battery_range_mi: row.get(20)?,
+                    latitude: row.get(21)?,
+                    longitude: row.get(22)?,
+                    charge_minutes_to_full: row.get(23)?,
+                    charging_state: row.get(24)?,
+                })
+            })()
+            .map_err(|e| {
+                *self.error.borrow_mut() = Some(e);
+                S::Error::custom("telemetry column read failed")
+            })?;
+
+            seq.serialize_element(&sample)?;
         }
         seq.end()
     }
@@ -1003,6 +1326,257 @@ mod import_diagnostics_tests {
             .query_row("SELECT COUNT(*) FROM routes", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 1);
+
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod full_db_export_tests {
+    use super::*;
+    use crate::db::DriveStore;
+    use crate::types::GpsPoint;
+    use rusqlite::Connection;
+
+    fn fresh_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::schema::migrate(&conn).unwrap();
+        conn
+    }
+
+    fn tmp_json(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "sentryusb-fulldb-{}-{}-{}.json",
+            tag,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    /// Insert one telemetry row exercising every column the sampler
+    /// writes (a charging `state` sample) and one sparse
+    /// `body_controller` row that only carries ts + source.
+    fn seed_telemetry(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO telemetry_samples (
+                ts, battery_pct, battery_temp_c, interior_temp_c, exterior_temp_c,
+                hvac_on, source,
+                tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
+                odometer_mi, software_version, location_name,
+                charger_power_kw, charger_actual_current_a, charger_voltage_v,
+                charge_rate_mph, charge_energy_added_kwh, charge_limit_soc,
+                battery_range_mi, latitude, longitude,
+                charge_minutes_to_full, charging_state
+            ) VALUES (
+                1700000000, 72.5, 21.0, 22.5, 18.0,
+                1, 'state',
+                42.0, 42.5, 41.5, 41.0,
+                12345.6, '2026.2.9.10', '123 Home St',
+                11, 48, 240,
+                30.5, 7.25, 80,
+                210.4, 37.7749, -122.4194,
+                95, 'charging'
+            )",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO telemetry_samples (ts, source) VALUES (1700000060, 'body_controller')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// Export → import into a fresh DB must carry the raw telemetry
+    /// samples plus charge tags and cost overrides — the tables the
+    /// pre-full-DB export silently dropped, which made an archive
+    /// restore lose all charging history and drive chart series.
+    #[test]
+    fn full_db_roundtrip_restores_telemetry_and_charge_data() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7750, -122.4195]];
+        store
+            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4, 4], &[1, 1], &[25.0, 26.0], &[0.5, 0.6], 0, 2, &[])
+            .unwrap();
+        store.with_locked_conn(|conn| seed_telemetry(conn));
+        store
+            .set_charge_tags(1700000000, &["Home".to_string(), "Overnight".to_string()])
+            .unwrap();
+        store
+            .set_charge_cost(1700000000, Some((4.56, "USD".to_string())))
+            .unwrap();
+
+        let path = tmp_json("roundtrip");
+        let path_str = path.to_string_lossy().to_string();
+        store.export_json_to_file(&path_str).unwrap();
+
+        let mut dest = fresh_conn();
+        let (stats, _diag) = import_json(&mut dest, &path_str, |_| {}).unwrap();
+        assert_eq!(stats.routes, 1);
+        assert_eq!(stats.telemetry_samples, 2);
+        assert_eq!(stats.charge_tags, 2);
+        assert_eq!(stats.charge_costs, 1);
+
+        // Full charging row survives column-for-column.
+        let (bp, hvac, src, fl, odo, swv, loc, pkw, amps, volts, rate, kwh, lim, range, lat, lng, mins, cs): (
+            Option<f64>, Option<i64>, String, Option<f64>, Option<f64>, Option<String>,
+            Option<String>, Option<i64>, Option<i64>, Option<i64>, Option<f64>, Option<f64>,
+            Option<i64>, Option<f64>, Option<f64>, Option<f64>, Option<i64>, Option<String>,
+        ) = dest
+            .query_row(
+                "SELECT battery_pct, hvac_on, source, tire_fl_psi, odometer_mi, software_version, \
+                        location_name, charger_power_kw, charger_actual_current_a, charger_voltage_v, \
+                        charge_rate_mph, charge_energy_added_kwh, charge_limit_soc, battery_range_mi, \
+                        latitude, longitude, charge_minutes_to_full, charging_state \
+                 FROM telemetry_samples WHERE ts = 1700000000",
+                [],
+                |r| {
+                    Ok((
+                        r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                        r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?,
+                        r.get(12)?, r.get(13)?, r.get(14)?, r.get(15)?, r.get(16)?, r.get(17)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(bp, Some(72.5));
+        assert_eq!(hvac, Some(1));
+        assert_eq!(src, "state");
+        assert_eq!(fl, Some(42.0));
+        assert_eq!(odo, Some(12345.6));
+        assert_eq!(swv.as_deref(), Some("2026.2.9.10"));
+        assert_eq!(loc.as_deref(), Some("123 Home St"));
+        assert_eq!(pkw, Some(11));
+        assert_eq!(amps, Some(48));
+        assert_eq!(volts, Some(240));
+        assert_eq!(rate, Some(30.5));
+        assert_eq!(kwh, Some(7.25));
+        assert_eq!(lim, Some(80));
+        assert_eq!(range, Some(210.4));
+        assert_eq!(lat, Some(37.7749));
+        assert_eq!(lng, Some(-122.4194));
+        assert_eq!(mins, Some(95));
+        assert_eq!(cs.as_deref(), Some("charging"));
+
+        // Sparse body-controller row survives with everything else NULL.
+        let (bp2, src2): (Option<f64>, String) = dest
+            .query_row(
+                "SELECT battery_pct, source FROM telemetry_samples WHERE ts = 1700000060",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(bp2, None);
+        assert_eq!(src2, "body_controller");
+
+        // Charge tags and cost override survive.
+        let tags: Vec<String> = {
+            let mut stmt = dest
+                .prepare("SELECT tag FROM charge_tags WHERE session_ts = 1700000000 ORDER BY tag")
+                .unwrap();
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0)).unwrap();
+            rows.map(|r| r.unwrap()).collect()
+        };
+        assert_eq!(tags, vec!["Home".to_string(), "Overnight".to_string()]);
+        let (amount, currency): (f64, Option<String>) = dest
+            .query_row(
+                "SELECT amount, currency FROM charge_costs WHERE session_ts = 1700000000",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(amount, 4.56);
+        assert_eq!(currency.as_deref(), Some("USD"));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Restoring an older backup over a live DB must never clobber rows
+    /// the sampler has written since the backup was taken — same-ts
+    /// telemetry rows, charge tags, and cost overrides all keep the
+    /// local (newer) value.
+    #[test]
+    fn import_merge_never_overwrites_existing_rows() {
+        let store = DriveStore::open_memory().unwrap();
+        store.with_locked_conn(|conn| {
+            conn.execute(
+                "INSERT INTO telemetry_samples (ts, battery_pct, source) VALUES (500, 99.0, 'state')",
+                [],
+            )
+            .unwrap();
+        });
+        store.set_charge_cost(500, Some((9.99, "USD".to_string()))).unwrap();
+        let path = tmp_json("merge");
+        let path_str = path.to_string_lossy().to_string();
+        store.export_json_to_file(&path_str).unwrap();
+
+        // Destination already has a different row at the same ts.
+        let mut dest = fresh_conn();
+        dest.execute(
+            "INSERT INTO telemetry_samples (ts, battery_pct, source) VALUES (500, 50.0, 'state')",
+            [],
+        )
+        .unwrap();
+        dest.execute(
+            "INSERT INTO charge_costs (session_ts, amount, currency) VALUES (500, 1.23, 'EUR')",
+            [],
+        )
+        .unwrap();
+
+        let (stats, _diag) = import_json(&mut dest, &path_str, |_| {}).unwrap();
+        assert_eq!(stats.telemetry_samples, 1, "row is counted as seen even when skipped");
+
+        let bp: Option<f64> = dest
+            .query_row("SELECT battery_pct FROM telemetry_samples WHERE ts = 500", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(bp, Some(50.0), "existing local sample must win over the backup");
+        let amount: f64 = dest
+            .query_row("SELECT amount FROM charge_costs WHERE session_ts = 500", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(amount, 1.23, "existing local cost must win over the backup");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pre-full-DB backup (no telemetrySamples/chargeTags/chargeCosts
+    /// sections) must keep importing exactly as before.
+    #[test]
+    fn old_format_backup_without_new_sections_still_imports() {
+        let json = r#"{"processedFiles":["2025-01-15/clip.mp4"],"routes":[{"file":"2025-01-15/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.1,-122.1]]}],"driveTags":{"k":["Sentry"]}}"#;
+        let path = tmp_json("oldformat");
+        std::fs::write(&path, json).unwrap();
+
+        let mut dest = fresh_conn();
+        let (stats, _diag) = import_json(&mut dest, path.to_str().unwrap(), |_| {}).unwrap();
+        assert_eq!(stats.routes, 1);
+        assert_eq!(stats.telemetry_samples, 0);
+        assert_eq!(stats.charge_tags, 0);
+        assert_eq!(stats.charge_costs, 0);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Empty stores must not emit the new sections at all — keeps the
+    /// no-telemetry export byte-stable for rsync diffing and older
+    /// readers.
+    #[test]
+    fn export_omits_new_sections_when_tables_empty() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194]];
+        store
+            .add_route("2025-01-15/clip.mp4", "2025-01-15", &pts, &[4], &[1], &[25.0], &[0.5], 0, 1, &[])
+            .unwrap();
+        let path = tmp_json("omit");
+        let path_str = path.to_string_lossy().to_string();
+        store.export_json_to_file(&path_str).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("telemetrySamples"));
+        assert!(!raw.contains("chargeTags"));
+        assert!(!raw.contains("chargeCosts"));
 
         let _ = std::fs::remove_file(&path);
     }

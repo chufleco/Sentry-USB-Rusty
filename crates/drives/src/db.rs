@@ -61,6 +61,13 @@ pub const ARCHIVE_DATA_PATH: &str = "/mnt/archive/drive-data.json";
 /// count still matches this baseline (the CIFS/NFS analogue of the
 /// shell script's drives_count short-circuit for rsync/rclone).
 const ARCHIVE_SYNC_ROUTE_COUNT_KEY: &str = "archive_sync_route_count";
+
+/// Meta-table key: `telemetry_samples` count at the last successful
+/// archive sync. A charging-only day grows telemetry without moving the
+/// route count, so the skip check needs both baselines — otherwise the
+/// archive backup would never pick up new charging history until the
+/// next drive.
+const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // Bump on every drive-list-shape change so existing on-disk caches
 // rebuild on first boot after upgrade.
 //
@@ -1228,18 +1235,29 @@ impl DriveStore {
         }
 
         // No-op short-circuit, mirroring the shell script's rsync path:
-        // skip the export + copy when the route count hasn't moved since
-        // the last successful sync. Tag-only edits don't bump the count
-        // and stay stale for one cycle — same accepted trade-off as the
-        // shell's drives_count check.
-        let last_synced: Option<i64> = {
+        // skip the export + copy when neither the route count nor the
+        // telemetry sample count has moved since the last successful
+        // sync (samples cover charging-only days). Tag-only edits don't
+        // bump either count and stay stale for one cycle — same accepted
+        // trade-off as the shell's drives_count check.
+        let (samples_now, last_synced, last_synced_samples) = {
             let conn = self.conn.lock().unwrap();
-            schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok())
+            let samples: i64 = conn
+                .query_row("SELECT COUNT(*) FROM telemetry_samples", [], |r| r.get(0))
+                .unwrap_or(0);
+            let routes: Option<i64> =
+                schema::meta_get(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY)?.and_then(|s| s.parse().ok());
+            let samples_baseline: Option<i64> = schema::meta_get(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY)?
+                .and_then(|s| s.parse().ok());
+            (samples, routes, samples_baseline)
         };
-        if last_synced == Some(routes_now) && Path::new(archive).exists() {
+        if last_synced == Some(routes_now)
+            && last_synced_samples == Some(samples_now)
+            && Path::new(archive).exists()
+        {
             info!(
-                "[drives] No new routes since last archive sync (route_count={}); skipping drive-data.json export",
-                routes_now
+                "[drives] No new routes or telemetry since last archive sync (route_count={} sample_count={}); skipping drive-data.json export",
+                routes_now, samples_now
             );
             return Ok(());
         }
@@ -1249,6 +1267,7 @@ impl DriveStore {
 
         let conn = self.conn.lock().unwrap();
         schema::meta_set(&conn, ARCHIVE_SYNC_ROUTE_COUNT_KEY, &routes_now.to_string())?;
+        schema::meta_set(&conn, ARCHIVE_SYNC_SAMPLE_COUNT_KEY, &samples_now.to_string())?;
         Ok(())
     }
 
@@ -2899,6 +2918,38 @@ mod tests {
         let repushed = std::fs::read_to_string(&archive).unwrap();
         assert_ne!(repushed, "sentinel");
         assert!(repushed.contains("11-00-00"));
+    }
+
+    /// A charging-only day adds telemetry samples without moving the
+    /// route count — the sync must still re-export so the archive backup
+    /// covers the new charging history.
+    #[test]
+    fn archive_sync_pushes_when_only_telemetry_added() {
+        let dir = TmpDir::new("telemetry-push");
+        let (mirror, archive, cache) =
+            (dir.path("mirror.json"), dir.path("archive.json"), dir.path("cache"));
+        let store = DriveStore::open_memory().unwrap();
+        add_test_route(&store, "a/2025-01-15_10-00-00-front.mp4");
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+
+        // No new routes, but the sampler wrote a row: archive rewritten.
+        std::fs::write(&archive, "sentinel").unwrap();
+        store.with_locked_conn(|conn| {
+            conn.execute(
+                "INSERT INTO telemetry_samples (ts, battery_pct, source) VALUES (1700000000, 72.5, 'state')",
+                [],
+            )
+            .unwrap();
+        });
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        let repushed = std::fs::read_to_string(&archive).unwrap();
+        assert_ne!(repushed, "sentinel");
+        assert!(repushed.contains("telemetrySamples"));
+
+        // Nothing new since: short-circuits again.
+        std::fs::write(&archive, "sentinel2").unwrap();
+        store.sync_to_archive_at(&mirror, &archive, &cache).unwrap();
+        assert_eq!(std::fs::read_to_string(&archive).unwrap(), "sentinel2");
     }
 
     #[test]
