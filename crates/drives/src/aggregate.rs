@@ -137,6 +137,11 @@ pub fn compute_route_aggregates(r: &Route) -> RouteAggregates {
 
     // v15 boundary state for the drive grouper (see RouteAggregates).
     agg.fsd_at_end = has_ap && r.autopilot_states[n - 1] == AUTOPILOT_FSD;
+    agg.ap_at_start = if has_ap {
+        Some(r.autopilot_states[0] as i32)
+    } else {
+        None
+    };
     if let Some(iv) = park_iv.iter().find(|iv| iv.0 < 2000.0) {
         agg.park_ms_start = Some(iv.0);
     }
@@ -511,6 +516,18 @@ mod tests {
             compute_route_aggregates(&boundary_route(vec![AUTOPILOT_FSD; 61], vec![4; 61], accel));
         assert_eq!(agg.fsd_accel_pushes, 0);
         assert_eq!(agg.fsd_accel_pushes_early, 1);
+    }
+
+    #[test]
+    fn ap_at_start_exports_mode_at_first_sample() {
+        let agg = compute_route_aggregates(&boundary_route(
+            vec![AUTOPILOT_FSD; 61],
+            vec![4; 61],
+            vec![],
+        ));
+        assert_eq!(agg.ap_at_start, Some(AUTOPILOT_FSD as i32));
+        let agg2 = compute_route_aggregates(&boundary_route(vec![], vec![4; 61], vec![]));
+        assert_eq!(agg2.ap_at_start, None, "no AP data → no start mode");
     }
 
     #[test]

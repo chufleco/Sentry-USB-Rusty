@@ -58,9 +58,14 @@ function normalizeFsdAnalytics(raw: any): FSDAnalyticsData | null {
   }
 }
 
+// Grade labels/bands match Sentry-Drive's fsdScoreLabel: Great >=90,
+// Good >=70, Okay >=40, Bad below. "Needs Improvement" is kept as a
+// fallback for analytics JSON cached by older backends.
 const gradeConfig: Record<string, { color: string; bgClass: string; ringColor: string }> = {
   Great: { color: "text-emerald-400", bgClass: "border-emerald-500/20 bg-emerald-500/5", ringColor: "#34d399" },
   Good: { color: "text-blue-400", bgClass: "border-blue-500/20 bg-blue-500/5", ringColor: "#60a5fa" },
+  Okay: { color: "text-amber-400", bgClass: "border-amber-500/20 bg-amber-500/5", ringColor: "#fbbf24" },
+  Bad: { color: "text-red-400", bgClass: "border-red-500/20 bg-red-500/5", ringColor: "#f87171" },
   "Needs Improvement": { color: "text-amber-400", bgClass: "border-amber-500/20 bg-amber-500/5", ringColor: "#fbbf24" },
 }
 

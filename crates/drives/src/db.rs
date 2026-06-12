@@ -100,8 +100,10 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "6";
 /// numeric output. "geodesic-1" = the WGS-84 distance migration.
 /// "boundary-2" = clip-boundary state export (v15 columns) + the
 /// engaged-at-start accel-push grace fix + pending-disengagement flush
-/// no longer counting at clip seams.
-const AGGREGATE_FORMULA_VERSION: &str = "boundary-2";
+/// no longer counting at clip seams. "boundary-3" adds `ap_at_start`
+/// so the grouper can attribute inter-clip bridge distance and seam
+/// wall-time to the incoming clip's autopilot mode.
+const AGGREGATE_FORMULA_VERSION: &str = "boundary-3";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
@@ -350,7 +352,8 @@ impl DriveStore {
             // separately) rebuilds from the fresh values.
             let stored_formula =
                 meta_get(&mg, "aggregate_formula_version")?.unwrap_or_default();
-            if stored_formula != AGGREGATE_FORMULA_VERSION {
+            let formula_gate_fired = stored_formula != AGGREGATE_FORMULA_VERSION;
+            if formula_gate_fired {
                 // NULL only the v2 (ALTER-added, nullable) aggregate
                 // columns. `max_speed_mps` is the backfill's gate
                 // (`WHERE max_speed_mps IS NULL`), so nulling it queues
@@ -365,7 +368,8 @@ impl DriveStore {
                      assisted_distance_m = NULL, fsd_distance_m = NULL, \
                      autosteer_distance_m = NULL, tacc_distance_m = NULL, \
                      fsd_pend_ms_end = NULL, park_ms_start = NULL, \
-                     fsd_at_end = NULL, fsd_accel_pushes_early = NULL",
+                     fsd_at_end = NULL, fsd_accel_pushes_early = NULL, \
+                     ap_at_start = NULL",
                     [],
                 )?;
                 info!(
@@ -403,7 +407,12 @@ impl DriveStore {
             // from what the cache was built from. On a typical restart where
             // nothing changed, this skips the expensive grouper run entirely
             // (two COUNT(*) queries instead of a full 5k-row table scan).
-            if is_drive_cache_valid(&mg)? {
+            //
+            // A fired formula gate forces the rebuild: the recompute
+            // rewrites aggregate columns without touching updated_at or
+            // row counts, so the validity marker still matches a cache
+            // built from the OLD formula's numbers.
+            if !formula_gate_fired && is_drive_cache_valid(&mg)? {
                 info!("[drives] Drive list cache is current; skipping rebuild on startup");
             } else {
                 rebuild_drive_list_cache(&mg).context("load: build drive cache")?;
@@ -1968,7 +1977,8 @@ fn insert_or_update_route(
             tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
             odometer_mi_start, odometer_mi_end,
             location_name_start, location_name_end,
-            fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early)
+            fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
+            ap_at_start)
          VALUES(
             ?1, ?2, ?3, ?4, ?5,
             NULL, NULL, ?6, ?7, ?8,
@@ -1982,7 +1992,7 @@ fn insert_or_update_route(
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
-            ?50, ?51, ?52, ?53)
+            ?50, ?51, ?52, ?53, ?54)
          ON CONFLICT(file) DO UPDATE SET
             date_dir            = excluded.date_dir,
             point_count         = excluded.point_count,
@@ -2035,7 +2045,8 @@ fn insert_or_update_route(
             fsd_pend_ms_end     = excluded.fsd_pend_ms_end,
             park_ms_start       = excluded.park_ms_start,
             fsd_at_end          = excluded.fsd_at_end,
-            fsd_accel_pushes_early = excluded.fsd_accel_pushes_early",
+            fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
+            ap_at_start         = excluded.ap_at_start",
         params![
             norm_file,
             &r.date,
@@ -2090,6 +2101,7 @@ fn insert_or_update_route(
             a.park_ms_start,
             a.fsd_at_end as i64,
             a.fsd_accel_pushes_early,
+            a.ap_at_start,
         ],
     )?;
     Ok(())
@@ -2276,7 +2288,8 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi,
                 odometer_mi_start, odometer_mi_end,
                 location_name_start, location_name_end,
-                fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early
+                fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early,
+                ap_at_start
          FROM routes
          ORDER BY file",
     )?;
@@ -2340,6 +2353,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 row.get::<_, Option<f64>>(40)?,
                 row.get::<_, Option<i64>>(41)?,
                 row.get::<_, Option<i64>>(42)?,
+                row.get::<_, Option<i64>>(43)?,
             ),
         ))
     })?;
@@ -2381,7 +2395,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
             (tire_fl_psi, tire_fr_psi, tire_rl_psi, tire_rr_psi),
             (odometer_mi_start, odometer_mi_end),
             (location_name_start, location_name_end),
-            (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early),
+            (fsd_pend_ms_end, park_ms_start, fsd_at_end, fsd_accel_pushes_early, ap_at_start),
         ) = r?;
 
         let gear_runs = decode_gear_runs(rb.as_deref())
@@ -2413,6 +2427,7 @@ fn select_all_route_summaries(conn: &Connection) -> Result<Vec<RouteSummary>> {
                 park_ms_start,
                 fsd_at_end: fsd_at_end.unwrap_or(0) != 0,
                 fsd_accel_pushes_early: fsd_accel_pushes_early.unwrap_or(0) as i32,
+                ap_at_start: ap_at_start.map(|v| v as i32),
                 start_lat,
                 start_lng: start_lon,
                 end_lat,
@@ -2850,6 +2865,134 @@ mod tests {
         assert_eq!(
             stats["fsd_distance_km"].as_f64(), Some(0.0),
             "imported drives must not feed FSD analytics: {stats}"
+        );
+    }
+
+    /// Like `add_boundary_clip` but with a custom base latitude so two
+    /// clips can sit a known gap apart for bridge-attribution tests.
+    fn add_boundary_clip_at(
+        store: &DriveStore,
+        file: &str,
+        ap: Vec<u8>,
+        gears: Vec<u8>,
+        base_lat: f64,
+    ) {
+        let n = 61;
+        let mut pts: Vec<GpsPoint> = Vec::with_capacity(n);
+        for i in 0..n {
+            pts.push([base_lat + (i as f64) * 0.00001, -122.4194]);
+        }
+        let speeds = vec![10.0f32; n];
+        let accel = vec![0.0f32; n];
+        store
+            .add_route(file, "2025-01-01", &pts, &gears, &ap, &speeds, &accel, 0, 61, &[])
+            .unwrap();
+    }
+
+    #[test]
+    fn fsd_seam_time_and_bridge_distance_attributed() {
+        use crate::extract::AUTOPILOT_FSD;
+        let store = DriveStore::open_memory().unwrap();
+        // Two all-FSD clips, 62s apart: a 2s wall-clock seam plus a ~55m
+        // GPS gap between clip A's end and clip B's start. Sentry-Drive's
+        // merged walk attributes both to FSD (next point is engaged);
+        // per-clip sums alone drop them.
+        add_boundary_clip_at(
+            &store, "2025-01-01/2025-01-01_10-00-00-front.mp4",
+            vec![AUTOPILOT_FSD; 61], vec![4; 61], 37.7749,
+        );
+        add_boundary_clip_at(
+            &store, "2025-01-01/2025-01-01_10-01-02-front.mp4",
+            vec![AUTOPILOT_FSD; 61], vec![4; 61], 37.7760,
+        );
+        let drives: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drives_json().unwrap()).unwrap();
+        let d = &drives[0];
+        let engaged = d["fsdEngagedMs"].as_i64().unwrap();
+        assert!(
+            (121_500..=122_500).contains(&engaged),
+            "2s seam must join the 2x60s of engaged time, got {engaged}: {d}"
+        );
+        let fsd_km = d["fsdDistanceKm"].as_f64().unwrap();
+        assert!(
+            fsd_km > 0.17,
+            "bridge segment (~55m) must count as FSD distance on top of ~133m in-clip, got {fsd_km}"
+        );
+    }
+
+    #[test]
+    fn analytics_avgs_use_sei_drive_denominator_and_sd_grades() {
+        use crate::extract::{AUTOPILOT_FSD, AUTOPILOT_OFF};
+        let store = DriveStore::open_memory().unwrap();
+        // Drive 1: FSD for the first 55s, then disengaged (1 disengagement).
+        let ap1: Vec<u8> = (0..61)
+            .map(|i| if i < 55 { AUTOPILOT_FSD } else { AUTOPILOT_OFF })
+            .collect();
+        add_boundary_clip(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4", ap1, vec![4; 61]);
+        // Drive 2 (3h later): manual the whole way — still an SEI drive.
+        add_boundary_clip(
+            &store, "2025-01-01/2025-01-01_13-00-00-front.mp4",
+            vec![AUTOPILOT_OFF; 61], vec![4; 61],
+        );
+
+        let analytics = store
+            .with_route_summaries(|s| {
+                crate::grouper::fsd_analytics_from_summaries_for_period(s, "all")
+            })
+            .unwrap();
+        // Sentry-Drive divides the averages by ALL SEI drives in the
+        // period, not just drives where FSD engaged: 1 disengagement
+        // over 2 drives = 0.5.
+        assert_eq!(
+            analytics.avg_disengagements_per_drive, 0.5,
+            "avg must use the SEI drive count as denominator"
+        );
+        // ~45% FSD share lands in Sentry-Drive's "Okay" band
+        // (>=90 Great, >=70 Good, >=40 Okay, else Bad).
+        assert!(
+            (40.0..70.0).contains(&analytics.fsd_percent),
+            "fixture should land in the Okay band, got {}",
+            analytics.fsd_percent
+        );
+        assert_eq!(analytics.fsd_grade, "Okay");
+    }
+
+    #[test]
+    fn aggregate_formula_gate_invalidates_drive_caches() {
+        // The formula gate recomputes every routes row from the BLOBs,
+        // but neither the reset nor the backfill bumps updated_at — so
+        // the drive caches' validity marker (algo version + row counts +
+        // max updated_at) still matches and a stale cache would survive
+        // the recompute. The gate must force a rebuild itself.
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        store
+            .add_route("2025-01-01/2025-01-01_10-00-00-front.mp4", "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+            .unwrap();
+        // Plant an absurd stored distance and bake it INTO the caches —
+        // this is the old-formula world the gate exists to replace.
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE routes SET distance_m = 999000.0", []).unwrap();
+        }
+        store.drive_cache_dirty.store(true, Ordering::Release);
+        let stale: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drive_stats_json().unwrap()).unwrap();
+        assert!(
+            stale["total_distance_km"].as_f64().unwrap() > 900.0,
+            "precondition: cache must hold the planted value: {stale}"
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            meta_set(&conn, "aggregate_formula_version", "stale-test").unwrap();
+        }
+        store.load().unwrap();
+        let stats: serde_json::Value =
+            serde_json::from_str(&store.get_cached_drive_stats_json().unwrap()).unwrap();
+        let km = stats["total_distance_km"].as_f64().unwrap();
+        assert!(
+            km < 10.0,
+            "stats cache must reflect the recomputed aggregates, not the stale 999km: {stats}"
         );
     }
 

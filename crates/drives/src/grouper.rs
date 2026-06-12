@@ -1380,13 +1380,16 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
         0.0
     };
 
-    // FSD grade
+    // FSD grade — same bands and labels as Sentry-Drive's fsdScoreLabel
+    // so the two apps never disagree on the same score.
     let fsd_grade = if fsd_percent >= 90.0 {
         "Great"
-    } else if fsd_percent >= 60.0 {
+    } else if fsd_percent >= 70.0 {
         "Good"
+    } else if fsd_percent >= 40.0 {
+        "Okay"
     } else {
-        "Needs Improvement"
+        "Bad"
     };
 
     // Streak: consecutive days with FSD usage counting backwards from today
@@ -1414,14 +1417,17 @@ fn build_fsd_analytics(summaries: &[DriveSummary], period: &str) -> FsdAnalytics
         format!("{}m", mins)
     };
 
-    // Avg per drive
-    let avg_disengagements = if fsd_sessions > 0 {
-        round2(disengagements as f64 / fsd_sessions as f64)
+    // Avg per drive — denominator is EVERY SEI drive in the period, not
+    // just FSD sessions, matching Sentry-Drive ("avg disengagements per
+    // drive", where a manual drive contributes a zero).
+    let drive_count = period_drives.len();
+    let avg_disengagements = if drive_count > 0 {
+        round2(disengagements as f64 / drive_count as f64)
     } else {
         0.0
     };
-    let avg_accel_pushes = if fsd_sessions > 0 {
-        round2(accel_pushes as f64 / fsd_sessions as f64)
+    let avg_accel_pushes = if drive_count > 0 {
+        round2(accel_pushes as f64 / drive_count as f64)
     } else {
         0.0
     };
@@ -1976,24 +1982,46 @@ fn split_summary_by_gear_state_legacy<'a>(
 /// contribute proportionally to two drives instead of dumping the full
 /// distance into one. The gap term matches Sentry-Drive's merged-point
 /// walk behavior and is especially important for sparse Tessie clips.
-fn distance_from_summary_clips(clips: &[SubClipSummary]) -> f64 {
+/// Output of [`distance_from_summary_clips`]: the drive's total distance
+/// plus how much of the inter-clip bridge distance belongs to each
+/// autopilot mode (attributed by the incoming clip's `ap_at_start`,
+/// matching Sentry-Drive's merged walk where the crossing segment lands
+/// on the next point's state).
+#[derive(Default)]
+struct SummaryDistances {
+    total_m: f64,
+    fsd_bridge_m: f64,
+    autosteer_bridge_m: f64,
+    tacc_bridge_m: f64,
+}
+
+fn distance_from_summary_clips(clips: &[SubClipSummary]) -> SummaryDistances {
     fn is_null_island_pair(lat: f64, lng: f64) -> bool {
         lat.abs() < 1.0 && lng.abs() < 1.0
     }
 
-    let mut total_dist_m = 0.0;
+    let mut out = SummaryDistances::default();
     let mut prev_end: Option<(f64, f64)> = None;
 
     for clip in clips {
         let a = &clip.summary.aggregates;
-        total_dist_m += a.distance_m * clip.fraction;
+        out.total_m += a.distance_m * clip.fraction;
 
         if let (Some((prev_lat, prev_lng)), Some(cur_lat), Some(cur_lng)) =
             (prev_end, a.start_lat, a.start_lng)
         {
             if !is_null_island_pair(prev_lat, prev_lng) && !is_null_island_pair(cur_lat, cur_lng)
             {
-                total_dist_m += calc::geodesic_m(prev_lat, prev_lng, cur_lat, cur_lng);
+                let gap_m = calc::geodesic_m(prev_lat, prev_lng, cur_lat, cur_lng);
+                out.total_m += gap_m;
+                match a.ap_at_start {
+                    Some(m) if m == AUTOPILOT_FSD as i32 => out.fsd_bridge_m += gap_m,
+                    Some(m) if m == AUTOPILOT_AUTOSTEER as i32 => {
+                        out.autosteer_bridge_m += gap_m
+                    }
+                    Some(m) if m == AUTOPILOT_TACC as i32 => out.tacc_bridge_m += gap_m,
+                    _ => {}
+                }
             }
         }
 
@@ -2006,7 +2034,7 @@ fn distance_from_summary_clips(clips: &[SubClipSummary]) -> f64 {
         };
     }
 
-    total_dist_m
+    out
 }
 
 /// Build a single `DriveSummary` from sub-clips. Per-clip time-
@@ -2040,7 +2068,8 @@ fn build_summary_from_aggregates(
     let end_time = last_clip.timestamp + chrono::Duration::milliseconds(last_segment_len_ms);
     let duration_ms = (end_time - start_time).num_milliseconds();
 
-    let total_dist_m: f64 = distance_from_summary_clips(clips);
+    let dists = distance_from_summary_clips(clips);
+    let total_dist_m: f64 = dists.total_m;
     let mut max_speed_mps: f64 = 0.0;
     let mut speed_sum: f64 = 0.0;
     let mut speed_count: f64 = 0.0;
@@ -2075,6 +2104,12 @@ fn build_summary_from_aggregates(
     // boundary — gates `fsd_accel_pushes_early` (pushes inside a
     // continuation clip's start-anchored grace window are real).
     let mut prev_fsd_at_end = false;
+    // Wall-clock end of the previous sub-clip when it ended at a whole-
+    // clip boundary: the seam between it and the next clip is real drive
+    // time that no per-clip aggregate covers. Sentry-Drive's merged walk
+    // attributes that dt to the next point's autopilot state; we do the
+    // same via the incoming clip's `ap_at_start`.
+    let mut prev_end_ts: Option<chrono::NaiveDateTime> = None;
 
     for clip in clips {
         let a = &clip.summary.aggregates;
@@ -2112,11 +2147,36 @@ fn build_summary_from_aggregates(
                 if prev_fsd_at_end {
                     fsd_accel_pushes += a.fsd_accel_pushes_early;
                 }
+                // Seam wall-time between the previous clip's end and this
+                // clip's start, attributed to this clip's starting mode.
+                if let Some(pe) = prev_end_ts {
+                    let seam_ms = (clip.timestamp - pe).num_milliseconds().max(0) as f64;
+                    match a.ap_at_start {
+                        Some(m) if m == AUTOPILOT_FSD as i32 => fsd_engaged_ms += seam_ms,
+                        Some(m) if m == AUTOPILOT_AUTOSTEER as i32 => {
+                            autosteer_engaged_ms += seam_ms
+                        }
+                        Some(m) if m == AUTOPILOT_TACC as i32 => tacc_engaged_ms += seam_ms,
+                        _ => {}
+                    }
+                }
             }
         }
         let whole_clip_end = clip.end_frame == clip.total_frames;
         pend_prev_ms = if whole_clip_end { a.fsd_pend_ms_end } else { None };
         prev_fsd_at_end = whole_clip_end && a.fsd_at_end;
+        prev_end_ts = if whole_clip_end {
+            let sub_len_ms = if clip.total_frames > 0 {
+                ((clip.end_frame - clip.start_frame) as f64 * 60_000.0
+                    / clip.total_frames as f64)
+                    .round() as i64
+            } else {
+                60_000
+            };
+            Some(clip.timestamp + chrono::Duration::milliseconds(sub_len_ms))
+        } else {
+            None
+        };
 
         if start_point.is_none() {
             if let (Some(lat), Some(lng)) = (a.start_lat, a.start_lng) {
@@ -2134,6 +2194,14 @@ fn build_summary_from_aggregates(
     if pend_prev_ms.is_some() {
         fsd_disengagements += 1;
     }
+
+    // Inter-clip bridge distance per autopilot mode (already inside
+    // total_dist_m): keeps per-mode percentages consistent with the
+    // total they're divided by, and with Sentry-Drive's merged walk.
+    fsd_dist_m += dists.fsd_bridge_m;
+    autosteer_dist_m += dists.autosteer_bridge_m;
+    tacc_dist_m += dists.tacc_bridge_m;
+    assisted_dist_m += dists.fsd_bridge_m + dists.autosteer_bridge_m + dists.tacc_bridge_m;
 
     let avg_speed_mps = if speed_count > 0.0 {
         speed_sum / speed_count
@@ -2528,7 +2596,7 @@ mod tests {
             SubClipSummary::whole(TimedSummary { summary: &s2, timestamp: ts + chrono::Duration::minutes(1) }),
         ];
 
-        let d = distance_from_summary_clips(&clips);
+        let d = distance_from_summary_clips(&clips).total_m;
         let gap = calc::geodesic_m(37.0009, -122.0000, 37.0020, -122.0000);
         assert!(
             (d - (300.0 + gap)).abs() < 0.1,
@@ -2598,9 +2666,9 @@ mod tests {
         // drive 3: 15/60 = 0.25  → 150m
         // (Sub-clip totals = 50/60 of clip's distance = 500m, by design
         // — the 10/60 parked portion is dropped on the cutting-room floor.)
-        let d1 = distance_from_summary_clips(&groups[0]);
-        let d2 = distance_from_summary_clips(&groups[1]);
-        let d3 = distance_from_summary_clips(&groups[2]);
+        let d1 = distance_from_summary_clips(&groups[0]).total_m;
+        let d2 = distance_from_summary_clips(&groups[1]).total_m;
+        let d3 = distance_from_summary_clips(&groups[2]).total_m;
         assert!((d1 - 200.0).abs() < 0.5, "drive 1 distance: {}", d1);
         assert!((d2 - 150.0).abs() < 0.5, "drive 2 distance: {}", d2);
         assert!((d3 - 150.0).abs() < 0.5, "drive 3 distance: {}", d3);
@@ -2619,7 +2687,7 @@ mod tests {
         let groups = group_summary_clips(&summaries);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].len(), 1);
-        assert!((distance_from_summary_clips(&groups[0]) - 1000.0).abs() < 0.5);
+        assert!((distance_from_summary_clips(&groups[0]).total_m - 1000.0).abs() < 0.5);
     }
 
     /// Sanity: a fully-parked clip closes the current drive and does not

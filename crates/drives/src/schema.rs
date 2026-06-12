@@ -337,6 +337,7 @@ pub const V15_ROUTE_BOUNDARY_COLUMNS: &[(&str, &str)] = &[
     ("park_ms_start", "REAL"),
     ("fsd_at_end", "INTEGER"),
     ("fsd_accel_pushes_early", "INTEGER"),
+    ("ap_at_start", "INTEGER"),
 ];
 
 /// v9 rollups on `routes`. Odometer start/end let the UI show a

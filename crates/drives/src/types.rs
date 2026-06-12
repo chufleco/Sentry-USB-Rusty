@@ -497,6 +497,12 @@ pub struct RouteAggregates {
     /// separately and the grouper counts them only when the previous clip
     /// ended FSD-engaged.
     pub fsd_accel_pushes_early: i32,
+    /// Autopilot mode on the clip's FIRST sample (AUTOPILOT_* constant),
+    /// `None` when the clip has no AP data. The grouper attributes the
+    /// inter-clip bridge segment and seam wall-time to this mode —
+    /// Sentry-Drive's merged point walk does the same implicitly (the
+    /// crossing segment's dt/distance lands on the next point's state).
+    pub ap_at_start: Option<i32>,
     /// Start/End points are the first/last non-null-island Points on the
     /// clip. `None` when the clip has no valid points — explicit Option
     /// rather than overloading (0, 0) as a sentinel.
