@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react"
+import { useState, useEffect, useRef } from "react"
 import { Cog, Thermometer, MapPin, Search, Battery, AlertTriangle } from "lucide-react"
 import type { StepProps } from "../SetupWizard"
 import { SizeInput } from "../SizeInput"
@@ -155,19 +155,32 @@ function TempInput({
   placeholder: string
   useFahrenheit: boolean
 }) {
-  // Convert from milli-°C stored value to display value
-  const raw = data[field] ?? ""
-  let displayVal = raw
-  // If value looks like milli-°C (>=1000), convert for display
-  if (raw && parseInt(raw) >= 1000) {
-    const celsius = parseInt(raw) / 1000
-    displayVal = useFahrenheit
-      ? ((celsius * 9 / 5) + 32).toFixed(1)
-      : celsius.toFixed(1)
-  } else if (raw && useFahrenheit && parseFloat(raw) > 0) {
-    // Already in °C display format, convert to °F
-    displayVal = ((parseFloat(raw) * 9 / 5) + 32).toFixed(1)
+  // Render the stored value (°C, or legacy milli-°C when >= 1000) as a display
+  // string in the active unit.
+  const toDisplay = (raw: string): string => {
+    if (!raw) return ""
+    let celsius = parseFloat(raw)
+    if (isNaN(celsius)) return ""
+    if (Math.abs(parseInt(raw)) >= 1000) celsius = parseInt(raw) / 1000
+    return useFahrenheit ? ((celsius * 9 / 5) + 32).toFixed(1) : celsius.toFixed(1)
   }
+
+  // What the user is actually typing. Keeping this in local state is the fix:
+  // previously the input's value was re-derived from the stored °C on every
+  // render, so each keystroke (which writes a converted °C back to the store)
+  // immediately re-rendered the field to that converted value — typing "7" in
+  // °F stored -13.9 °C and the box jumped to "-13.9", making it impossible to
+  // type a temperature. Now the box shows exactly what's typed; we only push
+  // the converted °C to the store, and re-derive the text on a unit switch.
+  const [text, setText] = useState<string>(() => toDisplay(data[field] ?? ""))
+  const lastUnit = useRef(useFahrenheit)
+  useEffect(() => {
+    if (lastUnit.current !== useFahrenheit) {
+      lastUnit.current = useFahrenheit
+      setText(toDisplay(data[field] ?? ""))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useFahrenheit])
 
   const unit = useFahrenheit ? "°F" : "°C"
 
@@ -178,18 +191,23 @@ function TempInput({
         <input
           type="text"
           inputMode="decimal"
-          value={displayVal}
+          value={text}
           onChange={(e) => {
-            const v = e.target.value.replace(/[^0-9.]/g, "")
-            // Store as °C (will be converted to milli-°C on save)
-            if (useFahrenheit && v) {
-              const f = parseFloat(v)
-              if (!isNaN(f)) {
-                onChange(field, ((f - 32) * 5 / 9).toFixed(1))
-                return
-              }
+            // Allow digits, a single decimal point, and a leading minus.
+            const v = e.target.value.replace(/[^0-9.-]/g, "")
+            setText(v)
+            // Partial inputs ("", "-", ".") aren't a number yet — clear the
+            // stored value but keep the in-progress text on screen.
+            if (v === "" || v === "-" || v === "." || v === "-.") {
+              onChange(field, "")
+              return
             }
-            onChange(field, v)
+            const num = parseFloat(v)
+            if (!isNaN(num)) {
+              // Store as °C (converted to milli-°C on save).
+              const celsius = useFahrenheit ? ((num - 32) * 5 / 9) : num
+              onChange(field, celsius.toFixed(1))
+            }
           }}
           placeholder={placeholder}
           className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 pr-10 text-sm text-slate-100 placeholder-slate-600 outline-none transition focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/25"
