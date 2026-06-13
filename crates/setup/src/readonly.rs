@@ -24,6 +24,19 @@ pub async fn make_readonly(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         return Ok(false);
     }
 
+    // Non-Pi boards (U-Boot/extlinux): skip read-only root. The kernel-side
+    // half of this phase (adding `ro fsck.mode=auto` to the boot args) lives
+    // behind `env.cmdline_path`, which is None on these boards — so only the
+    // fstab side (root line gets `,ro`) would apply, leaving fstab saying
+    // read-only while U-Boot's bootargs still say `rw`, plus a /var/* tmpfs
+    // contract nothing wires up. That half-applied state wedges boot. RO root
+    // is optional hardening and never required for the USB gadget, so skip it
+    // here until an extlinux-aware RO path exists. (No-op on Pis: guard false.)
+    if !env.pi_model.is_raspberry_pi() {
+        emitter.progress("Non-Pi board: skipping read-only root (no extlinux ro/initramfs contract). Set SKIP_READONLY to silence.");
+        return Ok(false);
+    }
+
     // Skip if root is already read-only and cmdline.txt already has `ro`.
     if already_readonly(env) {
         return Ok(false);
