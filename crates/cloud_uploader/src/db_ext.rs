@@ -148,6 +148,26 @@ pub fn backfill_ble_reupload(store: &DriveStore) -> Result<i64> {
     })
 }
 
+/// Clear `cloud_uploaded_at` for EVERY already-uploaded route so the next
+/// sweep re-encrypts and re-uploads the entire library. Used to repopulate
+/// the cloud after the user deletes their drive history server-side (the Pi
+/// otherwise still believes every route is uploaded and sends nothing).
+/// Unlike [`backfill_ble_reupload`] this is not gated on BLE telemetry, so
+/// imported (Tessie/Teslascope) and BLE-less native routes re-upload too.
+/// Permanent-skip rows (`= -1`, rejected by the cloud for size) are left
+/// alone — re-sending them just fails again. Returns the count queued.
+pub fn resync_all_reupload(store: &DriveStore) -> Result<i64> {
+    store.with_locked_conn(|conn| -> Result<_> {
+        let changed = conn.execute(
+            "UPDATE routes SET cloud_uploaded_at = NULL \
+             WHERE cloud_uploaded_at IS NOT NULL \
+               AND cloud_uploaded_at > 0",
+            [],
+        )?;
+        Ok(changed as i64)
+    })
+}
+
 pub fn pending_count(store: &DriveStore) -> i64 {
     store
         .with_locked_conn(|conn| {
@@ -215,4 +235,63 @@ pub fn pending_queue(store: &DriveStore, limit: i64) -> Result<Vec<QueueEntry>> 
         }
         Ok(out)
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sentryusb_drives::types::GpsPoint;
+
+    fn set_cloud_uploaded_at(store: &DriveStore, file: &str, val: Option<i64>) {
+        store
+            .with_locked_conn(|conn| -> Result<_> {
+                conn.execute(
+                    "UPDATE routes SET cloud_uploaded_at = ?1 WHERE file = ?2",
+                    params![val, file],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn resync_all_reupload_resets_every_uploaded_route_but_not_skips() {
+        let store = DriveStore::open_memory().unwrap();
+        let pts: Vec<GpsPoint> = vec![[37.7749, -122.4194], [37.7760, -122.4180]];
+        let add = |f: &str| {
+            store
+                .add_route(f, "2025-01-01", &pts, &[4, 4], &[1, 1], &[20.0, 21.0], &[0.0, 0.0], 0, 2, &[])
+                .unwrap();
+        };
+        // A native uploaded route, an imported uploaded route (no BLE — the
+        // case backfill_ble_reupload misses), a still-pending route, and a
+        // permanent-skip sentinel.
+        add("2025-01-01/2025-01-01_10-00-00-front.mp4");
+        add("tessie/2025-01-02/2025-01-02_09-00-00-front-tessie-1.mp4");
+        add("2025-01-03/2025-01-03_08-00-00-front.mp4");
+        add("2025-01-04/2025-01-04_07-00-00-front.mp4");
+        set_cloud_uploaded_at(&store, "2025-01-01/2025-01-01_10-00-00-front.mp4", Some(1_700_000_000));
+        set_cloud_uploaded_at(&store, "tessie/2025-01-02/2025-01-02_09-00-00-front-tessie-1.mp4", Some(1_700_000_500));
+        // 2025-01-03 stays NULL (pending).
+        set_cloud_uploaded_at(&store, "2025-01-04/2025-01-04_07-00-00-front.mp4", Some(PERMANENT_SKIP_SENTINEL));
+
+        let queued = resync_all_reupload(&store).unwrap();
+        assert_eq!(queued, 2, "both uploaded routes (native + imported) must reset");
+
+        // Everything except the skip sentinel is now pending.
+        assert_eq!(pending_count(&store), 3);
+        let skip_still_set = store
+            .with_locked_conn(|conn| -> Result<Option<i64>> {
+                Ok(conn.query_row(
+                    "SELECT cloud_uploaded_at FROM routes WHERE file = '2025-01-04/2025-01-04_07-00-00-front.mp4'",
+                    [],
+                    |r| r.get::<_, Option<i64>>(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(skip_still_set, Some(PERMANENT_SKIP_SENTINEL), "skip sentinel must survive");
+
+        // Idempotent: a second call resets nothing (all already NULL/-1).
+        assert_eq!(resync_all_reupload(&store).unwrap(), 0);
+    }
 }

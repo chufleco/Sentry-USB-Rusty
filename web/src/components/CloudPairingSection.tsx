@@ -31,6 +31,9 @@ export default function CloudPairingSection({ compact = false }: Props) {
   const [error, setError] = useState<string | null>(null)
   const [confirmUnpair, setConfirmUnpair] = useState(false)
   const [retrying, setRetrying] = useState(false)
+  const [confirmResync, setConfirmResync] = useState(false)
+  const [resyncing, setResyncing] = useState(false)
+  const [resyncNote, setResyncNote] = useState<string | null>(null)
 
   const sessionStartRef = useRef<{ pending: number; uploaded: number } | null>(null)
 
@@ -135,6 +138,33 @@ export default function CloudPairingSection({ compact = false }: Props) {
       // completes async and the cloud_upload WS event will refetch
       // status when it lands.
       setTimeout(() => setRetrying(false), 800)
+    }
+  }
+
+  // Full re-upload: clears the Pi's upload bookkeeping so the next sweep
+  // re-sends every route. For repopulating the cloud after deleting drive
+  // history server-side. Heavy + outward-facing (re-uploads the whole
+  // library), so it's confirm-gated.
+  async function resyncAll() {
+    if (resyncing) return
+    setResyncing(true)
+    setError(null)
+    setResyncNote(null)
+    try {
+      const res = await fetch("/api/cloud/resync-all", { method: "POST" })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      const body = (await res.json().catch(() => ({}))) as { queued?: number }
+      const n = body.queued ?? 0
+      setResyncNote(
+        n > 0
+          ? `Queued ${n.toLocaleString()} route${n === 1 ? "" : "s"} for re-upload.`
+          : "Nothing to re-upload.",
+      )
+      setConfirmResync(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "re-upload failed")
+    } finally {
+      setResyncing(false)
     }
   }
 
@@ -312,6 +342,46 @@ export default function CloudPairingSection({ compact = false }: Props) {
                 </button>
               </div>
             )}
+
+            {confirmResync ? (
+              <div className="flex flex-col gap-2 rounded-lg border border-sky-500/30 bg-sky-500/10 p-2.5">
+                <p className="text-[11px] text-sky-100">
+                  Re-upload <span className="font-semibold">all</span> drives to the cloud?
+                  This re-sends your entire library (including imported drives) on the next
+                  sweep — use it to repopulate the cloud after deleting your history there.
+                  It can take a while and is safe to leave running.
+                </p>
+                <div className="flex gap-2">
+                  <button
+                    onClick={resyncAll}
+                    disabled={resyncing}
+                    className="flex flex-1 items-center justify-center gap-1.5 rounded-md bg-sky-500 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-sky-600 disabled:opacity-50"
+                  >
+                    {resyncing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Upload className="h-3 w-3" />}
+                    {resyncing ? "Queuing…" : "Re-upload all"}
+                  </button>
+                  <button
+                    onClick={() => setConfirmResync(false)}
+                    disabled={resyncing}
+                    className="flex-1 rounded-md border border-white/10 bg-white/5 px-3 py-1.5 text-[11px] text-slate-300 hover:bg-white/10 disabled:opacity-50"
+                  >
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => {
+                  setResyncNote(null)
+                  setConfirmResync(true)
+                }}
+                className="flex items-center gap-1.5 rounded-md border border-white/10 bg-white/5 px-2.5 py-1.5 text-[11px] font-medium text-slate-300 transition-colors hover:border-sky-500/30 hover:bg-sky-500/10 hover:text-sky-200"
+              >
+                <Upload className="h-3 w-3" />
+                Re-upload all to cloud
+              </button>
+            )}
+            {resyncNote && <p className="text-[11px] text-sky-300">{resyncNote}</p>}
 
             {confirmUnpair ? (
               <div className="flex flex-col gap-2 rounded-lg border border-red-500/30 bg-red-500/10 p-2.5">

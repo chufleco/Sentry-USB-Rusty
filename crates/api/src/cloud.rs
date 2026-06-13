@@ -116,6 +116,27 @@ pub async fn backfill_ble(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// POST /api/cloud/resync-all — reset upload state on EVERY route so the
+/// next sweep re-uploads the whole library. Used to repopulate the cloud
+/// after the user deletes their drive history server-side; unlike
+/// backfill-ble this also re-sends imported and BLE-less routes. Returns
+/// the count queued and nudges the sweep loop.
+pub async fn resync_all(State(state): State<AppState>) -> impl IntoResponse {
+    match state.cloud.uploader.resync_all_reupload() {
+        Ok(queued) => {
+            if queued > 0 {
+                state.cloud.uploader.nudge();
+            }
+            (StatusCode::OK, Json(json!({ "ok": true, "queued": queued }))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize, Default)]
 pub struct QueueQuery {
 
