@@ -777,13 +777,40 @@ async fn disk_usage(path: &str) -> i64 {
 
 /// Get SBC model from device tree.
 pub fn get_sbc_model() -> String {
-    for p in &["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"] {
-        if let Ok(data) = std::fs::read(p) {
-            return String::from_utf8_lossy(&data)
+    let dt_model = ["/proc/device-tree/model", "/sys/firmware/devicetree/base/model"]
+        .iter()
+        .find_map(|p| std::fs::read(p).ok())
+        .map(|data| {
+            String::from_utf8_lossy(&data)
                 .trim_end_matches('\0')
                 .trim()
-                .to_string();
+                .to_string()
+        })
+        .unwrap_or_default();
+
+    // The device-tree `model` is a friendly string on a Raspberry Pi
+    // ("Raspberry Pi 4 Model B Rev 1.4"), but some vendor boards put only the
+    // bare SoC codename there — e.g. the Orange Pi Zero 3W (Allwinner A733)
+    // reports "sun60iw2". When the DT model is a single token with no spaces
+    // (a codename, not a product name), prefer the distro's BOARD_NAME, which
+    // Armbian / Orange Pi images carry verbatim (e.g. "Orange Pi Zero 3W").
+    if !dt_model.is_empty() && dt_model.contains(' ') {
+        return dt_model;
+    }
+    for rel in &["/etc/orangepi-release", "/etc/armbian-release"] {
+        if let Ok(txt) = std::fs::read_to_string(rel) {
+            if let Some(name) = txt.lines().find_map(|l| {
+                l.strip_prefix("BOARD_NAME=")
+                    .map(|v| v.trim().trim_matches('"').to_string())
+            }) {
+                if !name.is_empty() {
+                    return name;
+                }
+            }
         }
+    }
+    if !dt_model.is_empty() {
+        return dt_model;
     }
     "unknown".to_string()
 }
