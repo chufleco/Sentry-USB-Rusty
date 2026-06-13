@@ -1,7 +1,9 @@
 //! Partition management — replaces `create-backingfiles-partition.sh`.
 //!
-//! Handles detecting existing partitions, creating new backingfiles (XFS) and
-//! mutable (ext4) partitions, and updating /etc/fstab.
+//! Handles detecting existing partitions, creating new backingfiles (XFS or,
+//! on kernels without an XFS driver, ext4) and mutable (ext4) partitions, and
+//! updating /etc/fstab. The backing filesystem is chosen at format time by
+//! [`crate::verify::probe_backing_fs`].
 
 use std::path::Path;
 use std::time::Duration;
@@ -10,7 +12,18 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::verify::{probe_backing_fs, BackingFs};
 use crate::SetupEmitter;
+
+/// Format `dev` as the backingfiles partition using the probed filesystem.
+async fn format_backingfiles(fs: BackingFs, dev: &str, timeout: Duration) -> Result<()> {
+    let args = fs.mkfs_args(dev);
+    let argv: Vec<&str> = args.iter().map(String::as_str).collect();
+    sentryusb_shell::run_with_timeout(timeout, fs.mkfs_bin(), &argv)
+        .await
+        .with_context(|| format!("{} (backingfiles) failed", fs.mkfs_bin()))?;
+    Ok(())
+}
 
 const BACKINGFILES_MOUNT: &str = "/backingfiles";
 const MUTABLE_MOUNT: &str = "/mutable";
@@ -86,10 +99,12 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
 
     let bf_ok = check_label_matches(&p2, "backingfiles").await;
     let mut_ok = check_label_matches(&p1, "mutable").await;
-    let bf_xfs = check_fstype(&p2, "xfs").await;
+    // backingfiles may be XFS (reflink or plain) or ext4 (kernels without an
+    // XFS driver) — accept either so a re-run never reformats a valid drive.
+    let bf_fs_ok = check_fstype(&p2, "xfs").await || check_fstype(&p2, "ext4").await;
     let mut_ext4 = check_fstype(&p1, "ext4").await;
 
-    let already_partitioned = bf_ok && mut_ok && bf_xfs && mut_ext4;
+    let already_partitioned = bf_ok && mut_ok && bf_fs_ok && mut_ext4;
 
     // Idempotency: if the partitions already have the right labels and
     // filesystems, KEEP them and just (re)write fstab. Fstab is output,
@@ -100,7 +115,7 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     // (e.g. ARCHIVE_SERVER) hits this branch and never loses data.
     if already_partitioned {
         emitter.progress(&format!(
-            "Existing backingfiles (xfs) and mutable (ext4) partitions found on {}. Keeping them.",
+            "Existing backingfiles and mutable (ext4) partitions found on {}. Keeping them.",
             data_drive
         ));
         // Quiesce anything that might be holding the partitions open,
@@ -144,14 +159,14 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
             "Refusing to wipe {}: setup previously completed on this device, \
              but the partition labels or filesystem types are not what we \
              expected ({} backingfiles label match, {} mutable label match, \
-             {} backingfiles is xfs, {} mutable is ext4). The drive contents \
+             {} backingfiles is xfs/ext4, {} mutable is ext4). The drive contents \
              have NOT been modified. If the drive really needs to be \
              reformatted, delete /sentryusb/SENTRYUSB_SETUP_FINISHED and \
              re-run setup. Otherwise, reboot to let udev resettle and try again.",
             data_drive,
             if bf_ok { "✓" } else { "✗" },
             if mut_ok { "✓" } else { "✗" },
-            if bf_xfs { "✓" } else { "✗" },
+            if bf_fs_ok { "✓" } else { "✗" },
             if mut_ext4 { "✓" } else { "✗" },
         );
     }
@@ -196,10 +211,13 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
     sentryusb_shell::run_with_timeout(op_timeout, "mkfs.ext4",
         &["-F", "-L", "mutable", &p1]).await.context("mkfs.ext4 failed")?;
 
-    emitter.progress(&format!("Formatting backingfiles partition (xfs) on {}...", p2));
-    // -K: skip the default full-device TRIM (slow on large media, useless on a fresh partition).
-    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
-        &["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", &p2]).await.context("mkfs.xfs failed")?;
+    // Pick the backing filesystem from what THIS kernel can mount: reflink XFS
+    // (COW snapshots) → plain XFS → ext4 (for kernels with no XFS driver, e.g.
+    // Allwinner A733). Snapshots fall back to full copies via `cp --reflink=auto`
+    // in usb_gadget/snapshot.rs when reflink isn't available.
+    let backing_fs = probe_backing_fs(emitter).await;
+    emitter.progress(&format!("Formatting backingfiles partition ({}) on {}...", backing_fs.fstype(), p2));
+    format_backingfiles(backing_fs, &p2, op_timeout).await?;
 
     emitter.progress("Partition formatting complete.");
 
@@ -340,10 +358,10 @@ pub async fn setup_sd_card(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
     // useless on a fresh partition anyway. Bound the format with an
     // explicit timeout so a wedged card can't hang the wizard.
     let op_timeout = Duration::from_secs(120);
-    emitter.progress(&format!("Formatting backingfiles (xfs) on {}...", bf_dev));
-    sentryusb_shell::run_with_timeout(op_timeout, "mkfs.xfs",
-        &["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", &bf_dev]).await
-        .context("mkfs.xfs failed")?;
+    // Same kernel-aware filesystem cascade as the external-USB path above.
+    let backing_fs = probe_backing_fs(emitter).await;
+    emitter.progress(&format!("Formatting backingfiles ({}) on {}...", backing_fs.fstype(), bf_dev));
+    format_backingfiles(backing_fs, &bf_dev, op_timeout).await?;
 
     emitter.progress(&format!("Formatting mutable (ext4) on {}...", mut_dev));
     sentryusb_shell::run_with_timeout(op_timeout,
@@ -578,8 +596,17 @@ async fn update_fstab() -> Result<()> {
     let mut additions = String::new();
 
     if !fstab.contains("LABEL=backingfiles") {
+        // The backing partition is xfs on most kernels but ext4 where there's
+        // no XFS driver — read the live filesystem type so fstab matches what
+        // was actually created. `noatime` is valid for both. Default to xfs if
+        // blkid can't resolve the label yet.
+        let backing_fstype = if check_fstype("/dev/disk/by-label/backingfiles", "ext4").await {
+            "ext4"
+        } else {
+            "xfs"
+        };
         additions.push_str(&format!(
-            "LABEL=backingfiles {} xfs auto,rw,noatime,nofail 0 2\n", BACKINGFILES_MOUNT
+            "LABEL=backingfiles {} {} auto,rw,noatime,nofail 0 2\n", BACKINGFILES_MOUNT, backing_fstype
         ));
     }
     if !fstab.contains("LABEL=mutable") {

@@ -133,81 +133,138 @@ fn check_udc() -> Result<()> {
     Ok(())
 }
 
-async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
-    emitter.progress("Checking XFS support");
+/// Filesystem chosen for the backing-files partition (where the disk-image
+/// files and snapshots live). Picked by [`probe_backing_fs`] from what the
+/// running kernel can actually mount.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BackingFs {
+    /// XFS with reflink — copy-on-write snapshots (fastest, least disk use).
+    XfsReflink,
+    /// XFS without reflink/bigtime/inobtcount — broad kernel compat, snapshots
+    /// become full copies.
+    XfsPlain,
+    /// ext4 — fallback for kernels with no XFS driver at all (e.g. the
+    /// Allwinner A733 BSP kernel). Snapshots become full copies.
+    Ext4,
+}
 
-    // Install xfsprogs if the mkfs binary is missing. This is the slow
-    // step on a fresh Pi OS image — 30-60s for apt-get to fetch +
-    // install — so we log before and after to keep the UI from looking
-    // hung. Subsequent setup runs skip this entirely because the
-    // binary is already on disk.
+impl BackingFs {
+    /// blkid/fstab filesystem type string.
+    pub fn fstype(self) -> &'static str {
+        match self {
+            BackingFs::Ext4 => "ext4",
+            _ => "xfs",
+        }
+    }
+
+    /// mkfs binary used to format this filesystem.
+    pub fn mkfs_bin(self) -> &'static str {
+        match self {
+            BackingFs::Ext4 => "mkfs.ext4",
+            _ => "mkfs.xfs",
+        }
+    }
+
+    /// mkfs args to format `dev` (a block device or file) with the
+    /// `backingfiles` label. `-K`/`-f` skip the slow full-device TRIM and
+    /// force-overwrite an existing signature.
+    pub fn mkfs_args(self, dev: &str) -> Vec<String> {
+        let v: Vec<&str> = match self {
+            BackingFs::XfsReflink => vec!["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", dev],
+            BackingFs::XfsPlain => vec!["-f", "-K", "-m", "reflink=0,bigtime=0,inobtcount=0", "-L", "backingfiles", dev],
+            BackingFs::Ext4 => vec!["-F", "-L", "backingfiles", dev],
+        };
+        v.into_iter().map(String::from).collect()
+    }
+
+    pub fn human(self) -> &'static str {
+        match self {
+            BackingFs::XfsReflink => "XFS with reflink (copy-on-write snapshots)",
+            BackingFs::XfsPlain => "XFS without reflink (full-copy snapshots)",
+            BackingFs::Ext4 => "ext4 (full-copy snapshots — kernel has no XFS driver)",
+        }
+    }
+}
+
+/// Probe what the running kernel can actually mount for the backing-files
+/// partition, in preference order: reflink XFS → plain XFS → ext4. Never
+/// fails — ext4 is supported by every Pi-class kernel, so there is always a
+/// usable answer. This replaces the old hard "must mount reflink XFS or STOP"
+/// gate, which bailed on vendor SBC kernels (e.g. the Allwinner A733, whose
+/// BSP kernel ships no XFS driver at all — not even as a loadable module).
+///
+/// Snapshots only need reflink as an optimization: `usb_gadget/snapshot.rs`
+/// uses `cp --reflink=auto`, which silently degrades to a full byte copy when
+/// the filesystem can't do COW. So plain XFS / ext4 are fully functional, just
+/// more I/O and disk on each snapshot.
+pub async fn probe_backing_fs(emitter: &SetupEmitter) -> BackingFs {
+    // Make sure mkfs.xfs exists before we test XFS candidates. Best-effort —
+    // if the install fails (or the board has no XFS), we just fall through to
+    // ext4. The apt fetch is the slow step on a fresh image, so announce it.
     if sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_err() {
         emitter.progress("Installing xfsprogs (this can take 30-60 seconds)...");
-        crate::apt::apt_install(
+        let _ = crate::apt::apt_install(
             |m| emitter.progress(m),
             &["xfsprogs"],
             Duration::from_secs(180),
-        ).await.context("failed to install xfsprogs")?;
-        emitter.progress("xfsprogs installed");
+        ).await;
     }
+    let have_xfs_tools = sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_ok();
 
-    let img = "/tmp/xfs.img";
-    let mnt = "/tmp/xfsmnt";
-
-    // Cleanup any leftovers from a previous interrupted run. A stuck
-    // mount at `mnt` (umount failed silently, or we crashed mid-check)
-    // would otherwise make the fresh mount below fail with "mount point
-    // busy" and we'd incorrectly report "STOP: xfs does not support
-    // required features". Escalate: plain umount → lazy umount → bail.
+    let img = "/tmp/fsprobe.img";
+    let mnt = "/tmp/fsprobemnt";
     let _ = sentryusb_shell::run("umount", &[mnt]).await;
-    if sentryusb_shell::run("findmnt", &[mnt]).await.is_ok() {
-        let _ = sentryusb_shell::run("umount", &["-l", mnt]).await;
-        if sentryusb_shell::run("findmnt", &[mnt]).await.is_ok() {
-            bail!(
-                "STOP: {} is still a mount point after umount + lazy umount — reboot and re-run setup",
-                mnt
-            );
-        }
-    }
     let _ = std::fs::remove_file(img);
     let _ = std::fs::remove_dir_all(mnt);
+    let _ = std::fs::create_dir_all(mnt);
 
-    // 1 GB sparse loopback image — metadata-only truncate, near-instant.
-    emitter.progress("Creating test XFS image");
-    sentryusb_shell::run_with_timeout(
-        Duration::from_secs(30),
-        "truncate",
-        &["-s", "1GB", img],
-    )
-    .await
-    .context("truncate xfs test image")?;
-
-    // reflink=1 is the feature Sentry USB actually needs (copy-on-write
-    // snapshots of the cam image). If mkfs can make the fs but mount
-    // fails, the kernel doesn't support the required features.
-    emitter.progress("Formatting test image with XFS (reflink=1)");
-    sentryusb_shell::run_with_timeout(
-        Duration::from_secs(30),
-        "mkfs.xfs",
-        &["-m", "reflink=1", "-f", img],
-    )
-    .await
-    .context("mkfs.xfs failed — kernel likely lacks reflink support")?;
-
-    emitter.progress("Mounting test image");
-    std::fs::create_dir_all(mnt)?;
-    if sentryusb_shell::run("mount", &[img, mnt]).await.is_err() {
-        let _ = std::fs::remove_file(img);
+    // 1 GB sparse image — metadata-only truncate, near-instant.
+    if sentryusb_shell::run_with_timeout(Duration::from_secs(30), "truncate", &["-s", "1GB", img]).await.is_err() {
+        // Can't even create a scratch image — assume ext4 (universally mountable).
         let _ = std::fs::remove_dir_all(mnt);
-        bail!("STOP: xfs does not support required features");
+        emitter.progress(&format!("Backing filesystem: {}", BackingFs::Ext4.human()));
+        return BackingFs::Ext4;
     }
 
-    // Success — clean up.
-    let _ = sentryusb_shell::run("umount", &[mnt]).await;
+    // Format `img` with `mkfs_bin mkfs_args`, then try to mount it. Returns
+    // true only if BOTH the format and the mount succeed — a kernel can have
+    // mkfs.xfs (userspace) yet no XFS driver (kernel), so the mount is the
+    // real test.
+    async fn format_and_mount(img: &str, mnt: &str, bin: &str, args: &[&str]) -> bool {
+        if sentryusb_shell::run_with_timeout(Duration::from_secs(30), bin, args).await.is_err() {
+            return false;
+        }
+        let mounted = sentryusb_shell::run("mount", &[img, mnt]).await.is_ok();
+        if mounted {
+            let _ = sentryusb_shell::run("umount", &[mnt]).await;
+        }
+        mounted
+    }
+
+    let chosen = if have_xfs_tools
+        && format_and_mount(img, mnt, "mkfs.xfs", &["-q", "-f", "-m", "reflink=1", img]).await
+    {
+        BackingFs::XfsReflink
+    } else if have_xfs_tools
+        && format_and_mount(img, mnt, "mkfs.xfs", &["-q", "-f", "-m", "reflink=0,bigtime=0,inobtcount=0", img]).await
+    {
+        BackingFs::XfsPlain
+    } else {
+        BackingFs::Ext4
+    };
+
     let _ = std::fs::remove_file(img);
     let _ = std::fs::remove_dir_all(mnt);
+    emitter.progress(&format!("Backing filesystem: {}", chosen.human()));
+    chosen
+}
 
-    emitter.progress("XFS supported");
+/// Early-verify hook: probe the backing filesystem so the choice (and any
+/// xfsprogs install) happens up front in the "verify" phase. Never STOPs —
+/// see [`probe_backing_fs`]. partition.rs re-probes at format time and uses
+/// the same cascade, so this is informational/warm-up.
+async fn check_xfs_support(emitter: &SetupEmitter) -> Result<()> {
+    let _ = probe_backing_fs(emitter).await;
     Ok(())
 }
 
