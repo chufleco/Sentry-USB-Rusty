@@ -99,9 +99,12 @@ pub async fn setup_data_drive(env: &SetupEnv, emitter: &SetupEmitter) -> Result<
 
     let bf_ok = check_label_matches(&p2, "backingfiles").await;
     let mut_ok = check_label_matches(&p1, "mutable").await;
-    // backingfiles may be XFS (reflink or plain) or ext4 (kernels without an
-    // XFS driver) — accept either so a re-run never reformats a valid drive.
-    let bf_fs_ok = check_fstype(&p2, "xfs").await || check_fstype(&p2, "ext4").await;
+    // backingfiles may be XFS (reflink or plain), Btrfs, or ext4 depending on
+    // what the kernel could mount — accept any so a re-run never reformats a
+    // valid drive.
+    let bf_fs_ok = check_fstype(&p2, "xfs").await
+        || check_fstype(&p2, "btrfs").await
+        || check_fstype(&p2, "ext4").await;
     let mut_ext4 = check_fstype(&p1, "ext4").await;
 
     let already_partitioned = bf_ok && mut_ok && bf_fs_ok && mut_ext4;
@@ -596,12 +599,14 @@ async fn update_fstab() -> Result<()> {
     let mut additions = String::new();
 
     if !fstab.contains("LABEL=backingfiles") {
-        // The backing partition is xfs on most kernels but ext4 where there's
-        // no XFS driver — read the live filesystem type so fstab matches what
-        // was actually created. `noatime` is valid for both. Default to xfs if
-        // blkid can't resolve the label yet.
+        // The backing partition is xfs on most kernels, btrfs or ext4 where
+        // there's no XFS driver — read the live filesystem type so fstab
+        // matches what was actually created. `noatime` is valid for all of
+        // them. Default to xfs if blkid can't resolve the label yet.
         let backing_fstype = if check_fstype("/dev/disk/by-label/backingfiles", "ext4").await {
             "ext4"
+        } else if check_fstype("/dev/disk/by-label/backingfiles", "btrfs").await {
+            "btrfs"
         } else {
             "xfs"
         };
