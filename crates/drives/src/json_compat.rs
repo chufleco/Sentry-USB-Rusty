@@ -485,12 +485,20 @@ fn insert_imported_route(
     let first_lat: Option<f64> = r.points.first().map(|p| p[0]);
     let first_lon: Option<f64> = r.points.first().map(|p| p[1]);
 
-    // Telemetry columns come from the JSON (the exporter writes them) so
-    // an export→import round-trip preserves the BLE rollups — they used
-    // to be dropped here, and the OR REPLACE then nulled them on any
-    // re-imported row.
+    // Merge semantics for re-imported rows (ON CONFLICT DO UPDATE, not
+    // OR REPLACE — row replacement wiped every column the INSERT didn't
+    // carry):
+    //   * clip content + aggregates: the import wins (fresh recompute);
+    //   * BLE telemetry rollups: COALESCE — a Rusty round-trip carries
+    //     them and wins, but a Sentry-Drive re-process exports them null
+    //     and must not blank what the Pi recorded;
+    //   * cloud bookkeeping (cloud_uploaded_at / cloud_route_id): never
+    //     touched — resetting it re-uploaded the whole library to the
+    //     cloud as duplicates after every backfill import. New rows
+    //     (e.g. Tessie/Teslascope history arriving via Sentry-Drive)
+    //     insert with it NULL, i.e. queued for upload.
     tx.execute(
-        "INSERT OR REPLACE INTO routes(
+        "INSERT INTO routes(
             file, date_dir, point_count, raw_park_count, raw_frame_count,
             start_ts, end_ts, distance_m, first_lat, first_lon,
             points_blob, gear_states_blob, ap_states_blob,
@@ -522,7 +530,61 @@ fn insert_imported_route(
             ?36, ?37, ?38, ?39, ?40, ?41,
             ?42, ?43, ?44, ?45,
             ?46, ?47, ?48, ?49,
-            ?50, ?51, ?52, ?53, ?54)",
+            ?50, ?51, ?52, ?53, ?54)
+         ON CONFLICT(file) DO UPDATE SET
+            date_dir            = excluded.date_dir,
+            point_count         = excluded.point_count,
+            raw_park_count      = excluded.raw_park_count,
+            raw_frame_count     = excluded.raw_frame_count,
+            distance_m          = excluded.distance_m,
+            first_lat           = excluded.first_lat,
+            first_lon           = excluded.first_lon,
+            points_blob         = excluded.points_blob,
+            gear_states_blob    = excluded.gear_states_blob,
+            ap_states_blob      = excluded.ap_states_blob,
+            speeds_blob         = excluded.speeds_blob,
+            accel_blob          = excluded.accel_blob,
+            gear_runs_blob      = excluded.gear_runs_blob,
+            updated_at          = excluded.updated_at,
+            max_speed_mps       = excluded.max_speed_mps,
+            avg_speed_mps       = excluded.avg_speed_mps,
+            speed_sample_count  = excluded.speed_sample_count,
+            valid_point_count   = excluded.valid_point_count,
+            fsd_engaged_ms      = excluded.fsd_engaged_ms,
+            autosteer_engaged_ms= excluded.autosteer_engaged_ms,
+            tacc_engaged_ms     = excluded.tacc_engaged_ms,
+            fsd_distance_m      = excluded.fsd_distance_m,
+            autosteer_distance_m= excluded.autosteer_distance_m,
+            tacc_distance_m     = excluded.tacc_distance_m,
+            assisted_distance_m = excluded.assisted_distance_m,
+            fsd_disengagements  = excluded.fsd_disengagements,
+            fsd_accel_pushes    = excluded.fsd_accel_pushes,
+            start_lat           = excluded.start_lat,
+            start_lon           = excluded.start_lon,
+            end_lat             = excluded.end_lat,
+            end_lon             = excluded.end_lon,
+            source              = excluded.source,
+            external_signature  = excluded.external_signature,
+            tessie_autopilot_percent = excluded.tessie_autopilot_percent,
+            battery_pct_start   = COALESCE(excluded.battery_pct_start, battery_pct_start),
+            battery_pct_end     = COALESCE(excluded.battery_pct_end, battery_pct_end),
+            interior_temp_min   = COALESCE(excluded.interior_temp_min, interior_temp_min),
+            interior_temp_max   = COALESCE(excluded.interior_temp_max, interior_temp_max),
+            exterior_temp_avg   = COALESCE(excluded.exterior_temp_avg, exterior_temp_avg),
+            hvac_runtime_s      = COALESCE(excluded.hvac_runtime_s, hvac_runtime_s),
+            tire_fl_psi         = COALESCE(excluded.tire_fl_psi, tire_fl_psi),
+            tire_fr_psi         = COALESCE(excluded.tire_fr_psi, tire_fr_psi),
+            tire_rl_psi         = COALESCE(excluded.tire_rl_psi, tire_rl_psi),
+            tire_rr_psi         = COALESCE(excluded.tire_rr_psi, tire_rr_psi),
+            odometer_mi_start   = COALESCE(excluded.odometer_mi_start, odometer_mi_start),
+            odometer_mi_end     = COALESCE(excluded.odometer_mi_end, odometer_mi_end),
+            location_name_start = COALESCE(excluded.location_name_start, location_name_start),
+            location_name_end   = COALESCE(excluded.location_name_end, location_name_end),
+            fsd_pend_ms_end     = excluded.fsd_pend_ms_end,
+            park_ms_start       = excluded.park_ms_start,
+            fsd_at_end          = excluded.fsd_at_end,
+            fsd_accel_pushes_early = excluded.fsd_accel_pushes_early,
+            ap_at_start         = excluded.ap_at_start",
         params![
             norm, r.date, r.points.len() as i64, r.raw_park_count as i64, r.raw_frame_count as i64,
             a.distance_m, first_lat, first_lon,
@@ -1268,6 +1330,88 @@ mod import_diagnostics_tests {
     /// Telemetry fields in the JSON (as the exporter writes them) must land
     /// in the routes columns — they used to be dropped on import, so a
     /// backup restore lost every BLE telemetry badge.
+    #[test]
+    fn reimport_preserves_cloud_state_and_ble_rollups() {
+        // Onboarding flow: a Pi that has been recording natively (rows
+        // with BLE rollups + cloud-upload bookkeeping) later imports a
+        // Sentry-Drive backfill of the SAME clips. The import must
+        // refresh the clip content but NOT blank the Pi-recorded BLE
+        // columns (Sentry-Drive's own processing exports them null) and
+        // NOT reset cloud_uploaded_at (which would re-upload the whole
+        // library to the cloud as duplicates).
+        let native = r#"{"file":"2025-01-15_12-00-00/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.1,-122.1]],"batteryPctStart":80.5,"batteryPctEnd":79.0,"tireFlPsi":42.5}"#;
+        let path = std::env::temp_dir().join("sentryusb-diag-reimport-a.json");
+        std::fs::write(&path, build_json(native)).unwrap();
+        let mut conn = fresh_conn();
+        import_json(&mut conn, path.to_str().unwrap(), |_| {}).unwrap();
+        conn.execute(
+            "UPDATE routes SET cloud_uploaded_at = 1234, cloud_route_id = 'deadbeef'",
+            [],
+        )
+        .unwrap();
+
+        // Same clip processed fresh elsewhere: richer points, no BLE.
+        let reimport = r#"{"file":"2025-01-15_12-00-00/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.05,-122.05],[37.1,-122.1]]}"#;
+        let path2 = std::env::temp_dir().join("sentryusb-diag-reimport-b.json");
+        std::fs::write(&path2, build_json(reimport)).unwrap();
+        import_json(&mut conn, path2.to_str().unwrap(), |_| {}).unwrap();
+
+        let (pc, bs, fl, cu, cr): (i64, Option<f64>, Option<f64>, Option<i64>, Option<String>) =
+            conn.query_row(
+                "SELECT point_count, battery_pct_start, tire_fl_psi, \
+                        cloud_uploaded_at, cloud_route_id \
+                 FROM routes WHERE file = '2025-01-15_12-00-00/clip.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .unwrap();
+        assert_eq!(pc, 3, "content must refresh from the re-import");
+        assert_eq!(bs, Some(80.5), "Pi-recorded BLE must survive a null re-import");
+        assert_eq!(fl, Some(42.5), "TPMS must survive a null re-import");
+        assert_eq!(cu, Some(1234), "cloud bookkeeping must survive (no re-upload sweep)");
+        assert_eq!(cr.as_deref(), Some("deadbeef"));
+
+        // ...but a re-import that CARRIES telemetry (a Rusty round-trip)
+        // still wins over the stored values.
+        let richer = r#"{"file":"2025-01-15_12-00-00/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.1,-122.1]],"batteryPctStart":70.0}"#;
+        let path3 = std::env::temp_dir().join("sentryusb-diag-reimport-c.json");
+        std::fs::write(&path3, build_json(richer)).unwrap();
+        import_json(&mut conn, path3.to_str().unwrap(), |_| {}).unwrap();
+        let bs2: Option<f64> = conn
+            .query_row(
+                "SELECT battery_pct_start FROM routes WHERE file = '2025-01-15_12-00-00/clip.mp4'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(bs2, Some(70.0), "non-null incoming telemetry must overwrite");
+
+        // Third-party history riding in the same import (a Tessie or
+        // Teslascope drive the Pi has never seen) must land as a NEW row
+        // with empty cloud bookkeeping — i.e. queued for cloud upload.
+        // That's the onboarding funnel: Sentry-Drive imports the service
+        // data, Rusty merges it, the uploader ships it to the cloud.
+        let tessie = r#"{"file":"tessie/2025-01-10/2025-01-10_09-00-00-front-tessie-1.mp4","date":"2025-01-10","points":[[37.2,-122.2],[37.3,-122.3]],"source":"tessie"}"#;
+        let path4 = std::env::temp_dir().join("sentryusb-diag-reimport-d.json");
+        std::fs::write(&path4, build_json(tessie)).unwrap();
+        import_json(&mut conn, path4.to_str().unwrap(), |_| {}).unwrap();
+        let (src, cu_new): (Option<String>, Option<i64>) = conn
+            .query_row(
+                "SELECT source, cloud_uploaded_at FROM routes \
+                 WHERE file = 'tessie/2025-01-10/2025-01-10_09-00-00-front-tessie-1.mp4'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(src.as_deref(), Some("tessie"));
+        assert_eq!(cu_new, None, "new third-party rows must be pending for cloud upload");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&path2);
+        let _ = std::fs::remove_file(&path3);
+        let _ = std::fs::remove_file(&path4);
+    }
+
     #[test]
     fn import_preserves_telemetry_columns() {
         let route = r#"{"file":"2025-01-15_12-00-00/clip.mp4","date":"2025-01-15","points":[[37.0,-122.0],[37.1,-122.1]],"batteryPctStart":80.5,"batteryPctEnd":79.0,"hvacRuntimeS":30,"odometerMiStart":1000.5,"odometerMiEnd":1001.0,"locationNameStart":"Home St","tireFlPsi":42.5}"#;
