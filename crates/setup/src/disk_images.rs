@@ -114,17 +114,20 @@ async fn create_drive(
 
     emitter.progress(&format!("Allocating {}K for {}...", size_kb, filename));
     let _ = std::fs::remove_file(&filename);
-    sentryusb_shell::run("truncate", &["--size", &format!("{}K", size_kb), &filename]).await
-        .context("truncate failed")?;
 
     // On a Btrfs backing partition, mark the big disk-image files NoCOW: they
     // are constantly random-overwritten by the Tesla and would fragment badly
-    // under copy-on-write. Must run on the freshly-truncated (still-empty) file,
-    // before sfdisk writes anything. Best-effort + ignore errors — `chattr +C`
-    // only applies on Btrfs (returns "Operation not supported" on xfs/ext4, a
-    // harmless no-op). Reflink snapshots still work on NoCOW Btrfs files, so we
-    // keep cheap snapshots without the fragmentation.
+    // under copy-on-write. `chattr +C` on btrfs only takes effect while the
+    // file is still EMPTY (zero extents), so create the empty file and flag it
+    // BEFORE truncate sizes it — flagging after the truncate is silently
+    // ignored. Best-effort + ignore errors: `chattr +C` is a harmless no-op
+    // ("Operation not supported") on xfs/ext4. Reflink snapshots still work on
+    // NoCOW btrfs files, so we keep cheap snapshots without the fragmentation.
+    let _ = std::fs::File::create(&filename);
     let _ = sentryusb_shell::run("chattr", &["+C", &filename]).await;
+
+    sentryusb_shell::run("truncate", &["--size", &format!("{}K", size_kb), &filename]).await
+        .context("truncate failed")?;
 
     // Create partition table
     let sfdisk_type = if use_exfat { "type=7" } else { "type=c" };
