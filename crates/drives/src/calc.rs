@@ -58,28 +58,35 @@ pub fn geodesic_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
         return 0.0;
     }
     let to_rad = std::f64::consts::PI / 180.0;
-    let phi1 = lat1 * to_rad;
-    let phi2 = lat2 * to_rad;
     // Reduced (parametric) latitudes on the ellipsoid.
-    let b1 = ((1.0 - WGS84_F) * phi1.tan()).atan();
-    let b2 = ((1.0 - WGS84_F) * phi2.tan()).atan();
-    let dlon = (lon2 - lon1) * to_rad;
+    let b1 = ((1.0 - WGS84_F) * (lat1 * to_rad).tan()).atan();
+    let b2 = ((1.0 - WGS84_F) * (lat2 * to_rad).tan()).atan();
+    let p = (b1 + b2) / 2.0;
+    let q = (b2 - b1) / 2.0;
 
-    // Central angle via the spherical law of cosines on reduced latitudes.
-    let cos_sigma =
-        (b1.sin() * b2.sin() + b1.cos() * b2.cos() * dlon.cos()).clamp(-1.0, 1.0);
-    let sigma = cos_sigma.acos();
+    // Central angle σ via the HAVERSINE form: h = sin²(σ/2), then
+    // σ = 2·atan2(√h, √(1−h)). This is numerically stable for the short
+    // (~1–6 m) hops that 1 Hz dashcam GPS produces — the previous
+    // acos(law-of-cosines) form lost ~half the mantissa there (cos σ ≈ 1)
+    // and rounded sub-meter hops to 0, undercounting a real drive by
+    // ~0.7%. Mirrors Sentry Drive's geodesicM exactly so the two apps
+    // agree to floating-point precision.
+    let sin_half_dlon = ((lon2 - lon1) * to_rad / 2.0).sin();
+    let sin_q = q.sin();
+    let h = sin_q * sin_q + b1.cos() * b2.cos() * sin_half_dlon * sin_half_dlon;
+    let sigma = 2.0 * h.sqrt().atan2((1.0 - h).max(0.0).sqrt());
     if sigma == 0.0 {
         return 0.0;
     }
     let sin_sigma = sigma.sin();
 
-    let p = (b1 + b2) / 2.0;
-    let q = (b2 - b1) / 2.0;
-    let x = (sigma - sin_sigma) * p.sin().powi(2) * q.cos().powi(2)
-        / (sigma / 2.0).cos().powi(2);
-    let y = (sigma + sin_sigma) * p.cos().powi(2) * q.sin().powi(2)
-        / (sigma / 2.0).sin().powi(2);
+    // Andoyer first-order flattening correction. Denominators are the
+    // half-angle squares from the haversine `h`, clamped away from zero
+    // (near σ=0 the numerators vanish faster, so the correction → 0).
+    let cos2_half = (1.0 - h).max(1e-12); // cos²(σ/2)
+    let sin2_half = h.max(1e-12); // sin²(σ/2)
+    let x = (sigma - sin_sigma) * p.sin().powi(2) * q.cos().powi(2) / cos2_half;
+    let y = (sigma + sin_sigma) * p.cos().powi(2) * sin_q * sin_q / sin2_half;
     WGS84_A * (sigma - (WGS84_F / 2.0) * (x + y))
 }
 
@@ -168,6 +175,37 @@ mod tests {
     #[test]
     fn geodesic_same_point_is_zero() {
         assert_eq!(geodesic_m(37.5, -122.3, 37.5, -122.3), 0.0);
+    }
+
+    #[test]
+    fn geodesic_short_hops_sum_to_direct_line() {
+        // A dashcam drive is thousands of ~1-6 m hops between 1 Hz GPS
+        // samples. Summing them must equal the straight-line distance.
+        // Computing the central angle as acos(law-of-cosines) loses ~half
+        // the float mantissa for such short segments (cos σ ≈ 1 − 1e-14)
+        // and even rounds sub-meter hops to exactly 0 — undercounting a
+        // real drive by ~0.7%. The stable atan2(haversine) central angle
+        // (matching Sentry Drive's geodesicM) does not. Walk ~2 km due
+        // east in 2000 ~1 m hops and require the sum to match the direct
+        // line to floating-point precision.
+        let (lat0, lon0) = (37.4_f64, -122.1_f64);
+        let lon1 = lon0 + 0.0234; // ~2 km E-W at 37.4°N
+        let n = 2000;
+        let direct = geodesic_m(lat0, lon0, lat0, lon1);
+        let mut summed = 0.0;
+        let mut prev_lon = lon0;
+        for i in 1..=n {
+            let lon = lon0 + (lon1 - lon0) * (i as f64) / (n as f64);
+            summed += geodesic_m(lat0, prev_lon, lat0, lon);
+            prev_lon = lon;
+        }
+        let rel = (summed - direct).abs() / direct;
+        assert!(
+            rel < 1e-6,
+            "sum of short hops ({summed:.3} m) must match the direct line \
+             ({direct:.3} m); rel error {rel:.2e} — unstable central-angle \
+             formula undercounts short segments"
+        );
     }
 
     #[test]

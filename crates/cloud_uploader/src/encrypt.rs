@@ -809,13 +809,17 @@ mod tests {
     #[test]
     fn route_summary_v4_cross_impl_vectors() {
         // A: FSD 30 frames then manual, no Park -> grace expires, dis 1.
+        // dM/fdM cross-checked against the web's geodesicM on these exact
+        // points (329 m / 162 m). The earlier 328/161 were the pre-fix
+        // acos(law-of-cosines) values — ~1 m low on these 5.5 m hops,
+        // the short-segment undercount the stable central angle fixes.
         let mut ap = vec![1u8; 30];
         ap.extend(vec![0u8; 30]);
         let a = route_summary_json(&v4_vector_route(ap, vec![gr(4, 60)]));
         assert_eq!(a["dis"], serde_json::json!(1));
         assert!(a.get("dPnd").is_none());
-        assert_eq!(a["dM"], serde_json::json!(328));
-        assert_eq!(a["fdM"], serde_json::json!(161));
+        assert_eq!(a["dM"], serde_json::json!(329));
+        assert_eq!(a["fdM"], serde_json::json!(162));
         assert_eq!(a["apd"], serde_json::json!(1));
         assert_eq!(a["pv"].as_array().unwrap().len(), 21);
         assert_eq!(a["pv"][0], serde_json::json!([53.5, -113.5]));

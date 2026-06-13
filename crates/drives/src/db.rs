@@ -91,7 +91,11 @@ const ARCHIVE_SYNC_SAMPLE_COUNT_KEY: &str = "archive_sync_sample_count";
 // accel pushes in the grouper (see V15_ROUTE_BOUNDARY_COLUMNS), plus
 // FSD analytics narrowed from "not tessie" to SEI-only sources. Stale
 // v5 caches hold seam-inflated disengagement counts.
-const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "6";
+// v7 (2026-06-13): geodesic central angle moved from acos(law-of-cosines)
+// to the numerically-stable atan2(haversine) form (calc.rs), fixing a
+// ~0.7% short-segment undercount on native dashcam drives. Per-drive
+// distance shifts up; stale v6 caches hold the undercounted mileage.
+const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "7";
 
 /// Version tag for the per-clip aggregate FORMULA (compute_route_aggregates).
 /// Distinct from the cache algo version above: this gates a one-shot
@@ -102,8 +106,10 @@ const DRIVE_LIST_CACHE_ALGO_VERSION: &str = "6";
 /// engaged-at-start accel-push grace fix + pending-disengagement flush
 /// no longer counting at clip seams. "boundary-3" adds `ap_at_start`
 /// so the grouper can attribute inter-clip bridge distance and seam
-/// wall-time to the incoming clip's autopilot mode.
-const AGGREGATE_FORMULA_VERSION: &str = "boundary-3";
+/// wall-time to the incoming clip's autopilot mode. "geodesic-stable-4"
+/// recomputes per-clip distances with the numerically-stable geodesic
+/// central angle (calc.rs) that fixes the short-segment undercount.
+const AGGREGATE_FORMULA_VERSION: &str = "geodesic-stable-4";
 
 /// Version tag for the route `file` KEY format. Gates a one-shot rewrite of
 /// `routes.file` / `processed_files.file` to the canonical form (see
