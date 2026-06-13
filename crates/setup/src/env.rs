@@ -57,6 +57,16 @@ impl PiModel {
         }
     }
 
+    /// True for genuine Raspberry Pi boards. Non-Pi SBCs (Allwinner A733 /
+    /// Orange Pi, Radxa, etc.) return false so setup can skip Pi-only boot
+    /// machinery — config.txt/cmdline.txt overlays, the read-only-root
+    /// cmdline contract — that a U-Boot/extlinux board doesn't honor and that
+    /// otherwise half-applies into an unbootable state. Affirmative gate, vs.
+    /// relying on the fragile `*_path == None` side effects.
+    pub fn is_raspberry_pi(&self) -> bool {
+        !matches!(self, PiModel::Other)
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             PiModel::Pi5 => "Raspberry Pi 5",

@@ -535,18 +535,53 @@ async fn check_root_shrink(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
                 ).await;
             }
 
-            if Path::new("/sentryusb/config.txt").exists() {
+            // Tear down the resize hook so it does NOT run on the next boot.
+            // install_initramfs_resize_scripts already deleted the hook's
+            // SOURCE files under /etc/initramfs-tools, but the BUILT initrd
+            // still has the premount resize script embedded — it must be
+            // rebuilt to drop it. Two cases:
+            //
+            //   (a) Pi "temporary initramfs": we added an `initramfs …
+            //       followkernel # SENTRYUSB-REMOVE` line to config.txt
+            //       because the board shipped no initrd. Revert by stripping
+            //       that line and deleting the initrd (back to no-initramfs
+            //       boot).
+            //   (b) Every other board — incl. non-Pi U-Boot/extlinux boards
+            //       (Allwinner A733) and Pis that already had a stock initrd —
+            //       must REBUILD the initrd via update-initramfs so the
+            //       embedded resize premount script is gone. On U-Boot boards
+            //       this also regenerates uInitrd through the distro's
+            //       update-initramfs hook.
+            //
+            // The previous code ran (b) only when config.txt existed, so a
+            // non-Pi board (no config.txt) never rebuilt the initrd → the
+            // resize hook re-ran every boot → the shrink looped forever
+            // (the A733 / Orange Pi Zero 3W symptom).
+            let pi_temp_initramfs = Path::new("/sentryusb/config.txt").exists()
+                && std::fs::read_to_string("/sentryusb/config.txt")
+                    .unwrap_or_default()
+                    .contains("SENTRYUSB-REMOVE");
+            if pi_temp_initramfs {
                 let config = std::fs::read_to_string("/sentryusb/config.txt").unwrap_or_default();
-                if config.contains("SENTRYUSB-REMOVE") {
-                    let cleaned: String = config.lines()
-                        .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
-                        .collect::<Vec<_>>().join("\n");
-                    let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
-                    let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
-                    let _ = std::fs::remove_file(format!("/boot/{}", initrd));
-                } else {
-                    let _ = sentryusb_shell::run("update-initramfs", &["-u"]).await;
+                let cleaned: String = config.lines()
+                    .filter(|l| !l.contains("SENTRYUSB-REMOVE"))
+                    .collect::<Vec<_>>().join("\n");
+                let _ = std::fs::write("/sentryusb/config.txt", cleaned + "\n");
+                let initrd = format!("initrd.img-{}", std::env::consts::ARCH);
+                let _ = std::fs::remove_file(format!("/boot/{}", initrd));
+            } else {
+                let kernel_ver = sentryusb_shell::run("uname", &["-r"]).await
+                    .unwrap_or_default().trim().to_string();
+                let mut args: Vec<&str> = vec!["-u"];
+                if !kernel_ver.is_empty() {
+                    args.push("-k");
+                    args.push(&kernel_ver);
                 }
+                let _ = sentryusb_shell::run_with_timeout(
+                    Duration::from_secs(120),
+                    "update-initramfs",
+                    &args,
+                ).await;
             }
 
             emitter.progress("Root partition shrink complete, rebooting...");

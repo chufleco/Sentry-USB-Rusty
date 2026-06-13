@@ -120,7 +120,42 @@ fn gadget_dir_is_complete(gadget: &Path) -> bool {
 
 /// Enable the USB gadget by setting up configfs.
 /// This is equivalent to `enable_gadget.sh`.
+/// Boards with a USB-C OTG port but no ID pin (e.g. Allwinner A733 / Orange Pi
+/// Zero 3W) power the controller up in host/auto role, so a mass-storage gadget
+/// binds the UDC but the host (Tesla) never enumerates it. Force peripheral role
+/// via the sysfs `otg_role` knob before binding. The knob lives a couple levels
+/// under /sys/devices/platform (e.g. `soc@3000000/10.usbc0/otg_role`); walk a
+/// bounded depth and write every one found. Completely no-op on Raspberry Pis
+/// and any board that doesn't expose the knob — the file simply isn't there.
+fn force_peripheral_role() {
+    fn walk(dir: &Path, depth: u8) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let p = e.path();
+            let knob = p.join("otg_role");
+            if knob.is_file() {
+                // "peripheral" is the musb/sunxi token for device mode. A
+                // wrong token just fails the write harmlessly; verified
+                // on-device. Writing it is idempotent.
+                let _ = fs::write(&knob, "peripheral");
+            }
+            if p.is_dir() {
+                walk(&p, depth - 1);
+            }
+        }
+    }
+    walk(Path::new("/sys/devices/platform"), 4);
+}
+
 pub fn enable() -> Result<()> {
+    // Must run before any UDC bind below so a no-ID-pin OTG controller is in
+    // peripheral role when the gadget binds (Allwinner A733 / Orange Pi Zero
+    // 3W). No-op on Pis.
+    force_peripheral_role();
+
     let configfs = find_configfs_root()?;
     let gadget = configfs.join("usb_gadget").join(GADGET_NAME);
 
