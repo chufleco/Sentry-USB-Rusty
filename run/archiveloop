@@ -6,8 +6,11 @@ then
   return 1 # shouldn't use exit when sourced
 fi
 
-# Unload the module that was loaded by cmdline.txt
-modprobe -r g_ether
+# Unload the g_ether module if cmdline.txt loaded it. Best-effort: on non-Pi
+# boards (e.g. the Allwinner A733 / Orange Pi) there is no g_ether module at
+# all, so `modprobe -r` FATALs — and with `set -e` that aborted archiveloop on
+# boot before it could enable the USB gadget, so the Tesla never saw the drive.
+modprobe -r g_ether 2>/dev/null || true
 
 export LOG_FILE=/mutable/archiveloop.log
 
