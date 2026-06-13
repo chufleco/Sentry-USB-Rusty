@@ -55,6 +55,10 @@ struct CachedNetwork {
     /// driver doesn't populate it — e.g. the Allwinner A733). Empty on boards
     /// where the live /proc read works, so the live path stays primary there.
     wifi_strength: String,
+    /// Fallback RSSI in dBm parsed from `iw dev <iface> link` ("signal: -23
+    /// dBm"). Same role as wifi_strength: used when /proc/net/wireless is empty
+    /// (A733), so the exact dBm still shows. None when the live /proc read works.
+    wifi_signal_dbm: Option<i32>,
 }
 
 /// Live signal read from /proc/net/wireless — no fork+exec.
@@ -309,11 +313,13 @@ pub async fn get_status(
         if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
             s.wifi_strength = strength;
             s.wifi_signal_dbm = dbm;
-        } else if !net.wifi_strength.is_empty() {
+        } else if !net.wifi_strength.is_empty() || net.wifi_signal_dbm.is_some() {
             // /proc/net/wireless empty (driver doesn't populate it, e.g. the
-            // A733) — use the nmcli-derived strength cached in `net`. No exact
-            // dBm available this way, so the bars show but dBm stays absent.
+            // A733) — use the values cached in `net`: nmcli-derived bars plus
+            // the exact dBm parsed from `iw dev <iface> link`. dBm is the real
+            // RSSI the user wants to see; bars are the coarse fallback.
             s.wifi_strength = net.wifi_strength.clone();
+            s.wifi_signal_dbm = net.wifi_signal_dbm;
         }
         let (rx, tx) = compute_throughput(&state.net_sampler, &net.wifi_dev);
         s.wifi_rx_bps = rx;
@@ -392,6 +398,16 @@ async fn compute_network_info() -> CachedNetwork {
                 if let Some(rest) = trimmed.strip_prefix("freq:") {
                     if let Ok(mhz) = rest.trim().parse::<u64>() {
                         info.wifi_freq = (mhz * 1_000_000).to_string();
+                    }
+                } else if let Some(rest) = trimmed.strip_prefix("signal:") {
+                    // Format: `signal: -23 dBm`. The exact RSSI — cache it so
+                    // the live status path can surface dBm on boards where
+                    // /proc/net/wireless is empty (the A733). Free: same `iw
+                    // dev <iface> link` fork we already did for `freq:`.
+                    if let Some(num) = rest.trim().split_whitespace().next() {
+                        if let Ok(dbm) = num.parse::<i32>() {
+                            info.wifi_signal_dbm = Some(dbm);
+                        }
                     }
                 } else if info.wifi_ssid.is_empty() {
                     // SSID fallback #1: `iw dev <iface> link` prints
