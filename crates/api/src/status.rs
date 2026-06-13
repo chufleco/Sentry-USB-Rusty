@@ -50,6 +50,11 @@ struct CachedNetwork {
     /// when the user reconnects or swaps cable, so it's safe to cache.
     wifi_dev: String,
     eth_dev: String,
+    /// Fallback signal strength ("X/70" form) derived from nmcli, refreshed
+    /// at NETWORK_TTL. Used only when /proc/net/wireless is empty (the WiFi
+    /// driver doesn't populate it — e.g. the Allwinner A733). Empty on boards
+    /// where the live /proc read works, so the live path stays primary there.
+    wifi_strength: String,
 }
 
 /// Live signal read from /proc/net/wireless — no fork+exec.
@@ -304,6 +309,11 @@ pub async fn get_status(
         if let Some((strength, dbm)) = read_wireless_quality(&net.wifi_dev) {
             s.wifi_strength = strength;
             s.wifi_signal_dbm = dbm;
+        } else if !net.wifi_strength.is_empty() {
+            // /proc/net/wireless empty (driver doesn't populate it, e.g. the
+            // A733) — use the nmcli-derived strength cached in `net`. No exact
+            // dBm available this way, so the bars show but dBm stays absent.
+            s.wifi_strength = net.wifi_strength.clone();
         }
         let (rx, tx) = compute_throughput(&state.net_sampler, &net.wifi_dev);
         s.wifi_rx_bps = rx;
@@ -412,6 +422,32 @@ async fn compute_network_info() -> CachedNetwork {
                             info.wifi_ssid = v.to_string();
                             break;
                         }
+                    }
+                }
+            }
+        }
+
+        // Signal-strength fallback for drivers that leave /proc/net/wireless
+        // empty (the A733 does). Cache an nmcli-derived value so the live
+        // status path can use it WITHOUT forking nmcli on every poll. Only run
+        // it when the live /proc read has nothing for this device, so Pi / 4C+
+        // (where /proc works) never pay the nmcli fork.
+        if read_wireless_quality(&info.wifi_dev).is_none() {
+            if let Ok(out) = sentryusb_shell::run(
+                "nmcli", &["-t", "-f", "IN-USE,SIGNAL", "device", "wifi"],
+            ).await {
+                for line in out.lines() {
+                    // The active AP's line starts with '*' in the IN-USE field.
+                    if let Some(rest) = line.trim().strip_prefix('*') {
+                        if let Ok(pct) = rest.trim_start_matches(':').trim().parse::<u32>() {
+                            if pct > 0 {
+                                // Convert NM's 0-100% to the X/70 link-quality
+                                // form the UI's bars expect (e.g. 100% -> 70/70).
+                                let link = (pct * 70 + 50) / 100;
+                                info.wifi_strength = format!("{}/70", link);
+                            }
+                        }
+                        break;
                     }
                 }
             }
