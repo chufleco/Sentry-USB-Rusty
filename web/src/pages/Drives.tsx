@@ -5,6 +5,7 @@ import { cn } from "@/lib/utils"
 import { DriveRow } from "@/components/drives/DriveRow"
 import { DrivesActionsBar } from "@/components/drives/DrivesActionsBar"
 import { DrivesToolbar } from "@/components/drives/DrivesToolbar"
+import { ImportedDataNotice } from "@/components/drives/ImportedDataNotice"
 import { Pagination } from "@/components/drives/Pagination"
 import { useDrivesList } from "@/hooks/useDrivesList"
 
@@ -133,6 +134,13 @@ export default function Drives() {
         <h1 className="text-2xl font-semibold text-slate-100 sm:text-3xl">Drives</h1>
         <DrivesActionsBar onChanged={list.refresh} />
       </div>
+
+      {!list.loading && (
+        <ImportedDataNotice
+          count={list.filteredStats.count}
+          importedCount={list.filteredStats.tessieCount}
+        />
+      )}
 
       <DrivesToolbar
         drives={list.drives}
