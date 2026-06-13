@@ -140,11 +140,19 @@ fn check_udc() -> Result<()> {
 pub enum BackingFs {
     /// XFS with reflink — copy-on-write snapshots (fastest, least disk use).
     XfsReflink,
+    /// Btrfs — also copy-on-write (cheap snapshots via `cp --reflink`). The CoW
+    /// fallback for kernels that lack XFS but ship Btrfs (very common, e.g. the
+    /// Allwinner A733 BSP kernel has `CONFIG_BTRFS_FS=y` but no XFS). Keeps
+    /// snapshots cheap so small drives don't lose their RecentClips budget to
+    /// full-copy snapshots. The big disk-image files are marked NoCOW
+    /// (`chattr +C`) at creation to avoid random-write fragmentation —
+    /// reflink snapshots still work on NoCOW Btrfs files.
+    Btrfs,
     /// XFS without reflink/bigtime/inobtcount — broad kernel compat, snapshots
     /// become full copies.
     XfsPlain,
-    /// ext4 — fallback for kernels with no XFS driver at all (e.g. the
-    /// Allwinner A733 BSP kernel). Snapshots become full copies.
+    /// ext4 — last resort for kernels with neither XFS nor Btrfs. Snapshots
+    /// become full copies.
     Ext4,
 }
 
@@ -153,6 +161,7 @@ impl BackingFs {
     pub fn fstype(self) -> &'static str {
         match self {
             BackingFs::Ext4 => "ext4",
+            BackingFs::Btrfs => "btrfs",
             _ => "xfs",
         }
     }
@@ -161,8 +170,14 @@ impl BackingFs {
     pub fn mkfs_bin(self) -> &'static str {
         match self {
             BackingFs::Ext4 => "mkfs.ext4",
+            BackingFs::Btrfs => "mkfs.btrfs",
             _ => "mkfs.xfs",
         }
+    }
+
+    /// True if this filesystem gives copy-on-write (cheap reflink snapshots).
+    pub fn is_cow(self) -> bool {
+        matches!(self, BackingFs::XfsReflink | BackingFs::Btrfs)
     }
 
     /// mkfs args to format `dev` (a block device or file) with the
@@ -172,6 +187,7 @@ impl BackingFs {
         let v: Vec<&str> = match self {
             BackingFs::XfsReflink => vec!["-f", "-K", "-m", "reflink=1", "-L", "backingfiles", dev],
             BackingFs::XfsPlain => vec!["-f", "-K", "-m", "reflink=0,bigtime=0,inobtcount=0", "-L", "backingfiles", dev],
+            BackingFs::Btrfs => vec!["-f", "-L", "backingfiles", dev],
             BackingFs::Ext4 => vec!["-F", "-L", "backingfiles", dev],
         };
         v.into_iter().map(String::from).collect()
@@ -180,8 +196,9 @@ impl BackingFs {
     pub fn human(self) -> &'static str {
         match self {
             BackingFs::XfsReflink => "XFS with reflink (copy-on-write snapshots)",
+            BackingFs::Btrfs => "Btrfs (copy-on-write snapshots — no XFS in this kernel)",
             BackingFs::XfsPlain => "XFS without reflink (full-copy snapshots)",
-            BackingFs::Ext4 => "ext4 (full-copy snapshots — kernel has no XFS driver)",
+            BackingFs::Ext4 => "ext4 (full-copy snapshots — no XFS/Btrfs in this kernel)",
         }
     }
 }
@@ -210,6 +227,18 @@ pub async fn probe_backing_fs(emitter: &SetupEmitter) -> BackingFs {
         ).await;
     }
     let have_xfs_tools = sentryusb_shell::run("which", &["mkfs.xfs"]).await.is_ok();
+
+    // Same for Btrfs tools — the CoW fallback when XFS is absent from the
+    // kernel. Best-effort install; if it fails we just skip the Btrfs candidate.
+    if sentryusb_shell::run("which", &["mkfs.btrfs"]).await.is_err() {
+        emitter.progress("Installing btrfs-progs...");
+        let _ = crate::apt::apt_install(
+            |m| emitter.progress(m),
+            &["btrfs-progs"],
+            Duration::from_secs(180),
+        ).await;
+    }
+    let have_btrfs_tools = sentryusb_shell::run("which", &["mkfs.btrfs"]).await.is_ok();
 
     let img = "/tmp/fsprobe.img";
     let mnt = "/tmp/fsprobemnt";
@@ -241,10 +270,17 @@ pub async fn probe_backing_fs(emitter: &SetupEmitter) -> BackingFs {
         mounted
     }
 
+    // Preference order: reflink XFS → Btrfs → plain XFS → ext4. The first two
+    // give copy-on-write (cheap snapshots); we only drop to a full-copy
+    // filesystem (plain XFS / ext4) when no CoW option mounts on this kernel.
     let chosen = if have_xfs_tools
         && format_and_mount(img, mnt, "mkfs.xfs", &["-q", "-f", "-m", "reflink=1", img]).await
     {
         BackingFs::XfsReflink
+    } else if have_btrfs_tools
+        && format_and_mount(img, mnt, "mkfs.btrfs", &["-q", "-f", img]).await
+    {
+        BackingFs::Btrfs
     } else if have_xfs_tools
         && format_and_mount(img, mnt, "mkfs.xfs", &["-q", "-f", "-m", "reflink=0,bigtime=0,inobtcount=0", img]).await
     {

@@ -117,6 +117,15 @@ async fn create_drive(
     sentryusb_shell::run("truncate", &["--size", &format!("{}K", size_kb), &filename]).await
         .context("truncate failed")?;
 
+    // On a Btrfs backing partition, mark the big disk-image files NoCOW: they
+    // are constantly random-overwritten by the Tesla and would fragment badly
+    // under copy-on-write. Must run on the freshly-truncated (still-empty) file,
+    // before sfdisk writes anything. Best-effort + ignore errors — `chattr +C`
+    // only applies on Btrfs (returns "Operation not supported" on xfs/ext4, a
+    // harmless no-op). Reflink snapshots still work on NoCOW Btrfs files, so we
+    // keep cheap snapshots without the fragmentation.
+    let _ = sentryusb_shell::run("chattr", &["+C", &filename]).await;
+
     // Create partition table
     let sfdisk_type = if use_exfat { "type=7" } else { "type=c" };
     sentryusb_shell::run(

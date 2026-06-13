@@ -137,10 +137,17 @@ fn force_peripheral_role() {
             let p = e.path();
             let knob = p.join("otg_role");
             if knob.is_file() {
-                // "peripheral" is the musb/sunxi token for device mode. A
-                // wrong token just fails the write harmlessly; verified
-                // on-device. Writing it is idempotent.
-                let _ = fs::write(&knob, "peripheral");
+                // The accepted token varies by driver. The Allwinner A733
+                // (sunxi) otg_role takes "usb_device" — VERIFIED on-device:
+                // the valid values mirror the sibling usb_host/usb_device/
+                // usb_otg pseudo-files, and "peripheral"/"device" return
+                // EINVAL there. Other controllers (musb) use "peripheral" or
+                // "device". Try each; wrong tokens fail harmlessly. Idempotent.
+                for tok in ["usb_device", "peripheral", "device"] {
+                    if fs::write(&knob, tok).is_ok() {
+                        break;
+                    }
+                }
             }
             if p.is_dir() {
                 walk(&p, depth - 1);
