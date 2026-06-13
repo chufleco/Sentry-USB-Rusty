@@ -382,7 +382,36 @@ async fn compute_network_info() -> CachedNetwork {
                 if let Some(rest) = trimmed.strip_prefix("freq:") {
                     if let Ok(mhz) = rest.trim().parse::<u64>() {
                         info.wifi_freq = (mhz * 1_000_000).to_string();
-                        break;
+                    }
+                } else if info.wifi_ssid.is_empty() {
+                    // SSID fallback #1: `iw dev <iface> link` prints
+                    // "SSID: <name>". Covers images without wireless-tools
+                    // (no iwgetid) or WiFi drivers that don't answer the old
+                    // WEXT ioctl iwgetid uses — e.g. the Allwinner A733 /
+                    // Orange Pi. (Pi / Rock 4C+ ship iwgetid, so it's moot there.)
+                    if let Some(rest) = trimmed.strip_prefix("SSID:") {
+                        info.wifi_ssid = rest.trim().to_string();
+                    }
+                }
+            }
+        }
+
+        // SSID fallback #2: NetworkManager, for boards that ship only nmcli
+        // (no iwgetid/iw at all — the Orange Pi image is one). Without an SSID
+        // the UI shows WiFi as "Not connected" even when it's fully online,
+        // since that indicator keys on the SSID being non-empty.
+        if info.wifi_ssid.is_empty() {
+            if let Ok(out) = sentryusb_shell::run(
+                "nmcli",
+                &["-t", "-f", "GENERAL.CONNECTION", "device", "show", wifi_dev.as_str()],
+            ).await {
+                for line in out.lines() {
+                    if let Some(rest) = line.trim().strip_prefix("GENERAL.CONNECTION:") {
+                        let v = rest.trim();
+                        if !v.is_empty() && v != "--" {
+                            info.wifi_ssid = v.to_string();
+                            break;
+                        }
                     }
                 }
             }
