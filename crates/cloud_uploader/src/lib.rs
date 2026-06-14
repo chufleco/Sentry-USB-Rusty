@@ -92,14 +92,6 @@ impl CloudUploader {
     pub fn backfill_ble_reupload(&self) -> anyhow::Result<i64> {
         db_ext::backfill_ble_reupload(&self.inner.store)
     }
-
-    /// One-shot full re-sync: reset `cloud_uploaded_at` on every uploaded
-    /// route (not just BLE ones) so the next sweep re-uploads the entire
-    /// library. For repopulating the cloud after a server-side wipe.
-    /// Returns the number of routes queued; caller should `nudge()`.
-    pub fn resync_all_reupload(&self) -> anyhow::Result<i64> {
-        db_ext::resync_all_reupload(&self.inner.store)
-    }
 }
 
 pub struct SpawnOptions {
