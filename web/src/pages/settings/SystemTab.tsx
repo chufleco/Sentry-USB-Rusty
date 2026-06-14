@@ -107,37 +107,40 @@ export function SystemTab({ onOpenRawConfig, onOpenWizard, version, hostname }: 
 
   return (
     <PrefGrid min={300}>
-      {/* --- Configuration: edit raw keys or export the full config --- */}
-      <PrefCard
-        icon={<SettingsIcon className="h-3.5 w-3.5" />}
-        halo="slate"
-        title="Configuration"
-      >
-        <p className="t-xs">
-          Edit individual settings keys directly, or export your full active
-          configuration as a single shell-format file — handy for migrating to a
-          new Pi or sharing a recipe.
-        </p>
-        <div className="flex flex-wrap gap-2">
-          <button
-            onClick={onOpenRawConfig}
-            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
-          >
-            <SettingsIcon className="mr-1.5 inline h-3.5 w-3.5" />
-            Open editor
-          </button>
-          <button
-            onClick={exportConfig}
-            className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
-          >
-            <Download className="mr-1.5 inline h-3.5 w-3.5" />
-            Download sentryusb.conf
-          </button>
-        </div>
-      </PrefCard>
-
-      {/* --- Backups / config maintenance --- */}
-      <ConfigBackupSection />
+      {/* --- Config Backup + Configuration, grouped into one masonry column
+          so the Configuration card sits directly UNDER Config Backup. The
+          height-balanced grid won't reliably stack two separate siblings,
+          so we wrap them in a single column unit. --- */}
+      <div className="flex flex-col gap-2.5">
+        <ConfigBackupSection />
+        <PrefCard
+          icon={<SettingsIcon className="h-3.5 w-3.5" />}
+          halo="slate"
+          title="Configuration"
+        >
+          <p className="t-xs">
+            Edit individual settings keys directly, or export your full active
+            configuration as a single shell-format file — handy for migrating to a
+            new Pi or sharing a recipe.
+          </p>
+          <div className="flex flex-wrap gap-2">
+            <button
+              onClick={onOpenRawConfig}
+              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
+            >
+              <SettingsIcon className="mr-1.5 inline h-3.5 w-3.5" />
+              Open editor
+            </button>
+            <button
+              onClick={exportConfig}
+              className="rounded-lg border border-white/10 bg-white/5 px-3 py-1.5 text-xs font-medium text-slate-300 transition-colors hover:bg-white/10"
+            >
+              <Download className="mr-1.5 inline h-3.5 w-3.5" />
+              Download sentryusb.conf
+            </button>
+          </div>
+        </PrefCard>
+      </div>
 
       {/* --- Storage repair (external-SSD XFS recovery) --- */}
       <StorageRepairCard />
