@@ -35,14 +35,14 @@ const HealthCheckModal = lazy(() => import("@/components/settings/sections/Healt
 const SpeedTestModal = lazy(() => import("@/components/settings/sections/SpeedTestModal").then(m => ({ default: m.SpeedTestModal })))
 
 // Four task-based groups (consolidated from the original seven):
-//   Device        — keep-awake, units, keep-accessory, software updates
-//   Car & Network — WiFi/Eth, Tesla BLE, Away Mode, SentryCloud
-//   Notifications — mobile push + community features
-//   System        — backups/export/raw-config, setup wizard, privacy
+//   Device                  — keep-awake, units, keep-accessory, software updates
+//   Car & Network           — WiFi/Eth, Tesla BLE, Away Mode, SentryCloud
+//   Notifications & Community — mobile push + community features (wraps, chimes)
+//   System                  — backups/export/raw-config, setup wizard, privacy
 const TABS = [
   "Device",
   "Car & Network",
-  "Notifications",
+  "Notifications & Community",
   "System",
 ] as const
 type TabName = (typeof TABS)[number]
@@ -269,7 +269,7 @@ export default function Settings() {
         {activeTab === "Car & Network" && (
           <NetworkTab status={status} onOpenWizard={handleOpenWizard} />
         )}
-        {activeTab === "Notifications" && <NotificationsTab />}
+        {activeTab === "Notifications & Community" && <NotificationsTab />}
         {activeTab === "System" && (
           <SystemTab
             onOpenRawConfig={handleOpenRawConfig}
