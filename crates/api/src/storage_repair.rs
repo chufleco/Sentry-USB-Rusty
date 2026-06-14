@@ -208,22 +208,43 @@ async fn is_external(dev: &str) -> bool {
     }
 }
 
-/// Recent XFS-related kernel log lines mentioning the device, newest last.
+/// True for a genuine XFS *error* line for this device, excluding the benign
+/// informational lines XFS prints on every mount/unmount ("Mounting V5
+/// Filesystem", "Ending clean mount"). The first cut flagged any line that
+/// merely mentioned the device, so a healthy remount after a repair looked
+/// like two fresh "errors". An error line must carry a real error keyword.
+fn is_xfs_error_line(line: &str, devbase: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    if !l.contains("xfs") || !l.contains(devbase) {
+        return false;
+    }
+    // Normal lifecycle chatter — never an error.
+    if l.contains("mounting")
+        || l.contains("unmounting")
+        || l.contains("ending clean mount")
+        || l.contains("ending clean unmount")
+    {
+        return false;
+    }
+    l.contains("error")
+        || l.contains("corrupt")
+        || l.contains("shut down")
+        || l.contains("shutdown")
+        || l.contains("i/o error")
+        || l.contains("log recovery")
+        || l.contains("inconsistent")
+        || l.contains("needs repair")
+        || l.contains("metadata corruption")
+}
+
+/// Recent genuine XFS error lines for the device, newest last.
 async fn recent_xfs_errors(dev: &str) -> Vec<String> {
     let r = run_capture(PROBE_TIMEOUT, "dmesg", &["--ctime"]).await;
     let devbase = dev.strip_prefix("/dev/").unwrap_or(dev).to_ascii_lowercase();
     let mut out: Vec<String> = r
         .output
         .lines()
-        .filter(|l| {
-            let ll = l.to_ascii_lowercase();
-            ll.contains("xfs")
-                && (ll.contains("error")
-                    || ll.contains("corrupt")
-                    || ll.contains("shut down")
-                    || ll.contains("metadata")
-                    || ll.contains(&devbase))
-        })
+        .filter(|l| is_xfs_error_line(l, &devbase))
         .map(|s| s.trim().to_string())
         .collect();
     let len = out.len();
@@ -594,6 +615,32 @@ tmpfs /run tmpfs rw 0 0";
     fn resolve_mount_source_ignores_short_lines() {
         // A malformed/short line must not panic or mis-resolve.
         assert_eq!(resolve_mount_source("garbage\n/dev/sda2 /backingfiles xfs rw 0 0", "/backingfiles").as_deref(), Some("/dev/sda2"));
+    }
+
+    #[test]
+    fn xfs_error_filter_ignores_benign_mount_lines() {
+        let dev = "sda2";
+        // Benign lifecycle chatter — the lines a healthy remount prints.
+        // These were wrongly flagged as "2 recent filesystem errors".
+        assert!(!is_xfs_error_line(
+            "[Sun Jun 14 05:34:14 2026] XFS (sda2): Mounting V5 Filesystem b1a5fe90",
+            dev
+        ));
+        assert!(!is_xfs_error_line(
+            "[Sun Jun 14 05:34:14 2026] XFS (sda2): Ending clean mount",
+            dev
+        ));
+        // Real errors from the actual incident MUST still be flagged.
+        assert!(is_xfs_error_line("XFS (sda2): Metadata CRC error detected", dev));
+        assert!(is_xfs_error_line(
+            "XFS (sda2): Filesystem has been shut down due to log error (0x2).",
+            dev
+        ));
+        assert!(is_xfs_error_line("XFS (sda2): log mount/recovery failed: error -74", dev));
+        // A different volume's noise is ignored.
+        assert!(!is_xfs_error_line("XFS (sdb1): Metadata CRC error detected", dev));
+        // Non-XFS lines are ignored.
+        assert!(!is_xfs_error_line("EXT4-fs (sda1): error count", dev));
     }
 
     #[test]

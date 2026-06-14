@@ -77,6 +77,7 @@ export function StorageRepairCard() {
   const [errorMsg, setErrorMsg] = useState<string>("")
   const [rebooting, setRebooting] = useState(false)
   const logRef = useRef<HTMLDivElement>(null)
+  const rebootPollRef = useRef<number | null>(null)
 
   const refreshHealth = useCallback(() => {
     fetch("/api/storage/health")
@@ -125,6 +126,14 @@ export function StorageRepairCard() {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight
   }, [lines])
 
+  // Stop the reboot poller if the card unmounts before the box returns.
+  useEffect(
+    () => () => {
+      if (rebootPollRef.current) window.clearInterval(rebootPollRef.current)
+    },
+    []
+  )
+
   async function startRepair(force: boolean) {
     setLines([])
     setForceMsg("")
@@ -155,6 +164,23 @@ export function StorageRepairCard() {
     } catch {
       /* the box is going down — a failed fetch here is expected */
     }
+    // Wait for the Pi to actually drop off and come back, then reload so the
+    // card re-fetches health (now mounted/healthy) instead of sitting on
+    // "Rebooting…" forever. We only reload after seeing it go DOWN first, so
+    // the still-up pre-reboot server doesn't trigger an immediate reload.
+    let sawDown = false
+    if (rebootPollRef.current) window.clearInterval(rebootPollRef.current)
+    rebootPollRef.current = window.setInterval(async () => {
+      try {
+        const res = await fetch("/api/status", { cache: "no-store" })
+        if (res.ok && sawDown) {
+          if (rebootPollRef.current) window.clearInterval(rebootPollRef.current)
+          window.location.reload()
+        }
+      } catch {
+        sawDown = true // box is going / gone down
+      }
+    }, 3000)
   }
 
   // ── Blocked state: storage isn't on a separate external drive. ──
