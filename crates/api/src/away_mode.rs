@@ -323,7 +323,7 @@ fn write_auto_flag_file() {
 /// One auto-mode tick: read the fix + geofence, fold into the confirm
 /// state, and toggle the AP on a confirmed home/away flip. Holds (no
 /// change) on a stale/missing fix or an unset home geofence.
-async fn auto_eval_tick() {
+async fn auto_eval_tick(my_epoch: u64) {
     let fix = read_gps_fix();
     let (home_lat, home_lon, radius_m) = read_away_geofence();
 
@@ -335,25 +335,24 @@ async fn auto_eval_tick() {
         _ => None,
     };
 
-    let commit = {
-        let mut inner = mgr().lock().unwrap();
-        if inner.mode != "auto" {
-            return; // mode changed out from under us
-        }
-        let last = inner.last_is_home;
-        let mut pending = inner.pending_is_home;
-        let mut count = inner.pending_count;
-        let decision = fold_geofence(candidate, last, &mut pending, &mut count);
-        inner.pending_is_home = pending;
-        inner.pending_count = count;
-        if let Some(new_home) = decision {
-            inner.last_is_home = Some(new_home);
-        }
-        decision
-    };
-
-    // Act outside the lock (AP toggles spawn their own tasks).
-    if let Some(is_home) = commit {
+    // Decide AND act in one critical section. `set_mode`/`disable` switch
+    // the mode and bump the epoch under this same lock, so holding it across
+    // the toggle stops a switch from landing between our commit and the AP
+    // action (which would leave the AP up + flag file present in Manual
+    // mode). The toggles only spawn tasks — no blocking, no `.await` — so
+    // the std mutex is held briefly and never across a yield.
+    let mut inner = mgr().lock().unwrap();
+    if inner.mode != "auto" || inner.epoch != my_epoch {
+        return; // mode changed or watcher superseded — don't touch the AP
+    }
+    let last = inner.last_is_home;
+    let mut pending = inner.pending_is_home;
+    let mut count = inner.pending_count;
+    let decision = fold_geofence(candidate, last, &mut pending, &mut count);
+    inner.pending_is_home = pending;
+    inner.pending_count = count;
+    if let Some(is_home) = decision {
+        inner.last_is_home = Some(is_home);
         if is_home {
             // Arrived home → drop the AP so wlan0 rejoins home WiFi.
             // Remove the flag first so the dispatcher won't resurrect ap0.
@@ -388,7 +387,7 @@ fn spawn_auto_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
                     return;
                 }
             }
-            auto_eval_tick().await;
+            auto_eval_tick(my_epoch).await;
         }
     });
 }
