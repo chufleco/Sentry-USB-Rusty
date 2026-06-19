@@ -382,7 +382,7 @@ fn already_readonly(env: &SetupEnv) -> bool {
     root_ro && cmdline_ro
 }
 
-async fn ensure_boot_rw() {
+pub async fn ensure_boot_rw() {
     // /sentryusb is the Rust-preferred symlink; /teslausb is the legacy name
     // some upgraded installs still have. /boot/firmware is the bookworm path.
     for mp in &["/sentryusb", "/teslausb", "/boot/firmware", "/boot"] {

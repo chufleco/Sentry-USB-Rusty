@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
-use tracing::info;
+use tracing::{error, info};
 
 use crate::env::SetupEnv;
 use crate::SetupEmitter;
@@ -75,6 +75,17 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
     if !am_root() {
         bail!("Setup must run as root");
     }
+
+    // The STARTED/FINISHED markers (and several early phases) live on the
+    // boot partition (/sentryusb). On a re-run of an already-read-only
+    // system the boot partition is mounted read-only, so these writes
+    // silently fail. The critical casualty is the FINISHED marker at the
+    // end: without it, `auto_resume_setup` re-runs setup on every boot —
+    // an endless "Setup Complete → reboot" loop. Force boot writable up
+    // front (no-op when it already is); the final reboot re-applies `ro`
+    // from fstab. This is NOT covered by make_readonly's own ensure_boot_rw
+    // because that phase early-returns when the system is already read-only.
+    crate::readonly::ensure_boot_rw().await;
 
     let resuming = Path::new(SETUP_STARTED_MARKER).exists();
     // Capture this BEFORE we delete the finished marker — the partition
@@ -282,8 +293,20 @@ pub async fn run_full_setup(emitter: SetupEmitter) -> Result<()> {
         env.data_drive.clone().unwrap_or_default(),
     );
 
+    // The make_readonly phase above may have left the boot partition
+    // read-only on this run (it early-returns without remounting when the
+    // system was already read-only). Re-assert writability so the FINISHED
+    // marker — the one thing that stops setup from re-running every boot —
+    // actually lands, and don't swallow its error.
+    crate::readonly::ensure_boot_rw().await;
     let _ = std::fs::remove_file(SETUP_STARTED_MARKER);
-    let _ = std::fs::write(SETUP_FINISHED_MARKER, "");
+    if let Err(e) = std::fs::write(SETUP_FINISHED_MARKER, "") {
+        error!(
+            "[setup] CRITICAL: failed to write {} ({e}). Setup will re-run on \
+             the next boot — the boot partition may be read-only.",
+            SETUP_FINISHED_MARKER
+        );
+    }
 
     emitter.progress("=== SentryUSB Setup Complete ===");
     emitter.progress("Rebooting in 5 seconds to apply changes...");
