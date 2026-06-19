@@ -648,6 +648,14 @@ async fn signed_request_with_refresh_retry(
     const WAIT_RETRY_DELAY: Duration = Duration::from_millis(400);
     let mut refresh_retries_left = 1u32;
     let mut wait_retries_left = 1u32;
+    // One self-heal for a stale-session decrypt failure: the car answered
+    // but we couldn't decrypt because our cached session key is stale
+    // (car re-keyed / rotated epoch). Dropping the cached session forces a
+    // fresh handshake on the retry. Without this the stale key persisted
+    // and every command failed `aead::Error` until an unrelated transport
+    // drop happened to clear it. (tesla-control never hits this — it
+    // re-handshakes a fresh session on every invocation.)
+    let mut stale_retries_left = 1u32;
 
     loop {
         match try_signed_request_once(state, domain, &inner).await {
@@ -680,7 +688,24 @@ async fn signed_request_with_refresh_retry(
                 );
                 sleep(WAIT_RETRY_DELAY).await;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                // Stale-session self-heal: a response-decrypt failure
+                // means the link is fine but our cached session key is
+                // stale. Drop it so the retry re-handshakes a fresh one,
+                // instead of failing this (and every following) command.
+                if stale_retries_left > 0 && is_decrypt_error(&e) {
+                    stale_retries_left -= 1;
+                    state.domains.remove(&domain);
+                    warn!(
+                        "PersistentSession: response decrypt failed for {:?} \
+                         (stale session) — dropping cached session, \
+                         re-handshaking and retrying once: {e:#}",
+                        domain
+                    );
+                    continue;
+                }
+                return Err(e);
+            }
         }
     }
 }
@@ -1546,6 +1571,16 @@ fn is_transport_error(e: &anyhow::Error) -> bool {
         || msg.contains("Peripheral")
 }
 
+/// Whether `e` is an AES-GCM response-decrypt failure — the car answered
+/// but we couldn't decrypt it, meaning our cached session key is stale
+/// (car re-keyed / rotated epoch). Distinct from a transport error: the
+/// link is fine, the *session* is stale. Recovered by dropping the cached
+/// domain session and re-handshaking (see `signed_request_with_refresh_retry`).
+/// Matches the message built in `auth::decrypt_response`.
+fn is_decrypt_error(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("AES-GCM response decrypt")
+}
+
 /// Snapshot recent kernel Bluetooth lines so a drop that fires before
 /// any query (the "held=0s" pattern) comes with the kernel's reason —
 /// btleplug only surfaces an opaque "Failed to initiate write", but
@@ -1599,4 +1634,29 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
         .copied()
         .collect();
     Some(tail.join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_decrypt_error, is_transport_error};
+
+    #[test]
+    fn decrypt_failure_is_decrypt_not_transport() {
+        // Exact message shape from auth::decrypt_response.
+        let e = anyhow::anyhow!("AES-GCM response decrypt: aead::Error");
+        assert!(is_decrypt_error(&e), "stale-session decrypt failure must self-heal");
+        assert!(
+            !is_transport_error(&e),
+            "a decrypt failure must NOT be treated as a transport drop"
+        );
+    }
+
+    #[test]
+    fn transport_failure_is_not_decrypt() {
+        for msg in ["BLE write: Timeout", "not connected", "notification stream ended"] {
+            let e = anyhow::anyhow!("{msg}");
+            assert!(is_transport_error(&e), "{msg} should be transport");
+            assert!(!is_decrypt_error(&e), "{msg} must not trigger session re-handshake");
+        }
+    }
 }
