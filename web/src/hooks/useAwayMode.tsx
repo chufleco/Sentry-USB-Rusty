@@ -165,9 +165,12 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
                 body: JSON.stringify({ mode }),
             })
         } catch { /* ignore */ }
-        // Let the mutation guard lapse, then pull fresh full status (the
-        // /mode response omits ap_ssid/ap_ip the status endpoint adds).
-        lastMutation.current = 0
+        // Pull fresh full status (the /mode response omits the ap_ssid/ap_ip
+        // the status endpoint adds). refresh() starts after this mutation's
+        // timestamp, so its own response still applies — but we must NOT
+        // reset the guard to 0: doing so let a status poll that was already
+        // in flight before the switch land afterward and revert the
+        // optimistic mode, flickering the picker back for one cycle.
         refresh()
     }, [refresh])
 
