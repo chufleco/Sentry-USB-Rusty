@@ -8,6 +8,7 @@
 pub mod apt;
 pub mod emitter;
 pub mod env;
+pub mod error;
 pub mod partition;
 pub mod disk_images;
 pub mod system;
@@ -21,3 +22,4 @@ pub mod verify;
 pub mod runner;
 
 pub use emitter::SetupEmitter;
+pub use error::ConfigError;

@@ -1,6 +1,6 @@
 import { useEffect, useState, lazy, Suspense } from "react"
 import { BrowserRouter, Routes, Route } from "react-router-dom"
-import { Loader2 } from "lucide-react"
+import { Loader2, AlertTriangle } from "lucide-react"
 import { AppShell } from "@/components/layout/AppShell"
 import { SetupWizard } from "@/components/setup/SetupWizard"
 import { SetupProgress } from "@/components/setup/SetupProgress"
@@ -30,7 +30,9 @@ const Notifications = lazy(() => import("@/pages/Notifications"))
 const Snapshots = lazy(() => import("@/pages/Snapshots"))
 const Login = lazy(() => import("@/pages/Login"))
 
-type AppState = "loading" | "setup" | "configuring" | "finalizing" | "ready"
+type AppState = "loading" | "setup" | "configuring" | "finalizing" | "ready" | "setup_error"
+
+type SetupErrorInfo = { kind?: string; message?: string }
 
 export default function App() {
   return (
@@ -63,6 +65,7 @@ function CrashScreen({ error }: { error: Error }) {
 
 function AppContent() {
   const [appState, setAppState] = useState<AppState>("loading")
+  const [setupError, setSetupError] = useState<SetupErrorInfo | null>(null)
   const { state: authState, login } = useAuth()
 
   useEffect(() => {
@@ -74,6 +77,12 @@ function AppContent() {
         if (cancelled) return
         if (data.setup_finished) {
           setAppState("ready")
+        } else if (data.error) {
+          // Setup stopped on an error. Show a terminal "fix & retry" state
+          // instead of the perpetual "Setting Up" spinner — this is what a
+          // page reload after a config failure used to get stuck on.
+          setSetupError(data.error)
+          setAppState("setup_error")
         } else if (data.setup_running) {
           setAppState("configuring")
         } else {
@@ -101,6 +110,11 @@ function AppContent() {
         const data = await res.json()
         if (data.setup_finished) {
           setAppState("finalizing")
+        } else if (data.error) {
+          // Failed mid-run (e.g. a config validation bail) — surface it
+          // instead of spinning forever.
+          setSetupError(data.error)
+          setAppState("setup_error")
         }
       } catch {
         // Server rebooting — keep polling
@@ -136,6 +150,59 @@ function AppContent() {
     return (
       <div className="flex h-screen items-center justify-center bg-slate-950">
         <div className="h-6 w-6 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+      </div>
+    )
+  }
+
+  // Setup stopped on an error — terminal "fix & retry" state. Replaces the
+  // old behavior where a config failure left the UI on the "Setting Up"
+  // spinner forever while the device silently re-ran the doomed setup.
+  if (appState === "setup_error") {
+    const isConfig = setupError?.kind === "config"
+    return (
+      <div className="flex min-h-screen items-center justify-center bg-slate-950 p-4">
+        <div className="flex w-full max-w-lg flex-col items-center gap-6 rounded-2xl border border-amber-500/20 bg-white/[0.03] p-10 text-center">
+          <div className="flex h-16 w-16 items-center justify-center rounded-full bg-amber-500/20">
+            <AlertTriangle className="h-8 w-8 text-amber-400" />
+          </div>
+          <div>
+            <h2 className="text-xl font-semibold text-slate-100">
+              {isConfig ? "Setup needs a configuration fix" : "Setup hit a problem"}
+            </h2>
+            <p className="mt-2 text-sm text-slate-400">
+              {setupError?.message || "Setup could not finish."}
+            </p>
+            <p className="mt-4 text-xs text-slate-600">
+              {isConfig
+                ? "Adjust your settings and re-run setup. Your recordings are not affected."
+                : "Retry setup, or open the configuration to make changes."}
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-3">
+            <button
+              onClick={() => { setSetupError(null); setAppState("setup") }}
+              className="rounded-lg bg-blue-500/15 px-4 py-2 text-sm font-medium text-blue-400 transition-colors hover:bg-blue-500/25"
+            >
+              Open setup to fix
+            </button>
+            {!isConfig && (
+              <button
+                onClick={async () => {
+                  setSetupError(null)
+                  setAppState("configuring")
+                  try {
+                    await fetch("/api/setup/run", { method: "POST" })
+                  } catch {
+                    /* poll loop will re-surface any error */
+                  }
+                }}
+                className="rounded-lg border border-white/10 px-4 py-2 text-sm font-medium text-slate-300 transition-colors hover:bg-white/[0.06]"
+              >
+                Retry setup
+              </button>
+            )}
+          </div>
+        </div>
       </div>
     )
   }

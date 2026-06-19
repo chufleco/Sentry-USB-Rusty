@@ -13,6 +13,7 @@ use anyhow::{bail, Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::error::ConfigError;
 use crate::SetupEmitter;
 
 /// Configure the WiFi access point.
@@ -31,7 +32,12 @@ pub async fn configure_ap(env: &SetupEnv, emitter: &SetupEmitter) -> Result<()> 
 
     let pass = match env.config.get("AP_PASS") {
         Some(v) if !v.is_empty() && v != "password" && v.len() >= 8 => v.clone(),
-        _ => bail!("AP_PASS not set, unchanged from default, or too short (min 8 chars)"),
+        _ => {
+            return Err(ConfigError(
+                "AP_PASS not set, unchanged from default, or too short (min 8 chars)".into(),
+            )
+            .into())
+        }
     };
 
     emitter.begin_phase("wifi_ap", "WiFi access point");

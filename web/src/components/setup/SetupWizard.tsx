@@ -399,7 +399,14 @@ export function SetupWizard({ initialData, onClose }: SetupWizardProps) {
       try {
         const res = await fetch("/api/setup/status")
         const data = await res.json()
-        if (data.setup_finished) {
+        if (data.error) {
+          // Setup stopped on an error (e.g. a config validation bail).
+          // Surface it from the polled status — don't mistake the
+          // stopped-not-running state for a mid-flow reboot.
+          setPhase("error")
+          setSetupMessage(data.error.message || "Setup failed. Check the log below.")
+          if (pollRef.current) clearInterval(pollRef.current)
+        } else if (data.setup_finished) {
           // Setup scripts are done — the Pi will do a final reboot.
           // Transition to "finalizing" which keeps the spinner and
           // waits for the server to come back before showing dashboard.

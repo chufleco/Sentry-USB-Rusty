@@ -6,10 +6,11 @@
 
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use tracing::info;
 
 use crate::env::SetupEnv;
+use crate::error::ConfigError;
 use crate::SetupEmitter;
 
 /// Supported archive backends.
@@ -30,7 +31,7 @@ impl ArchiveSystem {
             "rsync" => Ok(Self::Rsync),
             "rclone" => Ok(Self::Rclone),
             "none" | "" => Ok(Self::None),
-            other => bail!("Unrecognized archive system: {}", other),
+            other => Err(ConfigError(format!("Unrecognized archive system: {other}")).into()),
         }
     }
 }
@@ -39,7 +40,9 @@ impl ArchiveSystem {
 fn validate_archive_config(env: &SetupEnv, system: ArchiveSystem) -> Result<()> {
     let require = |key: &str| -> Result<()> {
         if env.config.get(key).map_or(true, |v| v.is_empty()) {
-            bail!("Required config variable {} is not set", key);
+            return Err(
+                ConfigError(format!("Required config variable {key} is not set")).into(),
+            );
         }
         Ok(())
     };
@@ -186,11 +189,12 @@ fn validate_wake_apis(env: &SetupEnv) -> Result<()> {
         providers.push("Webhook");
     }
     if providers.len() > 1 {
-        bail!(
+        return Err(ConfigError(format!(
             "Multiple keep-awake providers configured ({}) — only 1 can be enabled \
              at a time. Edit /root/sentryusb.conf and keep just one.",
             providers.join(", ")
-        );
+        ))
+        .into());
     }
     Ok(())
 }
@@ -205,7 +209,10 @@ fn validate_sentry_case(env: &SetupEnv) -> Result<()> {
     if has_api {
         let case = env.get("SENTRY_CASE", "");
         if !["1", "2", "3"].contains(&case.as_str()) {
-            bail!("SENTRY_CASE must be 1, 2, or 3 when a wake API is configured");
+            return Err(ConfigError(
+                "SENTRY_CASE must be 1, 2, or 3 when a wake API is configured".into(),
+            )
+            .into());
         }
     }
     Ok(())
@@ -722,6 +729,33 @@ mod tests {
         ]);
         let err = validate_wake_apis(&env).unwrap_err().to_string();
         assert!(err.contains("BLE") && err.contains("Tessie"), "error names both: {err}");
+    }
+
+    #[test]
+    fn provider_conflict_is_a_config_error() {
+        // Config-validation failures must be a downcastable ConfigError so
+        // the web server can tell "user must fix settings" apart from a
+        // transient failure and stop the silent setup boot-loop.
+        let env = env_with(&[
+            ("TESLA_BLE_VIN", "5YJ3E1EA4JF000001"),
+            ("BLE_KEEP_AWAKE_ENABLED", "yes"),
+            ("TESSIE_API_TOKEN", "real-token"),
+        ]);
+        let err = validate_wake_apis(&env).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::ConfigError>().is_some(),
+            "provider conflict must be a ConfigError, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn missing_sentry_case_is_a_config_error() {
+        let env = env_with(&[("TESSIE_API_TOKEN", "real-token")]);
+        let err = validate_sentry_case(&env).unwrap_err();
+        assert!(
+            err.downcast_ref::<crate::error::ConfigError>().is_some(),
+            "missing SENTRY_CASE must be a ConfigError, got: {err:?}"
+        );
     }
 
     #[test]

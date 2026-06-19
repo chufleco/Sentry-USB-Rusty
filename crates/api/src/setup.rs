@@ -42,11 +42,93 @@ fn is_setup_started() -> bool {
     SETUP_STARTED_PATHS.iter().any(|p| std::path::Path::new(p).exists())
 }
 
+/// Persistent record of the last setup failure, written next to the
+/// STARTED/FINISHED markers. Without it, a failure is only a transient
+/// WebSocket event + a log line — so a page reload after the failure
+/// shows the perpetual "Setting Up" spinner forever (no terminal state),
+/// and `auto_resume_setup` silently re-runs the doomed setup every boot.
+const SETUP_ERROR_MARKER: &str = "/sentryusb/SENTRYUSB_SETUP_ERROR";
+
+#[derive(Debug, Clone, PartialEq)]
+struct SetupFailure {
+    /// "config" = user must fix settings (don't auto-retry);
+    /// "transient" = network/apt/disk hiccup (safe to auto-retry on boot).
+    kind: &'static str,
+    message: String,
+}
+
+impl SetupFailure {
+    /// Classify an `anyhow` error from the setup runner. Config-validation
+    /// failures surface as a downcastable `sentryusb_setup::ConfigError`.
+    fn from_error(err: &anyhow::Error) -> Self {
+        let kind = if err.downcast_ref::<sentryusb_setup::ConfigError>().is_some() {
+            "config"
+        } else {
+            "transient"
+        };
+        SetupFailure { kind, message: format!("{err:#}") }
+    }
+
+    fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "kind": self.kind, "message": self.message })
+    }
+
+    fn parse(s: &str) -> Option<SetupFailure> {
+        let v: serde_json::Value = serde_json::from_str(s).ok()?;
+        // Unknown/missing kinds degrade to "transient" — the conservative
+        // choice, since transient still allows auto-resume rather than
+        // silently wedging a recoverable install.
+        let kind = if v.get("kind").and_then(|k| k.as_str()) == Some("config") {
+            "config"
+        } else {
+            "transient"
+        };
+        let message = v
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or_default()
+            .to_string();
+        Some(SetupFailure { kind, message })
+    }
+}
+
+/// Decide whether to auto-resume an interrupted setup on boot. A config
+/// failure must NOT auto-resume (it fails identically); the user fixes
+/// settings and retries. A transient failure — and the normal mid-flow
+/// reboot case (no failure marker at all) — does resume.
+fn should_auto_resume(started: bool, finished: bool, failure: Option<&SetupFailure>) -> bool {
+    started && !finished && failure.map_or(true, |f| f.kind != "config")
+}
+
+fn read_setup_failure() -> Option<SetupFailure> {
+    SetupFailure::parse(&std::fs::read_to_string(SETUP_ERROR_MARKER).ok()?)
+}
+
+fn write_setup_failure(f: &SetupFailure) {
+    let _ = std::process::Command::new("bash")
+        .args(["-c", "/root/bin/remountfs_rw"])
+        .status();
+    let _ = std::fs::write(SETUP_ERROR_MARKER, f.to_json().to_string());
+}
+
+fn clear_setup_failure() {
+    let _ = std::fs::remove_file(SETUP_ERROR_MARKER);
+}
+
 /// Call at server startup to resume an interrupted setup after reboot.
 pub fn auto_resume_setup(hub: sentryusb_ws::Hub) {
-    if is_setup_started() && !is_setup_finished() {
+    let failure = read_setup_failure();
+    if should_auto_resume(is_setup_started(), is_setup_finished(), failure.as_ref()) {
         info!("[setup] Detected interrupted setup (STARTED marker present, no FINISHED). Auto-resuming...");
         spawn_setup(hub);
+    } else if let Some(f) = failure.filter(|f| f.kind == "config") {
+        // A config failure repeats identically on retry — don't spin the
+        // boot loop. Leave the marker so the web UI shows the error and the
+        // user can fix settings and retry explicitly.
+        info!(
+            "[setup] Last setup failed on a configuration error ({}). Not auto-resuming; awaiting user fix + retry.",
+            f.message
+        );
     }
 }
 
@@ -55,13 +137,24 @@ pub async fn get_setup_status(State(_s): State<AppState>) -> (StatusCode, Json<s
     let running = SETUP_RUNNING.load(Ordering::Relaxed);
     let finished = is_setup_finished();
 
-    // If setup was started but not finished, treat as running
-    let effective_running = running || (!finished && is_setup_started());
+    // Ignore any stale marker while a run is actively in progress.
+    let failure = if running { None } else { read_setup_failure() };
 
-    (StatusCode::OK, Json(serde_json::json!({
+    // STARTED-without-FINISHED normally means "still running" (a mid-flow
+    // reboot). But once a failure is recorded, setup has stopped and is
+    // awaiting a fix/retry — so stop reporting "running" (which is what
+    // kept the web UI stuck on the "Setting Up" spinner forever).
+    let effective_running = running || (!finished && is_setup_started() && failure.is_none());
+
+    let mut body = serde_json::json!({
         "setup_finished": finished,
         "setup_running": effective_running,
-    })))
+    });
+    if let Some(f) = failure {
+        body["error"] = f.to_json();
+    }
+
+    (StatusCode::OK, Json(body))
 }
 
 /// GET /api/setup/config
@@ -171,6 +264,9 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
     }
 
     tokio::spawn(async move {
+        // New attempt — drop any stale failure marker so a fresh run (or a
+        // user-initiated retry after fixing config) isn't reported as failed.
+        clear_setup_failure();
         hub.broadcast("setup_status", &serde_json::json!({"status": "running"}));
         info!("[setup] Starting native Rust setup");
 
@@ -195,6 +291,12 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
             }
             Err(e) => {
                 tracing::error!("[setup] Failed: {:#}", e);
+                // Persist a classified failure marker so a page reload shows
+                // a terminal "fix & retry" state (not the perpetual spinner)
+                // and `auto_resume_setup` stops silently re-running a config
+                // failure on every boot.
+                let failure = SetupFailure::from_error(&e);
+                write_setup_failure(&failure);
                 // Surface the error to the wizard's live log too. Without
                 // this, the failure only lands in journalctl and the
                 // wizard log just stops mid-phase with no explanation —
@@ -219,7 +321,14 @@ fn spawn_setup(hub: sentryusb_ws::Hub) {
                     let _ = writeln!(f, "{}", stamped);
                 }
                 hub.broadcast("setup_progress", &serde_json::json!({"message": stamped}));
-                hub.broadcast("setup", &serde_json::json!({"status": "error", "error": e.to_string()}));
+                hub.broadcast(
+                    "setup",
+                    &serde_json::json!({
+                        "status": "error",
+                        "error": e.to_string(),
+                        "kind": failure.kind,
+                    }),
+                );
             }
         }
     });
@@ -572,4 +681,66 @@ pub async fn preflight(
             req_gb, avail_gb, need_gb,
         ),
     })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_config_error() {
+        let e: anyhow::Error = sentryusb_setup::ConfigError("two providers".into()).into();
+        assert_eq!(SetupFailure::from_error(&e).kind, "config");
+    }
+
+    #[test]
+    fn classifies_transient_error() {
+        let e = anyhow::anyhow!("network unreachable");
+        assert_eq!(SetupFailure::from_error(&e).kind, "transient");
+    }
+
+    #[test]
+    fn from_error_keeps_the_message() {
+        let e: anyhow::Error = sentryusb_setup::ConfigError("SENTRY_CASE must be 1-3".into()).into();
+        assert!(SetupFailure::from_error(&e).message.contains("SENTRY_CASE"));
+    }
+
+    #[test]
+    fn failure_json_round_trips() {
+        let f = SetupFailure { kind: "config", message: "bad \"quoted\" value".into() };
+        let parsed = SetupFailure::parse(&f.to_json().to_string()).unwrap();
+        assert_eq!(parsed, f);
+    }
+
+    #[test]
+    fn parse_rejects_garbage() {
+        assert!(SetupFailure::parse("not json at all").is_none());
+    }
+
+    #[test]
+    fn config_failure_blocks_auto_resume() {
+        let f = SetupFailure { kind: "config", message: "x".into() };
+        assert!(!should_auto_resume(true, false, Some(&f)));
+    }
+
+    #[test]
+    fn transient_failure_still_auto_resumes() {
+        let f = SetupFailure { kind: "transient", message: "x".into() };
+        assert!(should_auto_resume(true, false, Some(&f)));
+    }
+
+    #[test]
+    fn mid_flow_reboot_with_no_failure_resumes() {
+        assert!(should_auto_resume(true, false, None));
+    }
+
+    #[test]
+    fn finished_setup_does_not_resume() {
+        assert!(!should_auto_resume(true, true, None));
+    }
+
+    #[test]
+    fn never_started_does_not_resume() {
+        assert!(!should_auto_resume(false, false, None));
+    }
 }
