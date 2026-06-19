@@ -242,12 +242,17 @@ async fn check_available_space(env: &SetupEnv, emitter: &SetupEmitter) -> Result
             ));
             check_available_space_usb(drive, emitter).await
         }
-        // A DATA_DRIVE that doesn't exist is the user's setting to fix →
-        // ConfigError, not a transient failure that should auto-retry.
-        Some(drive) => Err(ConfigError(format!(
-            "STOP: DATA_DRIVE is set to {drive}, which does not exist."
-        ))
-        .into()),
+        // Keep a missing DATA_DRIVE TRANSIENT (not ConfigError): env.data_drive
+        // is the raw config value with no existence check (env.rs), and this is
+        // the first existence gate. A USB/SSD that's just slow to enumerate — or
+        // not back yet after a mid-setup reboot, realistic on a brownout-prone
+        // Pi — must self-heal via the auto-resume retry rather than halt setup
+        // with a "fix your config" wall. A genuine typo only loops (pre-existing
+        // behavior); a transient absence recovers, which is the safer trade.
+        Some(drive) => bail!(
+            "STOP: DATA_DRIVE is set to {}, which does not exist.",
+            drive
+        ),
     }
 }
 
@@ -429,16 +434,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nonexistent_data_drive_is_a_config_error() {
-        // DATA_DRIVE pointing at a path that doesn't exist is the user's
-        // mistake to fix — classify it as ConfigError, not transient.
+    async fn nonexistent_data_drive_stays_transient() {
+        // A missing DATA_DRIVE must NOT be a ConfigError. `env.data_drive`
+        // is the raw config value with no existence check (env.rs), and this
+        // is the first existence gate — a USB/SSD that's merely slow to
+        // enumerate, or not back yet after a mid-setup reboot (realistic on
+        // a brownout-prone Pi), must auto-resume and retry, NOT halt setup as
+        // a config error. Keep it transient so it self-heals.
         let mut env = env_with(&[]);
         env.data_drive = Some("/no/such/sentryusb/drive".to_string());
         let emitter = SetupEmitter::new(|_| {}, |_, _| {});
         let err = check_available_space(&env, &emitter).await.unwrap_err();
         assert!(
-            err.downcast_ref::<ConfigError>().is_some(),
-            "nonexistent DATA_DRIVE must be a ConfigError, got: {err:?}"
+            err.downcast_ref::<ConfigError>().is_none(),
+            "nonexistent DATA_DRIVE must stay transient (self-heals on retry), got ConfigError: {err:?}"
         );
     }
 
