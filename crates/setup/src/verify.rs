@@ -31,6 +31,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 
 use crate::env::{PiModel, SetupEnv};
+use crate::error::ConfigError;
 use crate::SetupEmitter;
 
 /// Minimum usable space on the SD card (8 GiB) after root-partition shrink.
@@ -216,10 +217,14 @@ fn check_required_config(env: &SetupEnv) -> Result<()> {
     // explicitly empty or literal-0 CAM_SIZE still runs the setup — but
     // a truly missing key is a user-config error we should surface.
     if !env.config.contains_key("CAM_SIZE") {
-        bail!(
+        // User-config error (a missing key fails identically on retry) →
+        // ConfigError so the boot-loop auto-resume halts and surfaces it.
+        return Err(ConfigError(
             "STOP: Define the variable CAM_SIZE in sentryusb.conf like this: \
              export CAM_SIZE=32"
-        );
+                .into(),
+        )
+        .into());
     }
     Ok(())
 }
@@ -237,10 +242,12 @@ async fn check_available_space(env: &SetupEnv, emitter: &SetupEmitter) -> Result
             ));
             check_available_space_usb(drive, emitter).await
         }
-        Some(drive) => bail!(
-            "STOP: DATA_DRIVE is set to {}, which does not exist.",
-            drive
-        ),
+        // A DATA_DRIVE that doesn't exist is the user's setting to fix →
+        // ConfigError, not a transient failure that should auto-retry.
+        Some(drive) => Err(ConfigError(format!(
+            "STOP: DATA_DRIVE is set to {drive}, which does not exist."
+        ))
+        .into()),
     }
 }
 
@@ -386,6 +393,54 @@ fn parse_bytes_from_line(line: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::env::{PiModel, SetupEnv};
+    use crate::error::ConfigError;
+    use crate::SetupEmitter;
+    use std::collections::HashMap;
+
+    fn env_with(pairs: &[(&str, &str)]) -> SetupEnv {
+        let config: HashMap<String, String> = pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        SetupEnv {
+            pi_model: PiModel::Other,
+            boot_path: String::new(),
+            cmdline_path: None,
+            piconfig_path: None,
+            boot_disk: None,
+            root_partition: None,
+            data_drive: None,
+            config,
+        }
+    }
+
+    #[test]
+    fn missing_cam_size_is_a_config_error() {
+        // A missing required key is a user-config error: it fails identically
+        // on every retry, so it must classify as ConfigError (which stops the
+        // setup boot-loop auto-resume) rather than a transient failure.
+        let env = env_with(&[]);
+        let err = check_required_config(&env).unwrap_err();
+        assert!(
+            err.downcast_ref::<ConfigError>().is_some(),
+            "missing CAM_SIZE must be a ConfigError, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn nonexistent_data_drive_is_a_config_error() {
+        // DATA_DRIVE pointing at a path that doesn't exist is the user's
+        // mistake to fix — classify it as ConfigError, not transient.
+        let mut env = env_with(&[]);
+        env.data_drive = Some("/no/such/sentryusb/drive".to_string());
+        let emitter = SetupEmitter::new(|_| {}, |_, _| {});
+        let err = check_available_space(&env, &emitter).await.unwrap_err();
+        assert!(
+            err.downcast_ref::<ConfigError>().is_some(),
+            "nonexistent DATA_DRIVE must be a ConfigError, got: {err:?}"
+        );
+    }
 
     #[test]
     fn parse_bytes_picks_trailing_number_before_bytes() {
