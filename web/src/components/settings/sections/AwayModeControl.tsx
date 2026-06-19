@@ -1,5 +1,5 @@
-import { useState } from "react"
-import { AlertTriangle, Clock, Wifi, MapPin, Loader2 } from "lucide-react"
+import { useState, useRef, useEffect } from "react"
+import { AlertTriangle, Clock, Wifi, MapPin, Loader2, Plane } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAwayMode } from "@/hooks/useAwayMode"
 import type { AwayModeKind } from "@/hooks/useAwayMode"
@@ -8,6 +8,8 @@ import { Pill, LiveDot } from "@/components/ui/Pill"
 import { Row } from "@/components/ui/StatusTile"
 import { SegPicker } from "@/components/ui/SegPicker"
 import { HomeGeofencePicker } from "@/components/settings/HomeGeofencePicker"
+import { TravelModeDialog } from "@/components/settings/TravelModeDialog"
+import { api } from "@/lib/api"
 
 const AWAY_PRESETS = [
   { value: 60, label: "1h" },
@@ -39,6 +41,29 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   const [enabling, setEnabling] = useState(false)
   const [confirmOpen, setConfirmOpen] = useState(false)
   const [enablingBle, setEnablingBle] = useState(false)
+  // Secret menu: 5 taps on the card icon opens the Travel Mode dialog.
+  const [secretOpen, setSecretOpen] = useState(false)
+  const [travelOn, setTravelOn] = useState(false)
+  const tapCount = useRef(0)
+  const tapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  // Reflect Travel Mode in the card badge even before the dialog is opened.
+  useEffect(() => {
+    api.getTravelMode().then((r) => setTravelOn(r.enabled)).catch(() => {})
+  }, [])
+
+  function handleSecretTap() {
+    tapCount.current += 1
+    if (tapTimer.current) clearTimeout(tapTimer.current)
+    if (tapCount.current >= 5) {
+      tapCount.current = 0
+      setSecretOpen(true)
+      return
+    }
+    tapTimer.current = setTimeout(() => {
+      tapCount.current = 0
+    }, 600)
+  }
 
   const isActive = status.state === "active"
   // The AP is up when a manual timer is running, or auto mode says "away".
@@ -128,14 +153,27 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
 
   return (
     <PrefCard
-      icon={<Wifi className="h-3.5 w-3.5" />}
+      icon={
+        <span onClick={handleSecretTap} className="cursor-default select-none" role="presentation">
+          <Wifi className="h-3.5 w-3.5" />
+        </span>
+      }
       halo="blue"
       title="Away Mode"
       badge={
-        apUp ? (
-          <Pill kind="sky">
-            <LiveDot /> Active
-          </Pill>
+        apUp || travelOn ? (
+          <span className="flex items-center gap-1.5">
+            {travelOn && (
+              <Pill kind="accent">
+                <Plane className="h-3 w-3" /> Travel
+              </Pill>
+            )}
+            {apUp && (
+              <Pill kind="sky">
+                <LiveDot /> Active
+              </Pill>
+            )}
+          </span>
         ) : null
       }
       disabled={
@@ -381,6 +419,13 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
           </p>
         )}
       </div>
+
+      {secretOpen && (
+        <TravelModeDialog
+          onClose={() => setSecretOpen(false)}
+          onChange={setTravelOn}
+        />
+      )}
     </PrefCard>
   )
 }

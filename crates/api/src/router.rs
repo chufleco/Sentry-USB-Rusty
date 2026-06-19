@@ -245,6 +245,11 @@ pub fn build_router(state: AppState) -> Router {
             "/api/away-mode/config",
             get(crate::away_mode::config_get).put(crate::away_mode::config_set),
         )
+        // Travel Mode — secret-menu toggle: keep the USB gadget presented to
+        // the car at all times so recording stays continuous while archiving
+        // on the road (read fresh by archiveloop's travel_mode_active).
+        .route("/api/travel-mode/status", get(crate::travel_mode::status))
+        .route("/api/travel-mode", post(crate::travel_mode::set))
         // Terminal WebSocket
         .route("/api/terminal", get(crate::terminal::handle_terminal))
         // WebSocket

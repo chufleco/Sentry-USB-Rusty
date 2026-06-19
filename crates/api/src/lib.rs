@@ -10,6 +10,7 @@ pub mod lock_chime;
 pub mod terminal;
 pub mod keep_awake;
 pub mod away_mode;
+pub mod travel_mode;
 pub mod notifications;
 pub mod notification_center;
 pub mod setup;

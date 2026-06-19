@@ -291,6 +291,28 @@ function away_mode_active () {
   [ -n "$remaining" ] && [ "$remaining" -gt 0 ] 2>/dev/null
 }
 
+function travel_mode_active () {
+  # Travel Mode keeps the USB gadget presented to the car at all times: the
+  # archive flow still snapshots and uploads, but every step that would
+  # disconnect the gadget from the car is skipped. Read TRAVEL_MODE_ENABLED
+  # FRESH on each call (like away_mode_active re-reads its flag) so the web-UI
+  # toggle takes effect without restarting archiveloop. Search config paths in
+  # the same order as sentryusb_config::find_config_path(); first existing wins.
+  local conf val
+  for conf in /root/sentryusb.conf /boot/firmware/sentryusb.conf /boot/sentryusb.conf
+  do
+    [ -f "$conf" ] || continue
+    # Source in an isolated subshell so the value is parsed by bash itself
+    # (handles export/quotes), exactly like envsetup.sh, with no side effects.
+    val=$( set +eu; . "$conf" >/dev/null 2>&1; printf '%s' "${TRAVEL_MODE_ENABLED:-}" )
+    case "${val,,}" in
+      yes|true|1|on) return 0 ;;
+    esac
+    return 1
+  done
+  return 1
+}
+
 function wifi_cycle () {
   # This fix is only needed when ap0 exists.  ap0 shares the same physical
   # radio as wlan0 and locks it to the AP channel, preventing wlan0 from
@@ -995,7 +1017,11 @@ function archive_teslacam_clips () {
   then
     if [ "$archive_success" = "true" ]
     then
-      clean_cam_mount freespace
+      if travel_mode_active; then
+        log "Travel Mode: deferring freespace cleanup to keep the USB gadget connected to the car"
+      else
+        clean_cam_mount freespace
+      fi
     else
       log "Skipping cleaning step after archive error"
     fi
@@ -1138,12 +1164,16 @@ function archive_clips () {
   if { timeout 5 [ -d "${MUSIC_ARCHIVE_MOUNT:-}" -a -d "$MUSIC_MOUNT" ]; } || \
      { [ "${ARCHIVE_SYSTEM:-none}" = "rsync" ] && [ -n "${MUSIC_SHARE_NAME:-}" ] && [ -f /backingfiles/music_disk.bin ]; }
   then
-    log "Copying music..."
-    if copy_music_files
-    then
-      log "Finished copying music."
+    if travel_mode_active; then
+      log "Travel Mode: skipping music sync (would disconnect the USB gadget from the car)"
     else
-      log "ERROR: copy_music_files failed (exit $?)"
+      log "Copying music..."
+      if copy_music_files
+      then
+        log "Finished copying music."
+      else
+        log "ERROR: copy_music_files failed (exit $?)"
+      fi
     fi
   else
     log "Music archive not configured or unreachable (MUSIC_ARCHIVE_MOUNT=${MUSIC_ARCHIVE_MOUNT:-unset})"
@@ -1154,7 +1184,11 @@ function archive_clips () {
   # Reconnect cam drive before post-archive processing.
   # Processing reads local snapshots, not the cam disk — the car can resume
   # recording immediately instead of waiting for processing to finish.
-  connect_usb_drives_to_host
+  # In Travel Mode the gadget was never disconnected (cleanup was deferred),
+  # so skip the reconnect cycle to avoid interrupting the car's recording.
+  if ! travel_mode_active; then
+    connect_usb_drives_to_host
+  fi
   /root/bin/post-archive-process.sh || log "ERROR: post-archive-process.sh failed (exit $?)"
   cloud_upload_step
   /root/bin/send-live-activity end complete || true
@@ -1406,11 +1440,19 @@ then
 
   # Skip the gadget cycle if the user drove away during archive — the gadget
   # is still presented to the car and re-cycling it would interrupt recording.
-  if archive_is_reachable; then
+  # In Travel Mode the gadget was never disconnected, so skip the cycle too.
+  if archive_is_reachable && ! travel_mode_active; then
     connect_usb_drives_to_host
   fi
 
-  if archive_is_reachable; then
+  if travel_mode_active; then
+    # Always-on VPN never goes unreachable, so wait_for_archive_to_be_unreachable
+    # would block forever and halt archiving. Pace to the snapshot cadence: the
+    # next iteration takes a fresh snapshot and archives its new clips.
+    interval="${TRAVEL_MODE_INTERVAL:-${SNAPSHOT_INTERVAL:-3480}}"
+    log "Travel Mode: next snapshot+archive cycle in ${interval}s"
+    sleep "$interval"
+  elif archive_is_reachable; then
     wait_for_archive_to_be_unreachable
   fi
 fi
@@ -1457,11 +1499,19 @@ do
 
   # Skip the gadget cycle if the user drove away during archive — the gadget
   # is still presented to the car and re-cycling it would interrupt recording.
-  if archive_is_reachable; then
+  # In Travel Mode the gadget was never disconnected, so skip the cycle too.
+  if archive_is_reachable && ! travel_mode_active; then
     connect_usb_drives_to_host
   fi
 
-  if archive_is_reachable; then
+  if travel_mode_active; then
+    # Always-on VPN never goes unreachable, so wait_for_archive_to_be_unreachable
+    # would block forever and halt archiving. Pace to the snapshot cadence: the
+    # next iteration takes a fresh snapshot and archives its new clips.
+    interval="${TRAVEL_MODE_INTERVAL:-${SNAPSHOT_INTERVAL:-3480}}"
+    log "Travel Mode: next snapshot+archive cycle in ${interval}s"
+    sleep "$interval"
+  elif archive_is_reachable; then
     wait_for_archive_to_be_unreachable
   fi
 

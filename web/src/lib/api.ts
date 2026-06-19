@@ -171,6 +171,14 @@ export interface ClipTelemetry {
 }
 
 export const api = {
+  // Travel Mode (secret menu): keep the USB gadget connected to the car while
+  // still archiving on the road. Single persisted boolean in sentryusb.conf.
+  getTravelMode: () => request<{ enabled: boolean }>("/travel-mode/status"),
+  setTravelMode: (enabled: boolean) =>
+    request<{ ok: boolean; enabled: boolean }>("/travel-mode", {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    }),
   getStatus: () => request<PiStatus>("/status"),
   getStorageBreakdown: () => request<StorageBreakdown>("/status/storage"),
   getDriveStats: () => request<DriveStats>("/drives/stats"),
