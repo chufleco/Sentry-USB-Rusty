@@ -662,7 +662,27 @@ async fn signed_request_with_refresh_retry(
             Ok(QueryOutcome::Plaintext(bytes)) => return Ok(bytes),
             Ok(QueryOutcome::SessionRefresh(info)) => {
                 if refresh_retries_left == 0 {
-                    bail!("car requested SessionInfo refresh twice in a row — giving up")
+                    // The car keeps pushing SessionInfo refreshes that
+                    // don't converge — the signature of a stale, long-held
+                    // session (drifted clock estimate / rotated epoch).
+                    // Applying the car's pushed refresh isn't fixing it, so
+                    // fall back to a clean, explicit re-handshake from
+                    // scratch (fresh clock_time + key) before giving up.
+                    if stale_retries_left > 0 {
+                        stale_retries_left -= 1;
+                        state.domains.remove(&domain);
+                        warn!(
+                            "PersistentSession: {:?} SessionInfo refresh not converging \
+                             — dropping cached session for a clean re-handshake and retrying",
+                            domain
+                        );
+                        continue;
+                    }
+                    bail!(
+                        "car kept requesting SessionInfo refresh even after a clean \
+                         re-handshake for {:?} — giving up",
+                        domain
+                    )
                 }
                 refresh_retries_left -= 1;
                 apply_session_refresh(state, domain, info)?;
