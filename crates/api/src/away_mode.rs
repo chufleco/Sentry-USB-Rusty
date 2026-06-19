@@ -240,6 +240,19 @@ fn fold_geofence(
     }
 }
 
+/// Reconstruct the last committed home/away decision on boot from the
+/// flag file's existence. The flag file IS the persisted AP decision: it
+/// exists iff the last decision was "away" (the NetworkManager dispatcher
+/// uses it to bring ap0 back up on boot). So `flag_exists` ⟹ away
+/// (`Some(false)`), and no flag ⟹ home (`Some(true)`). Seeding
+/// `last_is_home` from this (instead of `None`) makes the in-memory state
+/// match the physical AP state the dispatcher established, so `status`
+/// reports it correctly and the first confirmed flip acts on a real
+/// transition rather than committing off an undecided `None`.
+fn auto_seed_decision(flag_exists: bool) -> Option<bool> {
+    Some(!flag_exists)
+}
+
 /// The daemon's last GPS fix as `(lat, lon, age_sec)`, or `None` if the
 /// file is missing/unparseable or has no coordinates. `age_sec` is how
 /// long ago the fix was taken (clamped ≥ 0).
@@ -542,7 +555,12 @@ pub fn restore_from_file() {
             inner.state = "idle"; // auto doesn't use the timer state
             inner.expires_at = None;
             inner.enabled_at = None;
-            inner.last_is_home = None;
+            // Seed the committed decision from the flag file so the in-memory
+            // state matches the AP the dispatcher resurrects on boot (flag
+            // present ⟹ away/AP-up). With `None` instead, `status` would
+            // report ap_on=false while the AP is physically up, and an
+            // arrived-home reboot would hold the stale AP until a fresh fix.
+            inner.last_is_home = auto_seed_decision(std::path::Path::new(FLAG_FILE).exists());
             inner.pending_is_home = None;
             inner.pending_count = 0;
             inner.stop = std::sync::Arc::new(Notify::new());
@@ -1011,6 +1029,15 @@ mod tests {
         assert_eq!(fold_geofence(Some(true), last, &mut pending, &mut count), None);
         assert_eq!(fold_geofence(Some(false), last, &mut pending, &mut count), None);
         assert_eq!(count, 1); // reset each flip-flop, never hits CONFIRM_TICKS
+    }
+
+    #[test]
+    fn auto_seed_decision_reflects_flag_file() {
+        // The flag file IS the persisted "away" decision: present ⟹ away
+        // (AP up, what the dispatcher resurrects on boot), absent ⟹ home.
+        // Seeding last_is_home from it must NOT invert this mapping.
+        assert_eq!(auto_seed_decision(true), Some(false)); // flag present → away
+        assert_eq!(auto_seed_decision(false), Some(true)); // no flag → home
     }
 }
 
