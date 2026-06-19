@@ -126,6 +126,11 @@ export function AwayModeProvider({ children }: { children: React.ReactNode }) {
         return () => { alive = false }
     }, [])
 
+    // Clear the pending debounced config PUT on unmount.
+    useEffect(() => () => {
+        if (saveTimer.current) clearTimeout(saveTimer.current)
+    }, [])
+
     const enable = useCallback(async (durationMin: number) => {
         lastMutation.current = Date.now()
         try {

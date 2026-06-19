@@ -52,6 +52,14 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
     api.getTravelMode().then((r) => setTravelOn(r.enabled)).catch(() => {})
   }, [])
 
+  // Clear the pending 5-tap reset timer on unmount.
+  useEffect(
+    () => () => {
+      if (tapTimer.current) clearTimeout(tapTimer.current)
+    },
+    [],
+  )
+
   function handleSecretTap() {
     tapCount.current += 1
     if (tapTimer.current) clearTimeout(tapTimer.current)
@@ -101,7 +109,9 @@ export function AwayModeControl({ onOpenWizard }: Props = {}) {
   }
 
   function getProgress() {
-    if (!status.enabled_at || !status.expires_at || !status.remaining_sec) return 0
+    // `== null` (not `!`) on remaining_sec: 0 is a real value (timer just
+    // hit zero → full bar), not "missing" — `!0` would snap the bar to empty.
+    if (!status.enabled_at || !status.expires_at || status.remaining_sec == null) return 0
     const total =
       (new Date(status.expires_at).getTime() - new Date(status.enabled_at).getTime()) / 1000
     if (total <= 0) return 0

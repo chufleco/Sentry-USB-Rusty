@@ -178,7 +178,11 @@ fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
     let dphi = (lat2 - lat1).to_radians();
     let dlambda = (lon2 - lon1).to_radians();
     let a = (dphi / 2.0).sin().powi(2) + p1.cos() * p2.cos() * (dlambda / 2.0).sin().powi(2);
-    2.0 * EARTH_R_M * a.sqrt().asin()
+    // Clamp to asin's [−1, 1] domain: float rounding can nudge `a` just past
+    // 1.0 for near-antipodal points, and asin(>1) is NaN — which would make
+    // band_is_home fall through to "hold" forever. Real inputs are same-metro
+    // so this never triggers in practice; it's a cheap guard on the formula.
+    2.0 * EARTH_R_M * a.sqrt().min(1.0).asin()
 }
 
 /// Resolve a distance-from-home into a hysteresis-banded reading:
@@ -1028,6 +1032,21 @@ mod tests {
         assert_eq!(fold_geofence(Some(true), last, &mut pending, &mut count), None);
         assert_eq!(fold_geofence(Some(false), last, &mut pending, &mut count), None);
         assert_eq!(count, 1); // reset each flip-flop, never hits CONFIRM_TICKS
+    }
+
+    #[test]
+    fn distance_is_finite_for_extreme_points() {
+        // asin domain guard: antipodal / polar inputs must not yield NaN.
+        for (a, b, c, d) in [
+            (0.0, 0.0, 0.0, 180.0),   // antipodal on the equator
+            (90.0, 0.0, -90.0, 0.0),  // pole to pole
+            (0.0, 0.0, 0.0, 0.0),     // same point
+        ] {
+            assert!(
+                distance_m(a, b, c, d).is_finite(),
+                "distance {a},{b} -> {c},{d} must be finite"
+            );
+        }
     }
 
     #[test]
