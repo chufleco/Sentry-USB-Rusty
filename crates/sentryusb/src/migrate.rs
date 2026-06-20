@@ -316,6 +316,15 @@ if [ -f "$TMPDIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary"
   install -m 755 "$TMPDIR/pi-gen-sources/00-sentryusb-tweaks/files/sentryusb-pick-binary" /usr/local/bin/sentryusb-pick-binary
 fi
 
+# ── Refresh the runtime-patches helper from the tarball ──
+# Without this, new patches we add to apply-runtime-patches.sh never reach
+# existing installs — the OTA invocation (the Rust caller after this shell
+# script exits) would re-run the OLD on-disk version. Bootstrap pre-v3.11
+# installs that never had the helper at all (the file just appears).
+if [ -f "$TMPDIR/setup/pi/apply-runtime-patches.sh" ]; then
+  install -m 755 "$TMPDIR/setup/pi/apply-runtime-patches.sh" /usr/local/bin/sentryusb-apply-runtime-patches
+fi
+
 # ── Install Tesla BLE telemetry sampler service + aux binaries ──
 # Two concerns here:
 #   1. The systemd unit ships in the source tarball — copy it into place
