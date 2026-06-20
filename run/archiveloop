@@ -921,7 +921,9 @@ function archive_teslacam_clips () {
     archive_progress_monitor "$total_count" "${sentrylist}" "$overlaymerged" &
     local progress_pid=$!
 
-    if /root/bin/archive-clips.sh "$overlaymerged" "${sentrylist}" "${triggerdir}" "${triggerlist}"
+    local travel_active=0
+    if travel_mode_active; then travel_active=1; fi
+    if TRAVEL_MODE_ACTIVE="$travel_active" /root/bin/archive-clips.sh "$overlaymerged" "${sentrylist}" "${triggerdir}" "${triggerlist}"
     then
       message="Archiving completed successfully. "
     else

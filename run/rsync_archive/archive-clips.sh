@@ -7,12 +7,29 @@
 # rsync's `--timeout=600` only fires on socket-idle, not on a quietly-
 # dropping link, so a bash-level monitor is the only way to bound the
 # hang from outside the rsync process.
+#
+# Travel Mode (passed fresh by archiveloop as TRAVEL_MODE_ACTIVE) relaxes the
+# thresholds below for slow, high-latency VPN links so a still-progressing
+# transfer isn't killed by a brief mobile-link hiccup. Normal mode keeps the
+# original snappy values byte-for-byte so "drive away from home" recovery is
+# unchanged.
+if [ "${TRAVEL_MODE_ACTIVE:-0}" = "1" ]; then
+  MONITOR_MISSES=20            # ~minutes of sustained loss before giving up
+  MONITOR_TIMEOUT=20           # must exceed the patient probe (ping 4 + ssh 8 ~= 12s)
+  export ARCHIVE_PING_TIMEOUT=4 ARCHIVE_SSH_TIMEOUT=8
+  RSYNC_EXTRA=(--partial)      # resume an interrupted large clip next cycle
+else
+  MONITOR_MISSES=5             # unchanged
+  MONITOR_TIMEOUT=6            # unchanged
+  RSYNC_EXTRA=()               # unchanged (expands to nothing)
+fi
+
 function connectionmonitor {
   while true
   do
-    for _ in {1..5}
+    for (( i = 1; i <= MONITOR_MISSES; i++ ))
     do
-      if timeout 6 /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER"
+      if timeout "$MONITOR_TIMEOUT" /root/bin/archive-is-reachable.sh "$ARCHIVE_SERVER"
       then
         sleep 5
         continue 2
@@ -35,6 +52,7 @@ connectionmonitor $$ &
 while [ -n "${1+x}" ]
 do
   if ! (rsync -avhRL --timeout=600 --remove-source-files --no-perms --omit-dir-times \
+        ${RSYNC_EXTRA[@]+"${RSYNC_EXTRA[@]}"} \
         --stats --log-file=/tmp/archive-rsync-cmd.log --ignore-missing-args \
         --files-from="$2" "$1" "$RSYNC_USER@$RSYNC_SERVER:$RSYNC_PATH" &> /tmp/rsynclog || [[ "$?" = "24" ]] )
   then
