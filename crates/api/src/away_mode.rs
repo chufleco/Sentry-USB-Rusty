@@ -24,6 +24,79 @@ use crate::router::AppState;
 
 const FLAG_FILE: &str = "/mutable/sentryusb_away_mode.json";
 const AP_PROFILE: &str = "SENTRYUSB_AP";
+const HOSTAPD_CONF: &str = "/etc/hostapd/hostapd.conf";
+const IFUPDOWN_AP_FILE: &str = "/etc/network/interfaces.d/sentryusb-ap";
+/// Default AP channel + hw_mode when wlan0 isn't associated — prefer 5GHz
+/// channel 36 (UNII-1, universal). Faster than 2.4 for clip serving.
+const DEFAULT_AP_CHANNEL: u32 = 36;
+const DEFAULT_AP_HW_MODE: &str = "a";
+
+/// Detect whether NetworkManager owns wifi (default on Pi OS / pi-gen) or
+/// whether we're on an ifupdown image (DietPi/Armbian). The AP enable/disable
+/// path is completely different between the two.
+fn use_networkmanager() -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--quiet", "is-active", "NetworkManager.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Parse `iw wlan0 info` for the current STA channel + band. On
+/// BCM43455-family chipsets (Pi 4/5, Pi Zero 2 W, Rock 4C+) STA and AP are
+/// constrained to the same channel — the AP must match wlan0's channel or
+/// the chip refuses one of them. When STA isn't associated, returns None
+/// and the caller falls back to the 5GHz default.
+async fn detect_sta_channel() -> Option<(u32, &'static str)> {
+    let out = sentryusb_shell::run("iw", &["wlan0", "info"]).await.ok()?;
+    for line in out.lines() {
+        let l = line.trim();
+        let Some(rest) = l.strip_prefix("channel ") else { continue };
+        let mut parts = rest.split_whitespace();
+        let ch: u32 = parts.next()?.parse().ok()?;
+        let freq_token = parts.next()?.trim_start_matches('(');
+        let freq: u32 = freq_token.parse().ok()?;
+        let hw_mode = if freq >= 5000 { "a" } else { "g" };
+        return Some((ch, hw_mode));
+    }
+    None
+}
+
+/// Rewrite the `channel=` and `hw_mode=` lines in /etc/hostapd/hostapd.conf
+/// so the AP matches wlan0's current channel. Called immediately before
+/// `ifup ap0` so hostapd starts on the right frequency.
+fn update_hostapd_channel(channel: u32, hw_mode: &str) -> Result<(), String> {
+    // Make root writable for the duration of the write — the install
+    // ships a `remountfs_rw` stub that is safe to call even when root is
+    // already RW (no-op + exit 0).
+    let _ = std::process::Command::new("/root/bin/remountfs_rw").status();
+    let content = std::fs::read_to_string(HOSTAPD_CONF)
+        .map_err(|e| format!("read {}: {}", HOSTAPD_CONF, e))?;
+    let mut new = String::new();
+    let mut saw_channel = false;
+    let mut saw_mode = false;
+    for line in content.lines() {
+        if line.starts_with("channel=") {
+            new.push_str(&format!("channel={}", channel));
+            saw_channel = true;
+        } else if line.starts_with("hw_mode=") {
+            new.push_str(&format!("hw_mode={}", hw_mode));
+            saw_mode = true;
+        } else {
+            new.push_str(line);
+        }
+        new.push('\n');
+    }
+    if !saw_channel {
+        new.push_str(&format!("channel={}\n", channel));
+    }
+    if !saw_mode {
+        new.push_str(&format!("hw_mode={}\n", hw_mode));
+    }
+    std::fs::write(HOSTAPD_CONF, new)
+        .map_err(|e| format!("write {}: {}", HOSTAPD_CONF, e))?;
+    Ok(())
+}
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 const MAX_DURATION_MIN: u64 = 24 * 60;
 
@@ -436,18 +509,50 @@ async fn ensure_ap0() -> Result<(), String> {
 
 fn start_ap_bg() {
     tokio::spawn(async {
-        if let Err(e) = ensure_ap0().await {
-            away_mode_log(&format!("Failed to create ap0: {}", e));
-            warn!("[away-mode] Failed to create ap0: {}", e);
-        }
-        match sentryusb_shell::run("nmcli", &["con", "up", AP_PROFILE]).await {
-            Ok(_) => {
-                away_mode_log("AP started");
-                info!("[away-mode] AP started");
+        if use_networkmanager() {
+            // NetworkManager path (Pi OS / pi-gen).
+            if let Err(e) = ensure_ap0().await {
+                away_mode_log(&format!("Failed to create ap0: {}", e));
+                warn!("[away-mode] Failed to create ap0: {}", e);
             }
-            Err(e) => {
-                away_mode_log(&format!("Failed to bring up AP: {}", e));
-                warn!("[away-mode] Failed to bring up AP: {}", e);
+            match sentryusb_shell::run("nmcli", &["con", "up", AP_PROFILE]).await {
+                Ok(_) => {
+                    away_mode_log("AP started");
+                    info!("[away-mode] AP started");
+                }
+                Err(e) => {
+                    away_mode_log(&format!("Failed to bring up AP: {}", e));
+                    warn!("[away-mode] Failed to bring up AP: {}", e);
+                }
+            }
+        } else {
+            // ifupdown path (DietPi/Armbian — no NetworkManager).
+            // Match STA's channel if associated (BCM43455 family chips can't
+            // host AP+STA on different channels), else fall back to 5GHz ch
+            // 36 — fast enough to serve clips through the AP without dropping
+            // to 2.4GHz.
+            let (channel, hw_mode) = detect_sta_channel()
+                .await
+                .unwrap_or((DEFAULT_AP_CHANNEL, DEFAULT_AP_HW_MODE));
+            if let Err(e) = update_hostapd_channel(channel, hw_mode) {
+                away_mode_log(&format!("Failed to set hostapd channel: {}", e));
+                warn!("[away-mode] update_hostapd_channel: {}", e);
+            }
+            match sentryusb_shell::run("ifup", &["ap0"]).await {
+                Ok(_) => {
+                    away_mode_log(&format!(
+                        "AP started (ifupdown, channel {} {})",
+                        channel, hw_mode
+                    ));
+                    info!(
+                        "[away-mode] AP started via ifupdown channel={} hw_mode={}",
+                        channel, hw_mode
+                    );
+                }
+                Err(e) => {
+                    away_mode_log(&format!("ifup ap0 failed: {}", e));
+                    warn!("[away-mode] ifup ap0 failed: {}", e);
+                }
             }
         }
     });
@@ -455,17 +560,36 @@ fn start_ap_bg() {
 
 fn stop_ap_bg() {
     tokio::spawn(async {
-        match sentryusb_shell::run("nmcli", &["con", "down", AP_PROFILE]).await {
-            Ok(_) => {
-                away_mode_log("AP stopped");
-                info!("[away-mode] AP stopped");
+        if use_networkmanager() {
+            match sentryusb_shell::run("nmcli", &["con", "down", AP_PROFILE]).await {
+                Ok(_) => {
+                    away_mode_log("AP stopped");
+                    info!("[away-mode] AP stopped");
+                }
+                Err(e) => {
+                    // Not fatal: `con down` also fails when the AP was already
+                    // down (e.g. expiry cleanup after a reboot).
+                    away_mode_log(&format!("nmcli con down failed (AP may already be down): {}", e));
+                    warn!("[away-mode] nmcli con down failed: {}", e);
+                }
             }
-            Err(e) => {
-                // Not fatal: `con down` also fails when the AP was already
-                // down (e.g. expiry cleanup after a reboot).
-                away_mode_log(&format!("nmcli con down failed (AP may already be down): {}", e));
-                warn!("[away-mode] nmcli con down failed: {}", e);
+        } else {
+            // ifupdown path. `ifdown ap0` runs the post-down hooks in
+            // /etc/network/interfaces.d/sentryusb-ap which stop hostapd +
+            // dnsmasq. Belt-and-suspenders stops follow in case the hooks
+            // are missing (e.g. setup didn't install the interfaces.d file).
+            match sentryusb_shell::run("ifdown", &["ap0"]).await {
+                Ok(_) => {
+                    away_mode_log("AP stopped (ifupdown)");
+                    info!("[away-mode] AP stopped via ifupdown");
+                }
+                Err(e) => {
+                    away_mode_log(&format!("ifdown ap0 failed (AP may already be down): {}", e));
+                    warn!("[away-mode] ifdown ap0 failed: {}", e);
+                }
             }
+            let _ = sentryusb_shell::run("systemctl", &["stop", "hostapd"]).await;
+            let _ = sentryusb_shell::run("systemctl", &["stop", "dnsmasq"]).await;
         }
         // Always remove ap0: it locks the shared radio to the AP channel
         // (blocking wlan0 scans), and a leftover ap0 is what used to make
@@ -474,40 +598,73 @@ fn stop_ap_bg() {
     });
 }
 
-/// Whether the SENTRYUSB_AP connection profile exists. Setup creates it
-/// (AP enabled in the wizard) and deletes it (AP unchecked) — the UI uses
-/// this to grey out the Away Mode card when the feature is unconfigured.
+/// Whether the SENTRYUSB_AP profile exists. Setup creates it (AP enabled
+/// in the wizard) and deletes it (AP unchecked) — the UI uses this to grey
+/// out the Away Mode card when the feature is unconfigured. On ifupdown
+/// systems we look for both the hostapd config AND the interfaces.d stanza
+/// so a half-installed AP doesn't read as "configured".
 async fn ap_profile_exists() -> bool {
-    sentryusb_shell::run("nmcli", &["-t", "con", "show", AP_PROFILE])
-        .await
-        .map(|o| !o.trim().is_empty())
-        .unwrap_or(false)
+    if use_networkmanager() {
+        sentryusb_shell::run("nmcli", &["-t", "con", "show", AP_PROFILE])
+            .await
+            .map(|o| !o.trim().is_empty())
+            .unwrap_or(false)
+    } else {
+        std::path::Path::new(HOSTAPD_CONF).exists()
+            && std::path::Path::new(IFUPDOWN_AP_FILE).exists()
+    }
 }
 
 async fn get_ap_info() -> (String, String) {
-    let out = match sentryusb_shell::run(
-        "nmcli",
-        &["-t", "-f", "802-11-wireless.ssid,ipv4.addresses", "con", "show", AP_PROFILE],
-    )
-    .await
-    {
-        Ok(o) => o,
-        Err(_) => return (String::new(), String::new()),
-    };
-    let mut ssid = String::new();
-    let mut ip = String::new();
-    for line in out.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("802-11-wireless.ssid:") {
-            ssid = rest.to_string();
-        } else if let Some(rest) = line.strip_prefix("ipv4.addresses:") {
-            ip = rest.to_string();
-            if let Some(idx) = ip.find('/') {
-                ip.truncate(idx);
+    if use_networkmanager() {
+        let out = match sentryusb_shell::run(
+            "nmcli",
+            &["-t", "-f", "802-11-wireless.ssid,ipv4.addresses", "con", "show", AP_PROFILE],
+        )
+        .await
+        {
+            Ok(o) => o,
+            Err(_) => return (String::new(), String::new()),
+        };
+        let mut ssid = String::new();
+        let mut ip = String::new();
+        for line in out.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("802-11-wireless.ssid:") {
+                ssid = rest.to_string();
+            } else if let Some(rest) = line.strip_prefix("ipv4.addresses:") {
+                ip = rest.to_string();
+                if let Some(idx) = ip.find('/') {
+                    ip.truncate(idx);
+                }
             }
         }
+        (ssid, ip)
+    } else {
+        // ifupdown path: SSID from hostapd.conf, IP from the interfaces.d
+        // stanza. Reading files directly avoids spawning subprocesses on
+        // hot paths (status poll runs every 30s).
+        let mut ssid = String::new();
+        let mut ip = String::new();
+        if let Ok(content) = std::fs::read_to_string(HOSTAPD_CONF) {
+            for line in content.lines() {
+                if let Some(rest) = line.strip_prefix("ssid=") {
+                    ssid = rest.trim().to_string();
+                    break;
+                }
+            }
+        }
+        if let Ok(content) = std::fs::read_to_string(IFUPDOWN_AP_FILE) {
+            for line in content.lines() {
+                let l = line.trim();
+                if let Some(rest) = l.strip_prefix("address ") {
+                    ip = rest.trim().to_string();
+                    break;
+                }
+            }
+        }
+        (ssid, ip)
     }
-    (ssid, ip)
 }
 
 fn spawn_watcher(stop: std::sync::Arc<Notify>, my_epoch: u64) {
