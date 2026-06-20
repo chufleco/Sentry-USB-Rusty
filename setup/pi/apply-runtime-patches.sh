@@ -112,9 +112,51 @@ PYEOF
     return 0
 }
 
+# ── EATT disable (all Pi boards) ────────────────────────────────────────
+#
+# Our BLE GATT is app-PIN over plain (unencrypted) ATT. Android (esp. 14+)
+# opens EATT (PSM 0x0027) on connect, which bluetoothd refuses without an
+# encrypted link and answers with an SMP Security Request — popping an OS
+# pair prompt on every connect (or, on some phones, a silent GATT 147 /
+# "Connection lost" tear-down loop with bond=BOND_NONE).
+#
+# Channels=1 keeps plain ATT (same GATT, same PIN), no prompt, no tear-down.
+# Safe on every Pi board — no security change vs. our existing model.
+# Universal patch (no board gate): pre-v3.11.x installs (e.g. v3.9.0 Zero 2W)
+# never ran the install-time version of this, so OTA must heal it for them.
+apply_eatt_disable() {
+    local conf=/etc/bluetooth/main.conf
+    [ -f "$conf" ] || { warn "EATT: $conf missing — skipping"; return 0; }
+
+    if grep -qE '^Channels[[:space:]]*=[[:space:]]*1' "$conf"; then
+        log "EATT disable: already applied"
+        return 0
+    fi
+
+    if grep -qE '^\[GATT\]' "$conf"; then
+        if grep -qiE '^[# ]*Channels' "$conf"; then
+            sed -i -E 's/^[# ]*Channels[ ]*=.*/Channels = 1/' "$conf"
+        else
+            sed -i '/^\[GATT\]/a Channels = 1' "$conf"
+        fi
+    else
+        printf '\n[GATT]\nChannels = 1\n' >> "$conf"
+    fi
+
+    if grep -qE '^Channels[[:space:]]*=[[:space:]]*1' "$conf"; then
+        log "EATT disable: applied to $conf"
+        systemctl restart bluetooth 2>/dev/null || true
+    else
+        err "EATT disable: write to $conf failed (read-only fs? check remountfs_rw)"
+        return 1
+    fi
+    return 0
+}
+
 # ── Run all patches ─────────────────────────────────────────────────────
 
 apply_ble_nonfatal_adv
+apply_eatt_disable
 
 # Future patches that must survive an OTA update get appended here. Each
 # one self-checks board / precondition / marker so the whole script stays
