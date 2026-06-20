@@ -249,25 +249,9 @@ else
     warn "Could not fetch BLE daemon — iOS app pairing will be unavailable"
 fi
 
-# ── Step 3b2: Disable EATT (no recurring BLE pairing prompt) ────────
-# The BLE GATT is app-PIN over plain (unencrypted) ATT, but a phone's EATT
-# (PSM 0x0027) open needs an encrypted link — bluetoothd refuses it and sends an
-# SMP Security Request, popping a pair prompt on every connect. Channels=1 keeps
-# plain ATT (same GATT), so no prompt. Safe on all boards (no security change).
-MAIN_CONF=/etc/bluetooth/main.conf
-if [ -f "$MAIN_CONF" ] && ! grep -qE '^Channels[[:space:]]*=[[:space:]]*1' "$MAIN_CONF"; then
-    if grep -qE '^\[GATT\]' "$MAIN_CONF"; then
-        if grep -qiE '^[# ]*Channels' "$MAIN_CONF"; then
-            sed -i -E 's/^[# ]*Channels[ ]*=.*/Channels = 1/' "$MAIN_CONF"
-        else
-            sed -i '/^\[GATT\]/a Channels = 1' "$MAIN_CONF"
-        fi
-    else
-        printf '\n[GATT]\nChannels = 1\n' >> "$MAIN_CONF"
-    fi
-    systemctl restart bluetooth 2>/dev/null || true
-    ok "EATT disabled (no recurring BLE pairing prompt)"
-fi
+# Step 3b2 (EATT disable) moved to setup/pi/apply-runtime-patches.sh
+# so existing pre-v3.11.x installs heal automatically on OTA. Step 3d2
+# installs that helper and runs it.
 
 # ── Step 3c: archiveloop ↔ gadget shim scripts ─────────────────────
 #
@@ -345,10 +329,11 @@ if ! grep -q SENTRYUSB_TIP1 /root/.bashrc 2>/dev/null; then
 fi
 
 # ── Step 3d2: install the runtime-patches script (called by OTA updater) ──
-# Universal — runs for everyone; the script self-detects 4C+ inside. Lives
-# at a stable path the Rust binary's update.rs invokes after every binary
-# swap so install-time fixes (BLE non-fatal-adv on BCM4345C0, etc.) heal
-# automatically on update instead of silently rotting.
+# Universal — runs for everyone; each patch inside self-detects its own
+# precondition (board, file presence, etc.). Lives at a stable path the
+# Rust binary's update.rs invokes after every binary swap so install-time
+# fixes — BLE non-fatal-adv on BCM4345C0 (4C+), EATT disable on all
+# boards, etc. — heal automatically on update instead of silently rotting.
 PATCHES_URL="https://raw.githubusercontent.com/${REPO}/main/setup/pi/apply-runtime-patches.sh"
 PATCHES_DST="/usr/local/bin/sentryusb-apply-runtime-patches"
 PATCHES_LOCAL="$(dirname "${1:-/dev/null}")/setup/pi/apply-runtime-patches.sh"
@@ -359,7 +344,7 @@ elif curl -fsSL --max-time 10 "$PATCHES_URL" -o "$PATCHES_DST" 2>/dev/null; then
     chmod +x "$PATCHES_DST"
     ok "Runtime-patches script downloaded to $PATCHES_DST"
 else
-    warn "Could not fetch runtime-patches script — OTA updates won't re-apply 4C+ BLE fix"
+    warn "Could not fetch runtime-patches script — OTA updates won't re-apply BLE patches"
 fi
 # Run it once now so first-install applies patches without waiting for the
 # first OTA update. The script's per-patch detection-gates make this a
