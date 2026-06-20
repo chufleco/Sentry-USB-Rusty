@@ -693,44 +693,74 @@ async fn self_update(target_version: Option<String>) -> anyhow::Result<String> {
     // is idempotent + detection-gated, so it's a no-op on non-applicable
     // boards and a no-op on already-patched files.
     //
-    // Bootstrap: the script first ships in v3.11.4. Users updating from a
-    // pre-v3.11.4 release won't have it on disk yet — fetch it from the
-    // repo BEFORE running so the very first auto-heal cycle works. The
-    // script lives at a stable URL (main branch, setup/pi/) so it's
-    // fetchable as long as the repo is reachable.
+    // Always refresh the script body from the repo before running.
+    //
+    // Bootstrap-only (the old behavior) had a fatal hole: if a user already
+    // had a stale on-disk copy from an earlier release, new patches we add
+    // to apply-runtime-patches.sh would never reach them — update.rs would
+    // skip the download and invoke the rotten old script. We fix that by
+    // ALWAYS downloading; a failed download falls back to whatever is
+    // already on disk (warn-only). The script lives at a stable URL
+    // (main branch, setup/pi/) so it's fetchable as long as the repo is
+    // reachable.
     let patches_path = "/usr/local/bin/sentryusb-apply-runtime-patches";
-    if !std::path::Path::new(patches_path).exists() {
-        let patches_url = format!(
-            "https://raw.githubusercontent.com/{}/main/setup/pi/apply-runtime-patches.sh",
-            repo
-        );
-        tracing::info!(
-            "update.rs: runtime-patches script missing — bootstrapping from {}",
-            patches_url
-        );
-        match sentryusb_shell::run_with_timeout(
-            std::time::Duration::from_secs(20),
-            "curl",
-            &[
-                "-fsSL",
-                "--max-time",
-                "15",
-                "-o",
-                patches_path,
-                &patches_url,
-            ],
-        )
-        .await
-        {
-            Ok(_) => {
+    let patches_url = format!(
+        "https://raw.githubusercontent.com/{}/main/setup/pi/apply-runtime-patches.sh",
+        repo
+    );
+    let patches_tmp = "/tmp/sentryusb-apply-runtime-patches.new";
+    tracing::info!(
+        "update.rs: refreshing runtime-patches script from {}",
+        patches_url
+    );
+    match sentryusb_shell::run_with_timeout(
+        std::time::Duration::from_secs(20),
+        "curl",
+        &[
+            "-fsSL",
+            "--max-time",
+            "15",
+            "-o",
+            patches_tmp,
+            &patches_url,
+        ],
+    )
+    .await
+    {
+        Ok(_) => {
+            // Only swap the live script if the download produced a non-empty
+            // file (catches "200 OK + empty body" rare github edge cases).
+            if std::fs::metadata(patches_tmp)
+                .map(|m| m.len() > 0)
+                .unwrap_or(false)
+            {
+                let _ = std::fs::rename(patches_tmp, patches_path);
                 let _ = sentryusb_shell::run("chmod", &["+x", patches_path]).await;
-                tracing::info!("update.rs: runtime-patches script bootstrapped");
+                tracing::info!("update.rs: runtime-patches script refreshed");
+            } else {
+                let _ = std::fs::remove_file(patches_tmp);
+                if !std::path::Path::new(patches_path).exists() {
+                    install_warnings.push(
+                        "runtime-patches download empty AND no existing script: board-specific \
+                         fixes won't apply this update. Re-run install-pi.sh manually."
+                            .to_string(),
+                    );
+                }
             }
-            Err(e) => install_warnings.push(format!(
-                "runtime-patches bootstrap FAILED ({e}): board-specific fixes \
-                 (BCM4345C0 BLE on Rock 4C+, etc.) won't auto-reapply after this \
-                 update. Re-run install-pi.sh manually if BLE pairing breaks."
-            )),
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(patches_tmp);
+            if !std::path::Path::new(patches_path).exists() {
+                install_warnings.push(format!(
+                    "runtime-patches download FAILED ({e}) AND no existing script: board-specific \
+                     fixes (BCM4345C0 BLE on Rock 4C+, EATT disable, etc.) won't auto-reapply \
+                     after this update. Re-run install-pi.sh manually if BLE pairing breaks."
+                ));
+            } else {
+                tracing::warn!(
+                    "update.rs: runtime-patches refresh failed ({e}), falling back to existing on-disk script"
+                );
+            }
         }
     }
 
