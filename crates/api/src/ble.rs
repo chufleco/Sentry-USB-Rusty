@@ -156,7 +156,13 @@ pub fn migrate_legacy_ble_flag() {
 /// editor surface the key as a togglable row out of the box, instead
 /// of forcing every tester to add it by hand with the `+` button.
 /// Idempotent — skips if the key is already set (so a tester who
-/// flipped it to `yes` doesn't get clobbered back to `no` on restart).
+/// flipped it doesn't get clobbered back to `no` on restart).
+///
+/// Accepted values (parsed in `tesla_telemetry::config`):
+///   * `no` (default) → legacy spawned `ble-action charge-port-close`
+///   * `wake` (or `yes`/`true`/`1`) → sampler-emit + VCSEC wake
+///   * `charge-port-close` → sampler-emit + Infotainment charge-port-close
+///   * `combo` → sampler-emit + wake → 2s pause → charge-port-close
 pub fn ensure_keep_awake_via_sampler_key_present() {
     let config_path = sentryusb_config::find_config_path();
     let Ok((mut active, _commented)) = sentryusb_config::parse_file(config_path) else {
