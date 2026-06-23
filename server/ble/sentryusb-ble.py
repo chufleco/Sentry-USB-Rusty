@@ -1257,27 +1257,103 @@ def wait_for_adapter(bus, preferred_hci=None, timeout_s=15, poll_interval_s=0.2)
     return None
 
 def enable_controller_advertising(adapter_path):
-    """Re-enable controller-level LE advertising via btmgmt.
+    """Force connectable + bondable + advertising controller flags via btmgmt.
 
-    The kernel mgmt 'advertising' flag persists OFF after some restart
-    paths (crash, manual restart, bond-dir reset); with it OFF, BlueZ's
-    RegisterAdvertisement below silently does nothing and the radio stops
-    broadcasting (new devices see "Pi not found nearby"). Run only after
-    wait_for_adapter() so BlueZ is provably up and btmgmt can't hang on the
-    mgmt socket. Best-effort. (Moved out of the unit's ExecStartPre so the
-    service no longer blocks the boot transaction.)
+    Kernel mgmt flags persist OFF after some restart paths (crash, manual
+    restart, bond-dir reset). On Broadcom (BCM4345, BCM43436) the calls
+    usually succeed first try. On AIC8800 (Radxa Zero 3W, OrangePi H618
+    daughterboards) the kernel mgmt socket itself stays wedged for ~30-40s
+    after boot while the chip firmware completes its handshake — every
+    `btmgmt` call times out during that window. With the flags OFF the
+    controller advertises only at PHY level but refuses incoming connections
+    (Android sees GATT_CONN_TERMINATE_PEER_USER status=22 → "Connection
+    rejected" in mobile pair flows).
+
+    Strategy: first PROBE the mgmt socket by polling `btmgmt info` until it
+    returns in < 1s (= socket responsive). This survives the AIC8800 dead
+    zone without doing wasted set-commands that would just time out. Then
+    issue connectable / bondable / advertising as fast follow-ups, verifying
+    each via `btmgmt info` afterwards. Best-effort — daemon proceeds even
+    on failure (logged at WARN).
     """
     hci = adapter_path.rsplit('/', 1)[-1]  # /org/bluez/hci0 -> hci0
-    cmd = ['btmgmt']
-    idx = hci[3:]
-    if hci.startswith('hci') and idx.isdigit():
-        cmd += ['--index', idx]
-    cmd += ['advertising', 'on']
-    try:
-        subprocess.run(cmd, timeout=5, capture_output=True, check=False)
-        log.info(f'Controller advertising enabled on {hci}')
-    except Exception as e:
-        log.warning(f'btmgmt advertising on failed (non-fatal): {e}')
+    idx = hci[3:] if hci.startswith('hci') else ''
+    if not idx.isdigit():
+        log.warning(f'enable_controller_advertising: unrecognized adapter path {adapter_path}')
+        return
+
+    base_cmd = ['btmgmt', '--index', idx]
+    required = ('connectable', 'bondable', 'advertising')
+
+    def current_flags(timeout=3):
+        try:
+            # stdin=PIPE (closed immediately) is REQUIRED: under systemd the
+            # service stdin is /dev/null, and btmgmt blocks forever reading it
+            # even for a one-shot 'info' (busy-loops on /dev/null instead of
+            # seeing EOF). A closed pipe gives an immediate EOF and btmgmt
+            # returns in ~10ms. This was the real AIC8800 cold-start bug —
+            # every btmgmt call timed out, so flags never got set.
+            r = subprocess.run(base_cmd + ['info'], timeout=timeout,
+                               capture_output=True, check=False, text=True,
+                               stdin=subprocess.PIPE)
+            for line in r.stdout.splitlines():
+                if 'current settings' in line:
+                    return set(line.split(':', 1)[1].split())
+        except Exception:
+            pass
+        return set()
+
+    # PROBE: wait for the kernel mgmt socket to become responsive before
+    # issuing any set commands. On AIC8800 (Radxa/OrangePi Zero 3W) the socket
+    # can still be settling for a few tens of seconds after the chip firmware
+    # finishes its post-boot handshake. On Broadcom this loop exits on the
+    # first iteration. Cap at 90s; past that something is more seriously wrong
+    # and we proceed without flags rather than block the daemon forever.
+    PROBE_CAP_S = 90
+    probe_start = time.time()
+    next_heartbeat = 30
+    while time.time() - probe_start < PROBE_CAP_S:
+        # 'powered' present means btmgmt actually reached the controller.
+        # While the socket is settling current_flags() returns empty, so this
+        # stays false.
+        flags = current_flags(timeout=4)
+        if 'powered' in flags:
+            waited = time.time() - probe_start
+            if waited > 1.0:
+                log.info(f'btmgmt mgmt socket ready after {waited:.1f}s wait')
+            break
+        waited = time.time() - probe_start
+        if waited >= next_heartbeat:
+            log.info(f'btmgmt mgmt socket still settling ({waited:.0f}s) — '
+                     'normal on AIC8800 cold boot, waiting')
+            next_heartbeat += 30
+        time.sleep(2)
+    else:
+        log.warning(f'btmgmt mgmt socket still unresponsive after {PROBE_CAP_S}s — flag set may fail')
+
+    # Mgmt socket is responsive — set each flag with up to 3 quick retries.
+    for flag in required:
+        for attempt in range(1, 4):
+            if flag in current_flags():
+                if attempt > 1:
+                    log.info(f'{flag} confirmed set on {hci} after {attempt - 1} retr{"y" if attempt == 2 else "ies"}')
+                break
+            try:
+                subprocess.run(base_cmd + [flag, 'on'], timeout=5,
+                               capture_output=True, check=False,
+                               stdin=subprocess.PIPE)
+            except Exception as e:
+                log.warning(f'btmgmt {flag} on attempt {attempt}/3: {e}')
+            if attempt < 3:
+                time.sleep(2)
+        else:
+            log.warning(f'Could not enable {flag} on {hci} after 3 attempts — pair attempts may fail')
+
+    missing = set(required) - current_flags()
+    if missing:
+        log.warning(f'Controller flags incomplete on {hci}: missing {sorted(missing)}')
+    else:
+        log.info(f'Controller flags fully set on {hci}: connectable + bondable + advertising')
 
 
 def register_ad_cb():
