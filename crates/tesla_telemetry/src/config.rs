@@ -53,6 +53,15 @@ pub struct BleConfig {
     /// install, so a pre-release build never changes behavior unless a
     /// tester explicitly turns it on. See the consolidation RFC.
     pub experimental: bool,
+    /// Emit periodic keep-awake nudges from inside the sampler on its
+    /// already-held PersistentSession instead of having `awake_start`
+    /// spawn a separate `ble-action` process every 300s. Default OFF
+    /// — set `BLE_KEEP_AWAKE_VIA_SAMPLER=yes` to enable. When on,
+    /// `awake_start`'s Case-3 BLE branch skips its `ble-action` call
+    /// while the sampler socket is present and lets the sampler emit
+    /// the nudge. When off (or the sampler is down), the legacy
+    /// spawned-loop path stays in charge. See task #329.
+    pub keep_awake_via_sampler: bool,
 }
 
 impl Default for BleConfig {
@@ -64,6 +73,7 @@ impl Default for BleConfig {
             keep_accessory: KeepAccessoryConfig::default(),
             away_auto_enabled: false,
             experimental: false,
+            keep_awake_via_sampler: false,
         }
     }
 }
@@ -166,6 +176,19 @@ impl BleConfig {
         .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
         .unwrap_or(false);
 
+        // Sampler-emitted keep-awake nudge opt-in. Default OFF — when
+        // the flag isn't set, behavior is byte-for-byte the legacy
+        // spawned `ble-action charge-port-close` loop. Read fresh on
+        // every loop iteration so a tester can flip it via a conf edit
+        // without bouncing the service.
+        let keep_awake_via_sampler = sentryusb_config::get_config_value(
+            &active,
+            &commented,
+            "BLE_KEEP_AWAKE_VIA_SAMPLER",
+        )
+        .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
+        .unwrap_or(false);
+
         Ok(Self {
             enabled,
             vin,
@@ -173,6 +196,7 @@ impl BleConfig {
             keep_accessory,
             away_auto_enabled,
             experimental,
+            keep_awake_via_sampler,
         })
     }
 }
