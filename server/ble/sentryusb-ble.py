@@ -1360,8 +1360,12 @@ def register_ad_cb():
     log.info('Advertisement registered')
 
 def register_ad_error_cb(error):
-    log.error(f'Failed to register advertisement: {error}')
-    sys.exit(1)  # non-zero so systemd Restart=on-failure triggers
+    # BCM4345C0 (Rock 4C+): BlueZ uses EXTENDED advertising which this chip
+    # rejects ('Invalid Parameters 0x0d'). Do NOT exit (that tears down GATT
+    # and loops forever); keep GATT up. Legacy btmgmt advertising is enabled
+    # out-of-band by sentryusb-ble-adv.service.
+    log.warning(f'BlueZ advertisement registration failed ({error}); '
+                'using legacy btmgmt advertising instead; GATT stays up.')
 
 def register_app_cb():
     log.info('GATT application registered')
