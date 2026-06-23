@@ -21,7 +21,9 @@ set -uo pipefail
 PATCHED=/opt/sentryusb/sentryusb-a733-patched
 TARGET=/opt/sentryusb/sentryusb-linux-arm64-a76
 ARCHIVELOOP=/root/bin/archiveloop
-WIFI_CONN=/etc/NetworkManager/system-connections/jznet.nmconnection
+# Auto-detect the active WiFi connection (override with the WIFI_CONN env var).
+WIFI_CONN="${WIFI_CONN:-$(nmcli -t -f NAME,TYPE connection show --active 2>/dev/null \
+  | awk -F: '$2=="802-11-wireless"{print $1; exit}')}"
 
 if [ "$(id -u)" -ne 0 ]; then
   echo "[repatch] must run as root:  sudo $0" >&2
@@ -58,12 +60,17 @@ if [ -f "$ARCHIVELOOP" ]; then
   fi
 fi
 
-# 3. WiFi — keep the 5GHz band if an update reset the connection to 2.4GHz.
-if [ -f "$WIFI_CONN" ] && grep -q '^band=bg' "$WIFI_CONN"; then
-  echo "[repatch] restoring 5GHz band on $WIFI_CONN"
-  sed -i 's/^band=bg/band=a/' "$WIFI_CONN"
-  nmcli connection reload 2>/dev/null || true
-  nmcli connection up jznet 2>/dev/null || true
+# 3. WiFi (optional) — restore the 5GHz band if an update reset the active
+#    connection to 2.4GHz. Off by default (personal preference, not an A733 fix);
+#    enable with FORCE_5GHZ=1.
+if [ "${FORCE_5GHZ:-0}" = "1" ] && [ -n "$WIFI_CONN" ]; then
+  CONN_FILE="/etc/NetworkManager/system-connections/${WIFI_CONN}.nmconnection"
+  if [ -f "$CONN_FILE" ] && grep -q '^band=bg' "$CONN_FILE"; then
+    echo "[repatch] restoring 5GHz band on $WIFI_CONN"
+    sed -i 's/^band=bg/band=a/' "$CONN_FILE"
+    nmcli connection reload 2>/dev/null || true
+    nmcli connection up "$WIFI_CONN" 2>/dev/null || true
+  fi
 fi
 
 # 4. Restart and report.
