@@ -289,16 +289,18 @@ else
       if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # use Tesla BLE API to nudge the car
       then
-        # Sampler-delegated path (task #329). When BLE_KEEP_AWAKE_VIA_SAMPLER=yes
-        # AND the sampler's IPC socket is up, the sampler is emitting the
-        # nudge itself on its already-held PersistentSession (using the
-        # `wake` verb, which rides VCSEC and lands while Infotainment is
-        # dozing). Checked per-iteration so a sampler crash mid-cycle
-        # falls back to the spawned-action path below without a break in
-        # nudge coverage. Structured as an if/else (NOT if + `continue`)
-        # so the delegate branch falls through to the bottom-of-loop
-        # sleep instead of busy-looping the log line every tick.
-        if [[ "${BLE_KEEP_AWAKE_VIA_SAMPLER:-no}" =~ ^(yes|true|1)$ ]] \
+        # Sampler-delegated path (task #329). When BLE_KEEP_AWAKE_VIA_SAMPLER
+        # is set to a non-`no` value AND the sampler's IPC socket is up,
+        # the sampler is emitting the nudge itself on its already-held
+        # PersistentSession. Conf accepts `wake`, `charge-port-close`,
+        # and `combo` (wake → 2s pause → charge-port-close); `yes`/`true`/`1`
+        # are kept as aliases for `wake` so v3.11.10/v3.11.11 testers don't
+        # have to re-flip after upgrade. Checked per-iteration so a sampler
+        # crash mid-cycle falls back to the spawned-action path below without
+        # a break in nudge coverage. Structured as if/elif (NOT if + `continue`)
+        # so the delegate branch falls through to the bottom-of-loop sleep
+        # instead of busy-looping the log line every tick.
+        if [[ "${BLE_KEEP_AWAKE_VIA_SAMPLER:-no}" =~ ^(yes|true|1|wake|charge-port-close|charge_port_close|combo|wake\+charge-port-close|wake\+charge_port_close)$ ]] \
            && [[ -S /tmp/sentryusb-telemetry.sock ]]
         then
           log "Tesla BLE: Keep-awake nudge delegated to sampler [$(nudge_label)]."

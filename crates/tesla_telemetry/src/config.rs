@@ -53,15 +53,42 @@ pub struct BleConfig {
     /// install, so a pre-release build never changes behavior unless a
     /// tester explicitly turns it on. See the consolidation RFC.
     pub experimental: bool,
-    /// Emit periodic keep-awake nudges from inside the sampler on its
-    /// already-held PersistentSession instead of having `awake_start`
-    /// spawn a separate `ble-action` process every 300s. Default OFF
-    /// — set `BLE_KEEP_AWAKE_VIA_SAMPLER=yes` to enable. When on,
-    /// `awake_start`'s Case-3 BLE branch skips its `ble-action` call
-    /// while the sampler socket is present and lets the sampler emit
-    /// the nudge. When off (or the sampler is down), the legacy
-    /// spawned-loop path stays in charge. See task #329.
-    pub keep_awake_via_sampler: bool,
+    /// Which BLE verb (if any) the sampler emits as its periodic
+    /// keep-awake nudge. Default `Off` — when off, `awake_start`'s
+    /// legacy spawned `ble-action charge-port-close` path stays in
+    /// charge. When non-`Off`, the sampler emits the nudge on its
+    /// already-held PersistentSession every 300s and `awake_start`'s
+    /// Case-3 BLE branch delegates to it. See task #329.
+    ///
+    /// Conf key: `BLE_KEEP_AWAKE_VIA_SAMPLER`. Accepted values:
+    ///   * `no` / unset → `Off` (default; legacy charge-port-close path)
+    ///   * `wake` / `yes` / `true` / `1` → `Wake` (VCSEC domain — bumps
+    ///     car out of doze; the 2026-06-10 investigation noted it only
+    ///     wakes momentarily and doesn't reliably hold)
+    ///   * `charge-port-close` / `charge_port_close` → `ChargePortClose`
+    ///     (Infotainment domain — the team-validated "actually holds"
+    ///     verb, on the warm sampler session this time)
+    ///   * `combo` / `wake+charge-port-close` → `Combo` (send `wake`
+    ///     first, ~2s pause, then `charge-port-close` — uses the wake
+    ///     to bump the car out of doze so charge-port-close lands while
+    ///     Infotainment is awake)
+    pub keep_awake_mode: KeepAwakeMode,
+}
+
+/// What the sampler-emitted keep-awake nudge does each cycle. See
+/// `BleConfig::keep_awake_mode` for value semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeepAwakeMode {
+    Off,
+    Wake,
+    ChargePortClose,
+    Combo,
+}
+
+impl Default for KeepAwakeMode {
+    fn default() -> Self {
+        Self::Off
+    }
 }
 
 impl Default for BleConfig {
@@ -73,7 +100,7 @@ impl Default for BleConfig {
             keep_accessory: KeepAccessoryConfig::default(),
             away_auto_enabled: false,
             experimental: false,
-            keep_awake_via_sampler: false,
+            keep_awake_mode: KeepAwakeMode::Off,
         }
     }
 }
@@ -176,18 +203,29 @@ impl BleConfig {
         .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
         .unwrap_or(false);
 
-        // Sampler-emitted keep-awake nudge opt-in. Default OFF — when
-        // the flag isn't set, behavior is byte-for-byte the legacy
-        // spawned `ble-action charge-port-close` loop. Read fresh on
-        // every loop iteration so a tester can flip it via a conf edit
-        // without bouncing the service.
-        let keep_awake_via_sampler = sentryusb_config::get_config_value(
+        // Sampler-emitted keep-awake nudge mode. Default Off — when off,
+        // behavior is byte-for-byte the legacy spawned
+        // `ble-action charge-port-close` loop. Read fresh on every loop
+        // iteration so a tester can flip the value via a conf edit
+        // without bouncing the service. `yes` / `true` / `1` are kept
+        // as aliases for `wake` so testers on v3.11.10 / v3.11.11 don't
+        // have to re-flip after upgrade.
+        let keep_awake_mode = match sentryusb_config::get_config_value(
             &active,
             &commented,
             "BLE_KEEP_AWAKE_VIA_SAMPLER",
         )
-        .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
-        .unwrap_or(false);
+        .as_deref()
+        {
+            Some("wake") | Some("yes") | Some("true") | Some("1") => KeepAwakeMode::Wake,
+            Some("charge-port-close") | Some("charge_port_close") => {
+                KeepAwakeMode::ChargePortClose
+            }
+            Some("combo") | Some("wake+charge-port-close") | Some("wake+charge_port_close") => {
+                KeepAwakeMode::Combo
+            }
+            _ => KeepAwakeMode::Off,
+        };
 
         Ok(Self {
             enabled,
@@ -196,7 +234,7 @@ impl BleConfig {
             keep_accessory,
             away_auto_enabled,
             experimental,
-            keep_awake_via_sampler,
+            keep_awake_mode,
         })
     }
 }
