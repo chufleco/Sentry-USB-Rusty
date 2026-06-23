@@ -129,16 +129,27 @@ impl KeepAwakeManager {
     }
 
     /// Auto-mode heartbeat: extend by AUTO_TIMEOUT, start if idle.
+    ///
+    /// Manual-mode sessions are NOT extended — the user picked an explicit
+    /// duration that the heartbeat must not silently shorten. Previously the
+    /// `Active` arm unconditionally set `expires_at = now + AUTO_TIMEOUT`,
+    /// which meant the web UI's periodic heartbeat clobbered a 2-hour manual
+    /// session down to a rolling 10-minute window — manual timers visibly
+    /// reset themselves to 10 min after the first heartbeat tick.
     pub async fn heartbeat(self: &Arc<Self>) -> KaState {
         {
             let mut inner = self.inner.lock().await;
             match inner.state {
                 KaState::Active => {
-                    inner.expires_at = Some(SystemTime::now() + AUTO_TIMEOUT);
+                    if inner.mode == "auto" {
+                        inner.expires_at = Some(SystemTime::now() + AUTO_TIMEOUT);
+                    }
                     return KaState::Active;
                 }
                 KaState::Pending => {
-                    inner.pending_duration = AUTO_TIMEOUT;
+                    if inner.mode == "auto" {
+                        inner.pending_duration = AUTO_TIMEOUT;
+                    }
                     return KaState::Pending;
                 }
                 KaState::Idle => {}
