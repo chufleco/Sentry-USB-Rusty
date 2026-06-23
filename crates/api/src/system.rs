@@ -285,6 +285,142 @@ fn set_ble_paired_marker(paired: bool) {
     }
 }
 
+/// POST /api/system/ble-reset-pair
+///
+/// Recovery for a wedged phone↔Pi BLE pairing — the "Pairing rejected by
+/// SentryUSB-XXXX" dead end (#324) where the phone has no Bluetooth-settings
+/// entry to forget and the only prior fix was SSH. Clears ONLY phone-side
+/// state so a fresh claim can succeed:
+///   - removes each phone GATT-client bond from BlueZ (`bluetoothctl remove`)
+///   - deletes the app PIN (`/root/.sentryusb/ble-pin` + boot copy) → unclaimed
+///   - restarts ONLY `sentryusb-ble.service` (the phone-facing GATT server)
+///
+/// It NEVER touches the car or the sampler: the Tesla's BlueZ entry
+/// (advertised name `S<hex>C`, stored keyless — the vehicle uses app-layer
+/// crypto, not an LE bond) is preserved, and neither `bluetooth.service` nor
+/// the telemetry sampler is restarted, so keep-awake / archiving keep running.
+/// The app generates and pushes a fresh PIN during the subsequent re-claim.
+pub async fn ble_reset_pair(State(_s): State<AppState>) -> (StatusCode, Json<serde_json::Value>) {
+    // 1) Remove phone bonds, preserving the Tesla peer + keyless entries.
+    let removed = remove_phone_bonds().await;
+
+    // 2) Clear the app PIN so the device returns to the unclaimed state and
+    //    accepts a fresh claim from the app. Root is ro at runtime.
+    remount_root_rw();
+    let mut pin_cleared = false;
+    for p in ["/root/.sentryusb/ble-pin", "/boot/firmware/BLE_PIN"] {
+        match std::fs::remove_file(p) {
+            Ok(()) => pin_cleared = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => tracing::warn!("ble-reset: failed to remove {p}: {e}"),
+        }
+    }
+
+    // 3) Restart ONLY the phone-facing GATT server. Never the sampler or
+    //    bluetooth.service — the Tesla session must stay up.
+    let restarted = sentryusb_shell::run_with_timeout(
+        Duration::from_secs(20),
+        "systemctl",
+        &["restart", "sentryusb-ble.service"],
+    )
+    .await
+    .is_ok();
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "status": "reset",
+        "removed_bonds": removed,
+        "pin_cleared": pin_cleared,
+        "ble_service_restarted": restarted,
+    })))
+}
+
+/// Remove every BlueZ phone-client bond, preserving the Tesla peer.
+///
+/// The phone bonds carry an LTK/LinkKey that goes stale after a Pi rebuild
+/// or a phone reset — the desync behind #324. The Tesla advertises as
+/// `S<hex>C` and is stored keyless (vehicle BLE doesn't LE-bond), so we skip
+/// any peer whose name matches that shape OR that carries no bond key.
+/// `bluetoothctl remove` drops the bond from the live daemon and deletes the
+/// on-disk dir without restarting bluetoothd, so the car link is untouched.
+async fn remove_phone_bonds() -> Vec<String> {
+    let mut removed = Vec::new();
+    let adapters = match std::fs::read_dir("/var/lib/bluetooth") {
+        Ok(d) => d,
+        Err(_) => return removed,
+    };
+    for adapter in adapters.flatten() {
+        let apath = adapter.path();
+        if !apath.is_dir() {
+            continue;
+        }
+        let peers = match std::fs::read_dir(&apath) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        for peer in peers.flatten() {
+            let ppath = peer.path();
+            let mac = peer.file_name().to_string_lossy().to_string();
+            if !is_mac_dir(&mac) {
+                continue;
+            }
+            let info = std::fs::read_to_string(ppath.join("info")).unwrap_or_default();
+            if is_tesla_peer(&info) || !has_bond_key(&info) {
+                continue; // preserve the car + keyless cache entries
+            }
+            let _ = sentryusb_shell::run_with_timeout(
+                Duration::from_secs(10),
+                "bluetoothctl",
+                &["remove", &mac],
+            )
+            .await;
+            // If the daemon didn't know the bond, the dir survives the
+            // `remove` — delete it directly so a stale LTK can't linger.
+            let _ = std::fs::remove_dir_all(&ppath);
+            removed.push(mac);
+        }
+    }
+    removed
+}
+
+/// `XX:XX:XX:XX:XX:XX` — a BlueZ peer directory name.
+fn is_mac_dir(s: &str) -> bool {
+    let parts: Vec<&str> = s.split(':').collect();
+    parts.len() == 6
+        && parts
+            .iter()
+            .all(|p| p.len() == 2 && p.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// The peer's advertised `Name=` from its BlueZ `info` file, if present.
+fn info_name(info: &str) -> Option<&str> {
+    info.lines().find_map(|l| l.strip_prefix("Name=").map(str::trim))
+}
+
+/// True when the peer is a Tesla — advertised name `S<hex>C` (e.g.
+/// `Se04d38788e92e221C`). Used to protect the car's BlueZ entry from the
+/// phone-bond cleanup.
+fn is_tesla_peer(info: &str) -> bool {
+    match info_name(info) {
+        Some(name) => {
+            let b = name.as_bytes();
+            b.len() >= 10
+                && b[0] == b'S'
+                && b[b.len() - 1] == b'C'
+                && b[1..b.len() - 1].iter().all(u8::is_ascii_hexdigit)
+        }
+        None => false,
+    }
+}
+
+/// True when the peer's `info` carries an actual pairing key. Keyless cache
+/// entries (e.g. the Tesla) aren't the stale-LTK problem and are left alone.
+fn has_bond_key(info: &str) -> bool {
+    info.contains("[LinkKey]")
+        || info.contains("[LongTermKey]")
+        || info.contains("[PeripheralLongTermKey]")
+        || info.contains("[SlaveLongTermKey]")
+}
+
 /// GET /api/system/ble-status
 pub async fn ble_status(
     State(_s): State<AppState>,
