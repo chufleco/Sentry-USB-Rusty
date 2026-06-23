@@ -268,6 +268,10 @@ async fn main() {
     // either feature across the decoupling change. Idempotent —
     // skips if `BLE_KEEP_AWAKE_ENABLED` is already present.
     sentryusb_api::ble::migrate_legacy_ble_flag();
+    // One-shot: seed BLE_KEEP_AWAKE_VIA_SAMPLER=no so the Raw Config
+    // editor renders the row as a togglable switch out of the box.
+    // Idempotent — won't overwrite a value the tester already set.
+    sentryusb_api::ble::ensure_keep_awake_via_sampler_key_present();
     phase!("startup_tasks_spawned");
 
     // Build the API router

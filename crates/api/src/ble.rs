@@ -151,6 +151,31 @@ pub fn migrate_legacy_ble_flag() {
     }
 }
 
+/// One-shot: ensure `BLE_KEEP_AWAKE_VIA_SAMPLER` is present in the
+/// config file with a default of `no`. Lets the Raw Configuration
+/// editor surface the key as a togglable row out of the box, instead
+/// of forcing every tester to add it by hand with the `+` button.
+/// Idempotent — skips if the key is already set (so a tester who
+/// flipped it to `yes` doesn't get clobbered back to `no` on restart).
+pub fn ensure_keep_awake_via_sampler_key_present() {
+    let config_path = sentryusb_config::find_config_path();
+    let Ok((mut active, _commented)) = sentryusb_config::parse_file(config_path) else {
+        return;
+    };
+    if active.contains_key("BLE_KEEP_AWAKE_VIA_SAMPLER") {
+        return;
+    }
+    active.insert("BLE_KEEP_AWAKE_VIA_SAMPLER".to_string(), "no".to_string());
+    let _ = std::process::Command::new("bash")
+        .args(["-c", "/root/bin/remountfs_rw"])
+        .status();
+    if let Err(e) = sentryusb_config::write_file(config_path, &active) {
+        tracing::warn!("BLE_KEEP_AWAKE_VIA_SAMPLER seed write failed: {e}");
+    } else {
+        tracing::info!("seeded BLE_KEEP_AWAKE_VIA_SAMPLER=no (togglable in Raw Config editor)");
+    }
+}
+
 /// GET /api/system/ble-enabled
 pub async fn ble_enabled_get(
     State(_s): State<AppState>,
