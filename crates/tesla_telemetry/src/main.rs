@@ -327,6 +327,15 @@ async fn main() -> Result<()> {
     let mut last_location_poll: Option<Instant> = None;
     // Keep-Accessory-Power automation policy state (see keep_accessory.rs).
     let mut keep_accessory_state = keep_accessory::KeepAccessoryState::default();
+    // Sampler-emitted keep-awake nudge state (see #329 / nudge_keep_awake).
+    // `next_nudge_due_at`: when the next `wake` action should fire; `None`
+    // = fire on the first eligible tick. `nudge_retry_count`: consecutive
+    // failures in the current 3-attempt cycle. `last_nudge_notification_at`:
+    // dedup window for the "Keep awake failed (attempt 3/3)" push so a
+    // prolonged outage emits at most one notification per 10 min.
+    let mut next_nudge_due_at: Option<Instant> = None;
+    let mut nudge_retry_count: u32 = 0;
+    let mut last_nudge_notification_at: Option<Instant> = None;
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -416,6 +425,9 @@ async fn main() -> Result<()> {
                     &mut last_lon,
                     &mut last_location_name,
                     &mut last_location_poll,
+                    &mut next_nudge_due_at,
+                    &mut nudge_retry_count,
+                    &mut last_nudge_notification_at,
                 ).await;
                 // Keep-Accessory-Power automation runs after each tick
                 // with the freshly-updated signals. Best-effort; gated
@@ -504,6 +516,9 @@ async fn tick(
     last_lon: &mut Option<f64>,
     last_location_name: &mut Option<String>,
     last_location_poll: &mut Option<Instant>,
+    next_nudge_due_at: &mut Option<Instant>,
+    nudge_retry_count: &mut u32,
+    last_nudge_notification_at: &mut Option<Instant>,
 ) -> (Duration, Option<BleConfig>) {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -575,6 +590,60 @@ async fn tick(
     // aborts the copy. Self-clears when the work finishes, so it can't
     // wedge the car permanently awake (see lock::keep_awake_requested).
     let keep_awake_active = lock::keep_awake_requested();
+
+    // Sampler-emitted keep-awake nudge (task #329). When opted in via
+    // BLE_KEEP_AWAKE_VIA_SAMPLER=yes and a keep-awake is in effect, emit
+    // a periodic `wake` action on the already-held PersistentSession
+    // instead of letting awake_start spawn a separate `ble-action` every
+    // 300s. The legacy path fails for two reasons that this fixes at
+    // once: (a) charge-port-close hits Domain::Infotainment which sleeps
+    // along with the main computer, while `wake` rides Domain::VehicleSecurity
+    // which stays up; (b) a second BLE client desyncs the framing on the
+    // GATT link the sampler is already holding. Both validated on-vehicle
+    // 2026-06-22 — Infotainment was deaf, a clean VCSEC wake flipped USB
+    // addressed→configured in ~4s, recording resumed. Sentry-on => car
+    // is already awake; no need to nudge.
+    if cfg.keep_awake_via_sampler && keep_awake_active && !sentry_on {
+        let now = Instant::now();
+        let due = next_nudge_due_at.map(|t| now >= t).unwrap_or(true);
+        if due {
+            let payload = sentryusb_tesla_ble::actions::wake_vehicle();
+            match session.send_action(payload).await {
+                Ok(_) => {
+                    info!("keep-awake: wake nudge sent (next in 300s)");
+                    *next_nudge_due_at = Some(now + Duration::from_secs(300));
+                    *nudge_retry_count = 0;
+                }
+                Err(e) => {
+                    *nudge_retry_count += 1;
+                    warn!(
+                        "keep-awake: wake nudge failed (attempt {}/3): {:#}",
+                        *nudge_retry_count, e
+                    );
+                    if *nudge_retry_count >= 3 {
+                        let notify_due = last_nudge_notification_at
+                            .map(|t| now.duration_since(t) >= Duration::from_secs(600))
+                            .unwrap_or(true);
+                        if notify_due {
+                            emit_keep_awake_failure_notification(&format!("{:#}", e));
+                            *last_nudge_notification_at = Some(now);
+                        }
+                        // Reset cycle so retries don't run forever at 30s
+                        // cadence; back off to the normal 300s window.
+                        *nudge_retry_count = 0;
+                        *next_nudge_due_at = Some(now + Duration::from_secs(300));
+                    } else {
+                        *next_nudge_due_at = Some(now + Duration::from_secs(30));
+                    }
+                }
+            }
+        }
+    } else if !keep_awake_active {
+        // Reset cycle state once the keep-awake reason clears so the next
+        // archive starts at a clean 0/3, immediate-fire baseline.
+        *next_nudge_due_at = None;
+        *nudge_retry_count = 0;
+    }
 
     // Two paths to quiet mode: car_truly_asleep (no recent clip writes)
     // or parked_confirmed (Park 3+ polls). Both also require the car isn't
@@ -1580,6 +1649,22 @@ async fn release_radio() {
     if let Err(e) = lock::release(OWNER) {
         warn!("failed to release radio lock: {e}");
     }
+}
+
+/// Shell out to `/root/bin/send-push-message` with the same arg shape
+/// `awake_start::notify_nudge_failure` uses, so the existing SC client
+/// regex (NotificationsScreen) still routes this push into the
+/// keep-awake-failure category. Best-effort: any failure to spawn is
+/// swallowed (the nudge cycle has already done its retries; a missing
+/// FCM relay can't recover the underlying BLE failure).
+fn emit_keep_awake_failure_notification(reason: &str) {
+    let title = std::env::var("NOTIFICATION_TITLE").unwrap_or_else(|_| "SentryUSB".into());
+    let body = format!(
+        "Tesla BLE: Keep awake failed (attempt 3/3). BLE command failed. Response: {reason}"
+    );
+    let _ = std::process::Command::new("/root/bin/send-push-message")
+        .args([&format!("{title}:"), &body, "", "keep_awake_failure"])
+        .spawn();
 }
 
 #[cfg(test)]
