@@ -47,6 +47,12 @@ const ARCHIVE_STATUS_FRESH_SECS: u64 = 120;
 /// PID file written by the Case-3 keep-awake nudge loop in awake_start.
 const NUDGE_PID_FILE: &str = "/tmp/keep_awake_nudge_pid";
 
+/// Wanted-flag written by `drives_handler::register_keep_awake_want` —
+/// presence means at least one in-process owner (web UI session,
+/// drive-data processor) currently wants the car kept awake. Path
+/// must match `KEEP_AWAKE_WANTED_FLAG` in `crates/api/src/drives_handler.rs`.
+const WEBUI_WANTED_FLAG: &str = "/tmp/keep_awake_webui_wanted";
+
 /// Acquire the radio lock for `owner`. Returns `true` if we now hold
 /// it. Returns `false` if another fresh owner holds it — callers
 /// should back off and retry later.
@@ -249,15 +255,29 @@ fn is_nudge_alive_at(pid_file: &Path) -> bool {
     Path::new(&format!("/proc/{pid}")).exists()
 }
 
+/// True when an in-process owner has registered a keep-awake want via
+/// `drives_handler::register_keep_awake_want`. Presence-only — the flag
+/// is removed on the 1→0 transition. Bridges the gap when `awake_start`
+/// hasn't been spawned (and therefore no nudge PID file exists) but the
+/// web UI or drive processor still wants the car awake.
+fn is_webui_keep_awake_wanted_at(flag_path: &Path) -> bool {
+    flag_path.exists()
+}
+
 /// True when something currently wants the car kept awake: an archive
-/// cycle (fresh `archive_status.json`) or any keep-awake nudge loop
+/// cycle (fresh `archive_status.json`), a keep-awake nudge loop
 /// (`awake_start`'s Case-3 PID file — archiveloop, web-UI, drive
-/// processing). The quiet-mode gate consults this so it never green-lights
-/// sleep out from under an in-flight archive. Both inputs self-clear — the
-/// status file goes stale (120s), the PID dies — so this can't wedge the
-/// car permanently awake once the work finishes.
+/// processing), or an in-process keep-awake want (web UI session,
+/// drive-data processor, future sampler-delegated keep-awake). The
+/// quiet-mode gate consults this so it never green-lights sleep out
+/// from under an in-flight archive. All inputs self-clear — the
+/// status file goes stale (120s), the PID dies, the wanted-flag is
+/// removed on release — so this can't wedge the car permanently
+/// awake once the work finishes.
 pub fn keep_awake_requested() -> bool {
-    is_archive_active() || is_nudge_alive()
+    is_archive_active()
+        || is_nudge_alive()
+        || is_webui_keep_awake_wanted_at(Path::new(WEBUI_WANTED_FLAG))
 }
 
 #[cfg(test)]
@@ -392,5 +412,16 @@ mod tests {
         env.acquire("keep_awake");
         release_at(&env.lock, "telemetry").unwrap();
         assert_eq!(env.owner().as_deref(), Some("keep_awake"));
+    }
+
+    #[test]
+    fn webui_wanted_flag_presence_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = dir.path().join("keep_awake_webui_wanted");
+        assert!(!is_webui_keep_awake_wanted_at(&flag));
+        std::fs::write(&flag, b"").unwrap();
+        assert!(is_webui_keep_awake_wanted_at(&flag));
+        std::fs::remove_file(&flag).unwrap();
+        assert!(!is_webui_keep_awake_wanted_at(&flag));
     }
 }
