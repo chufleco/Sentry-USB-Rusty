@@ -602,9 +602,18 @@ async fn tick(
     // the nudge rides Domain::VehicleSecurity which stays up while
     // Infotainment is dozing. Conf supports `wake`, `charge-port-close`,
     // and `combo` (wake → 2s pause → charge-port-close) so the verb axis
-    // can be tuned independently from the architecture change. Sentry-on
-    // => car is already awake; no need to nudge.
-    if cfg.keep_awake_mode != KeepAwakeMode::Off && keep_awake_active && !sentry_on {
+    // can be tuned independently from the architecture change.
+    //
+    // Gate is intentionally minimal — no `sentry_on` check. The legacy
+    // `awake_start` Case-3 loop nudges every 300s regardless of sentry
+    // state; this matches that. Asymmetric cost: nudging when sentry is
+    // genuinely on is a harmless no-op (car already awake, BLE round-trip
+    // costs nothing), but skipping a nudge when sentry's actually off is
+    // archive-breaking. Earlier versions gated on `!sentry_on` which broke
+    // on bench (no car => sentry_on defaults to true => nudge never fires)
+    // and would also block legit nudges if the sampler missed one sentry
+    // read on a real car.
+    if cfg.keep_awake_mode != KeepAwakeMode::Off && keep_awake_active {
         let now = Instant::now();
         let due = next_nudge_due_at.map(|t| now >= t).unwrap_or(true);
         if due {
