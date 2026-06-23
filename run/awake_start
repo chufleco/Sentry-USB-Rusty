@@ -289,6 +289,20 @@ else
       if [[ -n "${TESLA_BLE_VIN:+x}" ]] && ble_is_enabled
       # use Tesla BLE API to nudge the car
       then
+        # Sampler-delegated path (task #329). When BLE_KEEP_AWAKE_VIA_SAMPLER=yes
+        # AND the sampler's IPC socket is up, the sampler is emitting the
+        # nudge itself on its already-held PersistentSession (using the
+        # `wake` verb, which rides VCSEC and lands while Infotainment is
+        # dozing). Checked per-iteration so a sampler crash mid-cycle
+        # falls back to the spawned-action path below without a break in
+        # nudge coverage.
+        if [[ "${BLE_KEEP_AWAKE_VIA_SAMPLER:-no}" =~ ^(yes|true|1)$ ]] \
+           && [[ -S /tmp/sentryusb-telemetry.sock ]]
+        then
+          log "Tesla BLE: Keep-awake nudge delegated to sampler [$(nudge_label)]."
+          retry=0
+          continue
+        fi
         # In-process bluez-based BLE — see crates/tesla_ble. Reads
         # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs + sends one
         # charge-port-close, exits.
