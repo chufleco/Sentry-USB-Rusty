@@ -248,6 +248,15 @@ struct SessionState {
     /// Consecutive `ensure_connected` failures; reset on success, triggers
     /// an adapter rebuild at `ADAPTER_REBUILD_AFTER`.
     consecutive_connect_failures: u32,
+    /// Consecutive query-response timeouts ("waiting for response: deadline
+    /// has elapsed") on the current connection. A response-side timeout
+    /// doesn't necessarily mean the BLE link died — Tesla's own reference
+    /// (tesla/vehicle-command) keeps the connection open across such
+    /// timeouts. We swallow up to `MAX_QUERY_TIMEOUT_RETRIES` without
+    /// dropping the GATT, gated by `queries_since_connect >= 1` (proves the
+    /// link has worked at least once on this session). Reset on any
+    /// successful query.
+    query_timeout_retries: u32,
 }
 
 /// Timing-sample window for the percentiles. 100 ≈ 5-10 min of
@@ -272,6 +281,13 @@ const STATUS_FILE_PATH: &str = "/mutable/sentryusb-ble-status.txt";
 /// Emit a connection-status summary every N successful queries
 /// (~6 min at 15s cycles).
 const STATUS_LOG_EVERY_N_QUERIES: u32 = 25;
+
+/// Max in-session query-response-timeout retries before treating the link
+/// as dead. Two retries clears intermittent slow responses while still
+/// failing fast if the link is genuinely gone. After this cap, the next
+/// `"waiting for response"` error falls through to the normal teardown
+/// path. Reset to 0 on any successful query.
+const MAX_QUERY_TIMEOUT_RETRIES: u32 = 2;
 
 impl PersistentSession {
     /// Spawn the background session task and return a handle. The first
@@ -301,6 +317,7 @@ impl PersistentSession {
             framing_desync_recoveries: 0,
             cached_adapter: None,
             consecutive_connect_failures: 0,
+            query_timeout_retries: 0,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -1083,7 +1100,54 @@ async fn handle_transport_error_if_any<T>(
     result: &Result<T>,
 ) {
     if let Err(e) = result {
-        if state.conn.is_some() && is_transport_error(e) {
+        if state.conn.is_none() {
+            return;
+        }
+
+        // Query-response timeout fast-path: absorb up to
+        // MAX_QUERY_TIMEOUT_RETRIES on a proven-working link instead of
+        // tearing down the GATT. Matches Tesla's `vehicle-command`
+        // reference, which keeps the connection across response-side
+        // timeouts and only the caller-supplied context bounds the wait.
+        //
+        // Guards (all required):
+        //   * queries_since_connect >= 1 — proves the link has worked
+        //     at least once on this session (don't loop on a session
+        //     that never completed a handshake — the `held=15s queries=0`
+        //     pattern observed in /mutable/sentryusb-ble-disconnects.log
+        //     for fresh connects that never produced a successful query)
+        //   * query_timeout_retries < MAX_QUERY_TIMEOUT_RETRIES — cap
+        //     the absorbed-timeout count per session; after the cap the
+        //     next timeout falls through to the normal teardown path
+        //
+        // On fall-through, query_timeout_retries is NOT incremented past
+        // the cap — the existing teardown logs the drop with the same
+        // "waiting for response" reason and resets state on reconnect.
+        if is_query_response_timeout(e)
+            && state.queries_since_connect >= 1
+            && state.query_timeout_retries < MAX_QUERY_TIMEOUT_RETRIES
+        {
+            state.query_timeout_retries = state.query_timeout_retries.saturating_add(1);
+            let last_ok_secs = state
+                .last_successful_query_at
+                .map(|t| t.elapsed().as_secs() as i64)
+                .unwrap_or(-1);
+            warn!(
+                "PersistentSession: query response timeout (attempt {}/{}) — \
+                 keeping link open, retry on next query (held={}s, last_ok={}s_ago): {:#}",
+                state.query_timeout_retries,
+                MAX_QUERY_TIMEOUT_RETRIES,
+                state
+                    .connected_at
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0),
+                last_ok_secs,
+                e,
+            );
+            return;
+        }
+
+        if is_transport_error(e) || is_query_response_timeout(e) {
             state.lifetime_drops = state.lifetime_drops.saturating_add(1);
             let held_secs = state
                 .connected_at
@@ -1405,6 +1469,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.consecutive_connect_failures = 0;
     state.connected_at = Some(Instant::now());
     state.queries_since_connect = 0;
+    state.query_timeout_retries = 0;
     state.last_scan_rssi = scan_rssi;
     state.last_peer_mac = Some(peer_mac);
     // Drop the old latency history — a new link negotiates fresh BLE
@@ -1465,6 +1530,11 @@ fn note_successful_query(state: &mut SessionState, elapsed_ms: u128) {
     state.queries_since_connect = state.queries_since_connect.saturating_add(1);
     // Record success time for the disconnect diagnostic's "last_ok=Xs".
     state.last_successful_query_at = Some(Instant::now());
+    // A successful query proves the link recovered from any prior
+    // query-response timeouts on this session — clear the counter so
+    // the next timeout (if any) gets the full MAX_QUERY_TIMEOUT_RETRIES
+    // budget again instead of falling through to teardown.
+    state.query_timeout_retries = 0;
 
     // Push into the sliding latency window, evict oldest if full.
     if state.recent_latencies_ms.len() >= SAMPLES_FOR_PERCENTILES {
@@ -1589,13 +1659,42 @@ fn payload_variant_name(p: Option<&routable_message::Payload>) -> &'static str {
 /// Heuristic: does this error look like the BLE link dropped (vs a
 /// fault returned by the car at the protocol level)? Used to decide
 /// whether to drop the connection for the next query to reopen.
+///
+/// NOTE: query-response timeouts (`"waiting for response"`) are
+/// classified separately via [`is_query_response_timeout`] and are not
+/// counted as link-dead — Tesla's own reference SDK keeps the connection
+/// open across them. See `handle_transport_error_if_any` for the smart
+/// retry path.
 fn is_transport_error(e: &anyhow::Error) -> bool {
     let msg = format!("{e:#}");
     msg.contains("notification stream ended")
         || msg.contains("BLE write")
-        || msg.contains("waiting for response")
         || msg.contains("not connected")
         || msg.contains("Peripheral")
+}
+
+/// Match the specific error shape produced by the GATT-layer query
+/// response timeout (`gatt.rs` wraps the receive loop with
+/// `timeout(..).context("waiting for response")`). On expiry the message
+/// renders as `"waiting for response: deadline has elapsed"`.
+///
+/// A response-side timeout doesn't necessarily mean the BLE link died:
+/// the chip may have ack'd our TX, the car may be slow to respond, or a
+/// stray notification may have desynced our framing. Tesla's own
+/// `tesla/vehicle-command` reference keeps the connection across these
+/// (only the inputBuffer is discarded). We mirror that behavior: up to
+/// [`MAX_QUERY_TIMEOUT_RETRIES`] timeouts on a session that has already
+/// completed at least one successful query are absorbed without dropping
+/// the GATT, after which the next timeout falls through to the normal
+/// teardown path.
+///
+/// Match is anchored on `"waiting for response"` (the context string),
+/// not the bare `"deadline has elapsed"` — `tokio::time::timeout` is
+/// also used around `peripheral.connect()` (gatt.rs `CONNECT_TIMEOUT`),
+/// which would render as `"BLE connect: deadline has elapsed"` and must
+/// stay a real teardown.
+fn is_query_response_timeout(e: &anyhow::Error) -> bool {
+    format!("{e:#}").contains("waiting for response")
 }
 
 /// Whether `e` is an AES-GCM response-decrypt failure — the car answered
@@ -1665,7 +1764,7 @@ async fn capture_recent_bluetooth_dmesg() -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_decrypt_error, is_transport_error};
+    use super::{is_decrypt_error, is_query_response_timeout, is_transport_error};
 
     #[test]
     fn decrypt_failure_is_decrypt_not_transport() {
@@ -1676,6 +1775,10 @@ mod tests {
             !is_transport_error(&e),
             "a decrypt failure must NOT be treated as a transport drop"
         );
+        assert!(
+            !is_query_response_timeout(&e),
+            "a decrypt failure must NOT be classified as a response timeout"
+        );
     }
 
     #[test]
@@ -1684,6 +1787,45 @@ mod tests {
             let e = anyhow::anyhow!("{msg}");
             assert!(is_transport_error(&e), "{msg} should be transport");
             assert!(!is_decrypt_error(&e), "{msg} must not trigger session re-handshake");
+            assert!(
+                !is_query_response_timeout(&e),
+                "{msg} is a link-side error, not a response-side timeout"
+            );
         }
+    }
+
+    #[test]
+    fn query_response_timeout_is_classified_separately() {
+        // Exact shape produced by gatt.rs `timeout(..).context("waiting for response")`
+        // when the tokio Elapsed surfaces — context first, source after.
+        let e = anyhow::anyhow!("waiting for response: deadline has elapsed");
+        assert!(
+            is_query_response_timeout(&e),
+            "the GATT response-wait timeout must classify as query_response_timeout"
+        );
+        // CRITICAL: must NOT be classified as a transport error, so
+        // handle_transport_error_if_any takes the smart-retry path
+        // instead of tearing down the GATT.
+        assert!(
+            !is_transport_error(&e),
+            "query response timeout must NOT be is_transport_error (would force teardown)"
+        );
+        assert!(!is_decrypt_error(&e));
+    }
+
+    #[test]
+    fn ble_connect_timeout_stays_transport_not_query() {
+        // The connect-side timeout in gatt.rs (`CONNECT_TIMEOUT`) renders
+        // through its own context ("BLE connect") and must keep treating
+        // the link as down. The unique discriminator for the query path
+        // is the literal "waiting for response" substring.
+        let e = anyhow::anyhow!("BLE connect: deadline has elapsed");
+        assert!(
+            !is_query_response_timeout(&e),
+            "a connect-side timeout must NOT be absorbed as a query timeout"
+        );
+        // (BLE connect failures aren't matched by is_transport_error
+        // either — they're caught upstream in ensure_connected's own
+        // error path with ConnectFailure context.)
     }
 }
