@@ -45,6 +45,13 @@ path = "examples/persistent_session.rs"
 name = "typed_query"
 path = "examples/typed_query.rs"
 
+# Spike (task #338): bluer-based scan + connect probe. Used to verify
+# whether bluer's D-Bus connect path avoids the AIC8800 HCI ENOSYS
+# trap that breaks btleplug's reconnect on Radxa Zero 3W. Linux-only.
+[[example]]
+name = "bluer_probe"
+path = "examples/bluer_probe.rs"
+
 [dependencies]
 tokio = { workspace = true }
 anyhow = { workspace = true }
@@ -53,6 +60,12 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 
 btleplug = "0.12"
+# Bluer is added for task #338 spike — testing whether D-Bus-based
+# Connect on AIC8800 avoids the HCI Connection-Cancel ENOSYS that
+# breaks btleplug's reconnect path. Linux-only (BlueZ-specific), so
+# the example is the only consumer for now; library code still uses
+# btleplug. Will become a primary dep if the spike validates.
+bluer = { version = "0.17", features = ["bluetoothd"] }
 futures = "0.3"
 prost = "0.14"
 # Used only through build.rs's `.extern_path(".google.protobuf", "::prost_types")`
