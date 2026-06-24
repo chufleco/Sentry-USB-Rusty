@@ -53,43 +53,24 @@ pub struct BleConfig {
     /// install, so a pre-release build never changes behavior unless a
     /// tester explicitly turns it on. See the consolidation RFC.
     pub experimental: bool,
-    /// Which BLE verb (if any) the sampler emits as its periodic
-    /// keep-awake nudge. Default `Off` — when off, `awake_start`'s
-    /// legacy spawned `ble-action charge-port-close` path stays in
-    /// charge. When non-`Off`, the sampler emits the nudge on its
-    /// already-held PersistentSession every 300s and `awake_start`'s
-    /// Case-3 BLE branch delegates to it. See task #329.
-    ///
-    /// Conf key: `BLE_KEEP_AWAKE_VIA_SAMPLER`. Accepted values:
-    ///   * `no` / unset → `Off` (default; legacy charge-port-close path)
-    ///   * `wake` / `yes` / `true` / `1` → `Wake` (VCSEC domain — bumps
-    ///     car out of doze; the 2026-06-10 investigation noted it only
-    ///     wakes momentarily and doesn't reliably hold)
-    ///   * `charge-port-close` / `charge_port_close` → `ChargePortClose`
-    ///     (Infotainment domain — the team-validated "actually holds"
-    ///     verb, on the warm sampler session this time)
-    ///   * `combo` / `wake+charge-port-close` → `Combo` (send `wake`
-    ///     first, ~2s pause, then `charge-port-close` — uses the wake
-    ///     to bump the car out of doze so charge-port-close lands while
-    ///     Infotainment is awake)
-    pub keep_awake_mode: KeepAwakeMode,
+    /// How often the sampler fires the keep-awake `charge-port-close`
+    /// nudge while a keep-awake is active (env: `BLE_KEEP_AWAKE_INTERVAL_SEC`,
+    /// default 60). Tesla's post-2026.14.3 "falling asleep" window is
+    /// around 18 min on parked cars, so the default of 60 s sits well
+    /// inside that with room for a missed nudge. Bench-friendly knob:
+    /// AIC8800 / UART-BT boards can dial it to 120–180 s to reduce
+    /// session-drop pressure while the bluer rewrite (#338) lands.
+    /// Bash legacy path (`run/awake_start`) reads the same key so both
+    /// architectures honor it consistently.
+    pub keep_awake_interval_secs: u64,
 }
 
-/// What the sampler-emitted keep-awake nudge does each cycle. See
-/// `BleConfig::keep_awake_mode` for value semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeepAwakeMode {
-    Off,
-    Wake,
-    ChargePortClose,
-    Combo,
-}
-
-impl Default for KeepAwakeMode {
-    fn default() -> Self {
-        Self::Off
-    }
-}
+/// Default `BLE_KEEP_AWAKE_INTERVAL_SEC` when unset. 60 s matches the
+/// on-vehicle Phase 1+2 test (2026-06-23) that held a parked 2026.20.3
+/// Tesla `online` for 1 h+ continuous; relaxing to a bigger value is
+/// safe up to ~300 s on Tesla firmware that pre-dates the 14.3
+/// scheduler tightening but borderline beyond that.
+pub const DEFAULT_KEEP_AWAKE_INTERVAL_SECS: u64 = 60;
 
 impl Default for BleConfig {
     fn default() -> Self {
@@ -100,7 +81,7 @@ impl Default for BleConfig {
             keep_accessory: KeepAccessoryConfig::default(),
             away_auto_enabled: false,
             experimental: false,
-            keep_awake_mode: KeepAwakeMode::Off,
+            keep_awake_interval_secs: DEFAULT_KEEP_AWAKE_INTERVAL_SECS,
         }
     }
 }
@@ -203,29 +184,27 @@ impl BleConfig {
         .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
         .unwrap_or(false);
 
-        // Sampler-emitted keep-awake nudge mode. Default Off — when off,
-        // behavior is byte-for-byte the legacy spawned
-        // `ble-action charge-port-close` loop. Read fresh on every loop
-        // iteration so a tester can flip the value via a conf edit
-        // without bouncing the service. `yes` / `true` / `1` are kept
-        // as aliases for `wake` so testers on v3.11.10 / v3.11.11 don't
-        // have to re-flip after upgrade.
-        let keep_awake_mode = match sentryusb_config::get_config_value(
+        // Note (2026-06-23, task #336): the `BLE_KEEP_AWAKE_VIA_SAMPLER`
+        // 4-valued flag (#115 / off / wake / charge-port-close / combo)
+        // was removed. The sampler now always dispatches a single
+        // `charge-port-close` nudge inline at the end of an active tick
+        // when `keep_awake_requested()` is true — see the "Sampler
+        // keep-awake CPC dispatch" block in `main.rs::tick`. Setting
+        // the legacy env var has no effect; it's ignored silently to
+        // avoid breaking existing configs at upgrade time.
+
+        // Cadence knob for the inline keep-awake nudge. Same env key
+        // the legacy bash path in `run/awake_start` honors, so both
+        // architectures agree. Clamp out absurd values (< 15 s spams
+        // the radio, > 900 s exceeds Tesla's post-14.3 sleep window).
+        let keep_awake_interval_secs = sentryusb_config::get_config_value(
             &active,
             &commented,
-            "BLE_KEEP_AWAKE_VIA_SAMPLER",
+            "BLE_KEEP_AWAKE_INTERVAL_SEC",
         )
-        .as_deref()
-        {
-            Some("wake") | Some("yes") | Some("true") | Some("1") => KeepAwakeMode::Wake,
-            Some("charge-port-close") | Some("charge_port_close") => {
-                KeepAwakeMode::ChargePortClose
-            }
-            Some("combo") | Some("wake+charge-port-close") | Some("wake+charge_port_close") => {
-                KeepAwakeMode::Combo
-            }
-            _ => KeepAwakeMode::Off,
-        };
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| (15..=900).contains(s))
+        .unwrap_or(DEFAULT_KEEP_AWAKE_INTERVAL_SECS);
 
         Ok(Self {
             enabled,
@@ -234,7 +213,7 @@ impl BleConfig {
             keep_accessory,
             away_auto_enabled,
             experimental,
-            keep_awake_mode,
+            keep_awake_interval_secs,
         })
     }
 }

@@ -34,7 +34,7 @@ use rusqlite::Connection;
 use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
-use crate::config::{BleConfig, KeepAwakeMode};
+use crate::config::BleConfig;
 use crate::sample::Sample;
 use crate::usb_watch::CarState;
 
@@ -591,100 +591,17 @@ async fn tick(
     // wedge the car permanently awake (see lock::keep_awake_requested).
     let keep_awake_active = lock::keep_awake_requested();
 
-    // Sampler-emitted keep-awake nudge (task #329). When opted in via
-    // BLE_KEEP_AWAKE_VIA_SAMPLER and a keep-awake is in effect, emit a
-    // periodic action on the already-held PersistentSession instead of
-    // letting awake_start spawn a separate `ble-action` every 300s. The
-    // legacy path fails for two reasons that the sampler-emit fixes at
-    // once: (a) the spawned `ble-action` is a second BLE client on the
-    // same GATT link as the sampler — framing desync on both sides; (b)
-    // when the conf selects the `wake` verb instead of `charge-port-close`,
-    // the nudge rides Domain::VehicleSecurity which stays up while
-    // Infotainment is dozing. Conf supports `wake`, `charge-port-close`,
-    // and `combo` (wake → 2s pause → charge-port-close) so the verb axis
-    // can be tuned independently from the architecture change.
-    //
-    // Gate is intentionally minimal — no `sentry_on` check. The legacy
-    // `awake_start` Case-3 loop nudges every 300s regardless of sentry
-    // state; this matches that. Asymmetric cost: nudging when sentry is
-    // genuinely on is a harmless no-op (car already awake, BLE round-trip
-    // costs nothing), but skipping a nudge when sentry's actually off is
-    // archive-breaking. Earlier versions gated on `!sentry_on` which broke
-    // on bench (no car => sentry_on defaults to true => nudge never fires)
-    // and would also block legit nudges if the sampler missed one sentry
-    // read on a real car.
-    if cfg.keep_awake_mode != KeepAwakeMode::Off && keep_awake_active {
-        let now = Instant::now();
-        let due = next_nudge_due_at.map(|t| now >= t).unwrap_or(true);
-        if due {
-            let verb_label = match cfg.keep_awake_mode {
-                KeepAwakeMode::Wake => "wake",
-                KeepAwakeMode::ChargePortClose => "charge-port-close",
-                KeepAwakeMode::Combo => "combo (wake + charge-port-close)",
-                KeepAwakeMode::Off => unreachable!(),
-            };
-            let result = match cfg.keep_awake_mode {
-                KeepAwakeMode::Wake => {
-                    session.send_action(sentryusb_tesla_ble::actions::wake_vehicle()).await
-                }
-                KeepAwakeMode::ChargePortClose => {
-                    session.send_action(sentryusb_tesla_ble::actions::charge_port_close()).await
-                }
-                KeepAwakeMode::Combo => {
-                    // Two-step nudge: wake (VCSEC) to bump the car out of
-                    // any current doze, then charge-port-close (Infotainment,
-                    // the team-validated "actually holds" verb) to land
-                    // while Infotainment is awake enough to honor it. The
-                    // ~2s pause matches the on-vehicle isolation test's
-                    // USB addressed→configured window. Wake is best-effort
-                    // (logged but not retry-driving); charge-port-close
-                    // drives the retry/notification budget.
-                    let wake_result = session
-                        .send_action(sentryusb_tesla_ble::actions::wake_vehicle())
-                        .await;
-                    match &wake_result {
-                        Ok(_) => info!("keep-awake: combo step 1/2 wake sent"),
-                        Err(e) => warn!(
-                            "keep-awake: combo step 1/2 wake failed (continuing to step 2): {:#}",
-                            e
-                        ),
-                    }
-                    tokio::time::sleep(Duration::from_secs(2)).await;
-                    session.send_action(sentryusb_tesla_ble::actions::charge_port_close()).await
-                }
-                KeepAwakeMode::Off => unreachable!(),
-            };
-            match result {
-                Ok(_) => {
-                    info!("keep-awake: {} nudge sent (next in 300s)", verb_label);
-                    *next_nudge_due_at = Some(now + Duration::from_secs(300));
-                    *nudge_retry_count = 0;
-                }
-                Err(e) => {
-                    *nudge_retry_count += 1;
-                    warn!(
-                        "keep-awake: {} nudge failed (attempt {}/3): {:#}",
-                        verb_label, *nudge_retry_count, e
-                    );
-                    if *nudge_retry_count >= 3 {
-                        let notify_due = last_nudge_notification_at
-                            .map(|t| now.duration_since(t) >= Duration::from_secs(600))
-                            .unwrap_or(true);
-                        if notify_due {
-                            emit_keep_awake_failure_notification(&format!("{:#}", e));
-                            *last_nudge_notification_at = Some(now);
-                        }
-                        // Reset cycle so retries don't run forever at 30s
-                        // cadence; back off to the normal 300s window.
-                        *nudge_retry_count = 0;
-                        *next_nudge_due_at = Some(now + Duration::from_secs(300));
-                    } else {
-                        *next_nudge_due_at = Some(now + Duration::from_secs(30));
-                    }
-                }
-            }
-        }
-    } else if !keep_awake_active {
+    // Keep-awake state cleanup happens here; the nudge itself fires
+    // AFTER the polls below (see "Sampler keep-awake CPC dispatch"
+    // comment further down). The two halves are separated because the
+    // pre-poll location used to fire the nudge against a session that
+    // might still be in mid-reconnect, which on AIC8800 / UART-BT boards
+    // returned `le-connection-abort-by-local` and burned the 3-retry
+    // budget every cycle. Firing after a successful poll guarantees the
+    // session is alive at the moment we send the action — the verb call
+    // reuses the same warm GATT link instead of triggering a fresh
+    // scan/connect that races the chip-firmware HCI gaps.
+    if !keep_awake_active {
         // Reset cycle state once the keep-awake reason clears so the next
         // archive starts at a clean 0/3, immediate-fire baseline.
         *next_nudge_due_at = None;
@@ -1335,6 +1252,78 @@ async fn tick(
                 sample.location_name = last_location_name.clone();
             }
             persist(conn, sample);
+        }
+
+        // Sampler keep-awake CPC dispatch (task #336 / supervisor pattern).
+        //
+        // We're at the end of an active tick — telemetry polls have run on
+        // the held session, which means the BLE link to the car is verified
+        // warm right now. This is the safe moment to piggy-back a
+        // `charge-port-close` action onto the same session: it reuses the
+        // already-handshook GATT path, no fresh scan-and-connect, no race
+        // with PersistentSession's reconnect logic.
+        //
+        // Single-verb design (CPC only, no `wake`, no `combo`):
+        //   * On-vehicle measurement 2026-06-23 (Phases 1–2 of #336 in-car
+        //     test): CPC every 60s held a parked Tesla 2026.20.3 `online`
+        //     for 1h+ continuous — 5× the post-2026.14.3 median online
+        //     window of 12 min. 25 CPCs in Phase 1, 34 more in Phase 2,
+        //     all returned "action OK; decrypted response = 22 bytes."
+        //   * `wake` alone is unreliable on parked cars (timed out in
+        //     Stage 1 isolation test); `combo` triggers a cross-domain
+        //     race that produces `le-connection-abort-by-local` 13 s
+        //     after the wake step. Neither outperforms CPC alone.
+        //   * 60 s cadence: well inside Tesla's post-2026.14.3 ~18 min
+        //     "falling asleep" window, picked aggressive enough to absorb
+        //     a single failed nudge without the cycle expiring.
+        //
+        // Failure budget: 3 attempts at 30 s spacing, then a 10-min-dedup
+        // push notification + 60 s back-off. Matches the legacy bash
+        // path's user-visible behavior so SC's notification regex still
+        // matches.
+        if keep_awake_active {
+            let now = Instant::now();
+            let due = next_nudge_due_at.map(|t| now >= t).unwrap_or(true);
+            if due {
+                let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
+                let result = session
+                    .send_action(sentryusb_tesla_ble::actions::charge_port_close())
+                    .await;
+                match result {
+                    Ok(_) => {
+                        info!(
+                            "keep-awake: charge-port-close nudge sent (next in {}s)",
+                            cfg.keep_awake_interval_secs
+                        );
+                        *next_nudge_due_at = Some(now + interval);
+                        *nudge_retry_count = 0;
+                    }
+                    Err(e) => {
+                        *nudge_retry_count += 1;
+                        warn!(
+                            "keep-awake: charge-port-close nudge failed \
+                             (attempt {}/3): {:#}",
+                            *nudge_retry_count, e
+                        );
+                        if *nudge_retry_count >= 3 {
+                            let notify_due = last_nudge_notification_at
+                                .map(|t| now.duration_since(t) >= Duration::from_secs(600))
+                                .unwrap_or(true);
+                            if notify_due {
+                                emit_keep_awake_failure_notification(&format!("{:#}", e));
+                                *last_nudge_notification_at = Some(now);
+                            }
+                            // Reset retry count and back off to normal
+                            // cadence — don't spam the link with 30 s
+                            // retries once the budget is exhausted.
+                            *nudge_retry_count = 0;
+                            *next_nudge_due_at = Some(now + interval);
+                        } else {
+                            *next_nudge_due_at = Some(now + Duration::from_secs(30));
+                        }
+                    }
+                }
+            }
         }
 
         // Live gate snapshot for the BLE card (not the DB).

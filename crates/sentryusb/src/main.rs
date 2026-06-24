@@ -268,10 +268,11 @@ async fn main() {
     // either feature across the decoupling change. Idempotent —
     // skips if `BLE_KEEP_AWAKE_ENABLED` is already present.
     sentryusb_api::ble::migrate_legacy_ble_flag();
-    // One-shot: seed BLE_KEEP_AWAKE_VIA_SAMPLER=no so the Raw Config
-    // editor renders the row as a togglable switch out of the box.
-    // Idempotent — won't overwrite a value the tester already set.
-    sentryusb_api::ble::ensure_keep_awake_via_sampler_key_present();
+    // Note (#336): the BLE_KEEP_AWAKE_VIA_SAMPLER seed call was removed.
+    // The 4-valued flag is no longer read by the sampler — keep-awake
+    // now always dispatches `charge-port-close` inline at the end of an
+    // active tick (see "Sampler keep-awake CPC dispatch" in
+    // tesla_telemetry/src/main.rs). Existing conf lines remain inert.
     phase!("startup_tasks_spawned");
 
     // Build the API router
