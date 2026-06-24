@@ -1306,18 +1306,64 @@ async fn tick(
                             *nudge_retry_count, e
                         );
                         if *nudge_retry_count >= 3 {
-                            let notify_due = last_nudge_notification_at
-                                .map(|t| now.duration_since(t) >= Duration::from_secs(600))
-                                .unwrap_or(true);
-                            if notify_due {
-                                emit_keep_awake_failure_notification(&format!("{:#}", e));
-                                *last_nudge_notification_at = Some(now);
+                            // Sampler session is unrecoverable for this
+                            // nudge (typically AIC8800 HCI ENOSYS — fresh
+                            // btleplug reconnect inside the same process
+                            // fails on that chip). Before giving up, try
+                            // a subprocess fallback: a fresh
+                            // /root/bin/sentryusb-ble-action invocation
+                            // gets its own BLE adapter handle, which
+                            // sidesteps the in-process HCI failure mode.
+                            // Same recipe held a parked Tesla online for
+                            // 1h+ in the 2026-06-23 in-car Phase 1+2 test.
+                            // BCM users (4C+ etc.) rarely hit the 3-strike
+                            // path at all, so this is effectively an
+                            // AIC8800-only fallback.
+                            let fallback = tokio::task::spawn_blocking(|| {
+                                std::process::Command::new(
+                                    "/root/bin/sentryusb-ble-action",
+                                )
+                                .arg("charge-port-close")
+                                .output()
+                            })
+                            .await;
+                            match fallback {
+                                Ok(Ok(out)) if out.status.success() => {
+                                    info!(
+                                        "keep-awake: subprocess fallback \
+                                         succeeded (sampler session \
+                                         unrecoverable, fresh ble-action \
+                                         delivered nudge)"
+                                    );
+                                    *nudge_retry_count = 0;
+                                    *next_nudge_due_at = Some(now + interval);
+                                }
+                                other => {
+                                    // Sampler AND subprocess both failed
+                                    // — fall back to the original
+                                    // notify-and-backoff path.
+                                    let err = format!(
+                                        "sampler: {:#}; subprocess: {:?}",
+                                        e, other
+                                    );
+                                    let notify_due = last_nudge_notification_at
+                                        .map(|t| {
+                                            now.duration_since(t)
+                                                >= Duration::from_secs(600)
+                                        })
+                                        .unwrap_or(true);
+                                    if notify_due {
+                                        emit_keep_awake_failure_notification(&err);
+                                        *last_nudge_notification_at = Some(now);
+                                    }
+                                    // Reset retry count and back off to
+                                    // normal cadence — don't spam the
+                                    // link with 30 s retries once the
+                                    // budget is exhausted.
+                                    *nudge_retry_count = 0;
+                                    *next_nudge_due_at = Some(now + interval);
+                                }
                             }
-                            // Reset retry count and back off to normal
-                            // cadence — don't spam the link with 30 s
-                            // retries once the budget is exhausted.
-                            *nudge_retry_count = 0;
-                            *next_nudge_due_at = Some(now + interval);
                         } else {
                             *next_nudge_due_at = Some(now + Duration::from_secs(30));
                         }
