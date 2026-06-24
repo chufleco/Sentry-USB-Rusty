@@ -53,42 +53,6 @@ pub struct BleConfig {
     /// install, so a pre-release build never changes behavior unless a
     /// tester explicitly turns it on. See the consolidation RFC.
     pub experimental: bool,
-    /// Which BLE verb (if any) the sampler emits as its periodic
-    /// keep-awake nudge. Default `Off` — when off, `awake_start`'s
-    /// legacy spawned `ble-action charge-port-close` path stays in
-    /// charge. When non-`Off`, the sampler emits the nudge on its
-    /// already-held PersistentSession every 300s and `awake_start`'s
-    /// Case-3 BLE branch delegates to it. See task #329.
-    ///
-    /// Conf key: `BLE_KEEP_AWAKE_VIA_SAMPLER`. Accepted values:
-    ///   * `no` / unset → `Off` (default; legacy charge-port-close path)
-    ///   * `wake` / `yes` / `true` / `1` → `Wake` (VCSEC domain — bumps
-    ///     car out of doze; the 2026-06-10 investigation noted it only
-    ///     wakes momentarily and doesn't reliably hold)
-    ///   * `charge-port-close` / `charge_port_close` → `ChargePortClose`
-    ///     (Infotainment domain — the team-validated "actually holds"
-    ///     verb, on the warm sampler session this time)
-    ///   * `combo` / `wake+charge-port-close` → `Combo` (send `wake`
-    ///     first, ~2s pause, then `charge-port-close` — uses the wake
-    ///     to bump the car out of doze so charge-port-close lands while
-    ///     Infotainment is awake)
-    pub keep_awake_mode: KeepAwakeMode,
-}
-
-/// What the sampler-emitted keep-awake nudge does each cycle. See
-/// `BleConfig::keep_awake_mode` for value semantics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum KeepAwakeMode {
-    Off,
-    Wake,
-    ChargePortClose,
-    Combo,
-}
-
-impl Default for KeepAwakeMode {
-    fn default() -> Self {
-        Self::Off
-    }
 }
 
 impl Default for BleConfig {
@@ -100,7 +64,6 @@ impl Default for BleConfig {
             keep_accessory: KeepAccessoryConfig::default(),
             away_auto_enabled: false,
             experimental: false,
-            keep_awake_mode: KeepAwakeMode::Off,
         }
     }
 }
@@ -203,29 +166,14 @@ impl BleConfig {
         .map(|v| matches!(v.as_str(), "yes" | "true" | "1"))
         .unwrap_or(false);
 
-        // Sampler-emitted keep-awake nudge mode. Default Off — when off,
-        // behavior is byte-for-byte the legacy spawned
-        // `ble-action charge-port-close` loop. Read fresh on every loop
-        // iteration so a tester can flip the value via a conf edit
-        // without bouncing the service. `yes` / `true` / `1` are kept
-        // as aliases for `wake` so testers on v3.11.10 / v3.11.11 don't
-        // have to re-flip after upgrade.
-        let keep_awake_mode = match sentryusb_config::get_config_value(
-            &active,
-            &commented,
-            "BLE_KEEP_AWAKE_VIA_SAMPLER",
-        )
-        .as_deref()
-        {
-            Some("wake") | Some("yes") | Some("true") | Some("1") => KeepAwakeMode::Wake,
-            Some("charge-port-close") | Some("charge_port_close") => {
-                KeepAwakeMode::ChargePortClose
-            }
-            Some("combo") | Some("wake+charge-port-close") | Some("wake+charge_port_close") => {
-                KeepAwakeMode::Combo
-            }
-            _ => KeepAwakeMode::Off,
-        };
+        // Note (2026-06-23, task #336): the `BLE_KEEP_AWAKE_VIA_SAMPLER`
+        // 4-valued flag (#115 / off / wake / charge-port-close / combo)
+        // was removed. The sampler now always dispatches a single
+        // `charge-port-close` nudge inline at the end of an active tick
+        // when `keep_awake_requested()` is true — see the "Sampler
+        // keep-awake CPC dispatch" block in `main.rs::tick`. Setting
+        // the legacy env var has no effect; it's ignored silently to
+        // avoid breaking existing configs at upgrade time.
 
         Ok(Self {
             enabled,
@@ -234,7 +182,6 @@ impl BleConfig {
             keep_accessory,
             away_auto_enabled,
             experimental,
-            keep_awake_mode,
         })
     }
 }
