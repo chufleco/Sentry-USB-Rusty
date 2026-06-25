@@ -231,6 +231,25 @@ else
     echo "$label"
   }
 
+  # When the sampler is handling keep-awake, the bash loop's own log line
+  # is purely a "not my job this cycle" marker — the actual nudge success
+  # or failure is logged by the sampler in its own journal. Field tester
+  # confusion ("why does it keep delegating every 5 minutes?") motivated
+  # appending the sampler's most-recent result so the bash line tells the
+  # full story in one place. Returns "sent", "failed (1/3)" etc., or
+  # empty if there's no recent sampler keep-awake line (sampler down,
+  # not nudging this window, etc.).
+  function sampler_last_nudge_status {
+    local line
+    line=$(journalctl -u sentryusb-telemetry --since "2 min ago" --no-pager 2>/dev/null \
+             | grep -E "keep-awake: .*nudge (sent|failed)" | tail -1)
+    if [[ "$line" == *"nudge sent"* ]]; then
+      echo "sent"
+    elif [[ "$line" =~ nudge\ failed\ \(attempt\ ([0-9]+/[0-9]+) ]]; then
+      echo "failed (${BASH_REMATCH[1]})"
+    fi
+  }
+
   function nudge {
     local retry=1
 
@@ -304,7 +323,11 @@ else
         # looping the log line every tick.
         if [[ -S /tmp/sentryusb-telemetry.sock ]]
         then
-          log "Tesla BLE: Keep-awake nudge delegated to sampler [$(nudge_label)]."
+          local _status _suffix
+          _status="$(sampler_last_nudge_status)"
+          _suffix=""
+          [[ -n "$_status" ]] && _suffix=" — last nudge: $_status"
+          log "Tesla BLE: Keep-awake handled by telemetry sampler [$(nudge_label)]${_suffix}."
           retry=0
         # In-process bluez-based BLE — see crates/tesla_ble. Reads
         # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs + sends one
