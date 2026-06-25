@@ -167,7 +167,33 @@ enum Command {
     AddKey {
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Tactical recovery: caller asks the background task to force-close
+    /// the current connection (if any) and let `ensure_connected` reopen
+    /// it on the next command. Used by the keep-awake nudge loop when
+    /// repeated in-band attempts are failing — gives a known-good
+    /// teardown when sampler's session is stuck but the chip is fine.
+    /// No-op if `state.conn` is already `None`. Cooldown-gated inside the
+    /// handler so repeated calls during one stuck window don't thrash.
+    /// `reason` is logged so the disconnect line ties to the trigger.
+    ForceReconnect {
+        reason: String,
+        reply: oneshot::Sender<ForceReconnectOutcome>,
+    },
     Shutdown,
+}
+
+/// Outcome of a [`Command::ForceReconnect`]:
+///   * `Closed` — there was a live conn and we closed it cleanly; the
+///     next query will reconnect via the normal path.
+///   * `NoConn` — sampler already had no conn (existing reconnect loop
+///     in flight). Call was a no-op.
+///   * `Cooldown` — last ForceReconnect was within the cooldown window;
+///     skipped to avoid thrashing while the car/chip is unreachable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForceReconnectOutcome {
+    Closed,
+    NoConn,
+    Cooldown,
 }
 
 /// Per-domain authenticated session state cached across commands.
@@ -257,6 +283,11 @@ struct SessionState {
     /// link has worked at least once on this session). Reset on any
     /// successful query.
     query_timeout_retries: u32,
+    /// When [`Command::ForceReconnect`] last actually closed a conn. Gates
+    /// repeated calls (cooldown = `FORCE_RECONNECT_COOLDOWN`) so the
+    /// keep-awake nudge loop can't thrash a stuck-but-unreachable session.
+    /// `None` until the first force-reconnect; cleared on a fresh connect.
+    last_force_reconnect_at: Option<Instant>,
 }
 
 /// Timing-sample window for the percentiles. 100 ≈ 5-10 min of
@@ -289,6 +320,14 @@ const STATUS_LOG_EVERY_N_QUERIES: u32 = 25;
 /// path. Reset to 0 on any successful query.
 const MAX_QUERY_TIMEOUT_RETRIES: u32 = 2;
 
+/// Minimum time between consecutive [`Command::ForceReconnect`] actions
+/// that actually close a conn. Inside this window, ForceReconnect returns
+/// `Cooldown` and the caller falls through to existing retry/backoff.
+/// Sized to cover one full keep-awake nudge cycle (default 60 s) plus
+/// reconnect time so the loop doesn't thrash when the car/chip is
+/// genuinely unreachable.
+const FORCE_RECONNECT_COOLDOWN: Duration = Duration::from_secs(90);
+
 impl PersistentSession {
     /// Spawn the background session task and return a handle. The first
     /// `query()` triggers the actual connection. `adapter_name` forces
@@ -318,6 +357,7 @@ impl PersistentSession {
             cached_adapter: None,
             consecutive_connect_failures: 0,
             query_timeout_retries: 0,
+            last_force_reconnect_at: None,
         };
         tokio::spawn(run_session_task(state, cmd_rx));
         Self { cmd_tx }
@@ -434,6 +474,35 @@ impl PersistentSession {
             .await
             .context("PersistentSession background task has stopped")?;
         rx.await.context("session task dropped the reply channel")?
+    }
+
+    /// Tactical recovery: ask the background task to close the current
+    /// connection (if any) so the next command reopens it via the normal
+    /// `ensure_connected` path. Used by the keep-awake nudge loop when
+    /// repeated in-band attempts are failing, on the theory that the
+    /// sampler's session may be stale-but-stuck (bluez state lagging,
+    /// chip in a degraded state, etc.) while the chip itself is fine.
+    ///
+    /// Internally cooldown-gated to [`FORCE_RECONNECT_COOLDOWN`] — calls
+    /// inside that window return [`ForceReconnectOutcome::Cooldown`] and
+    /// the caller should fall through to existing retry/backoff. If
+    /// there is no live conn, returns [`ForceReconnectOutcome::NoConn`]
+    /// (existing reconnect loop is already in flight).
+    ///
+    /// `reason` is logged so the resulting disconnect line ties back to
+    /// the trigger (e.g. `"keep-awake nudge fail 2/3"`).
+    ///
+    /// This is a *recovery* tweak, not a fix for slot contention — if
+    /// the car (or whatever's holding the slot on Tesla's side) is
+    /// refusing fresh connects, the subsequent reconnect will fail too.
+    pub async fn force_reconnect(&self, reason: String) -> Result<ForceReconnectOutcome> {
+        let (tx, rx) = oneshot::channel();
+        self.cmd_tx
+            .send(Command::ForceReconnect { reason, reply: tx })
+            .await
+            .context("PersistentSession background task has stopped")?;
+        rx.await
+            .context("session task dropped the reply channel")
     }
 
     // Typed wrappers: each does a raw Infotainment `query()` and
@@ -624,6 +693,10 @@ async fn run_session_task(
                     note_successful_query(&mut state, started.elapsed().as_millis());
                 }
                 let _ = reply.send(result);
+            }
+            Command::ForceReconnect { reason, reply } => {
+                let outcome = handle_force_reconnect(&mut state, &reason).await;
+                let _ = reply.send(outcome);
             }
             Command::Shutdown => break,
         }
@@ -1470,6 +1543,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
     state.connected_at = Some(Instant::now());
     state.queries_since_connect = 0;
     state.query_timeout_retries = 0;
+    state.last_force_reconnect_at = None;
     state.last_scan_rssi = scan_rssi;
     state.last_peer_mac = Some(peer_mac);
     // Drop the old latency history — a new link negotiates fresh BLE
@@ -1654,6 +1728,102 @@ fn payload_variant_name(p: Option<&routable_message::Payload>) -> &'static str {
         Some(routable_message::Payload::SessionInfoRequest(_)) => "SessionInfoRequest",
         None => "<none>",
     }
+}
+
+/// [`Command::ForceReconnect`] handler. Closes the current connection
+/// (if any) using the same cleanup path normal transport-error teardown
+/// uses (`conn.close().await` + clear domains/queries_since_connect/
+/// connected_at + write Disconnected status). The next command then
+/// reopens via `ensure_connected`.
+///
+/// Cooldown-gated by [`FORCE_RECONNECT_COOLDOWN`] so the keep-awake
+/// nudge loop can't thrash a session while the car/chip is genuinely
+/// unreachable.
+async fn handle_force_reconnect(
+    state: &mut SessionState,
+    reason: &str,
+) -> ForceReconnectOutcome {
+    // No-op when there's no conn — existing reconnect loop is already
+    // in flight via the normal `ensure_connected` path with backoff.
+    if state.conn.is_none() {
+        debug!(
+            "PersistentSession: ForceReconnect ({}) — no conn, deferring to existing reconnect loop",
+            reason
+        );
+        return ForceReconnectOutcome::NoConn;
+    }
+    // Cooldown gate: don't force-close more than once per window. Inside
+    // the window the caller falls through to its existing retry/backoff
+    // (which will eventually escalate to its own notification path).
+    if let Some(last) = state.last_force_reconnect_at {
+        if last.elapsed() < FORCE_RECONNECT_COOLDOWN {
+            let remaining = FORCE_RECONNECT_COOLDOWN.saturating_sub(last.elapsed());
+            debug!(
+                "PersistentSession: ForceReconnect ({}) — cooldown, {}s remaining",
+                reason,
+                remaining.as_secs()
+            );
+            return ForceReconnectOutcome::Cooldown;
+        }
+    }
+    // Do the teardown. Mirror the post-transport-error cleanup so the
+    // disconnect log + status file stay consistent with the established
+    // shape (lifetime drops, percentiles, peer MAC retained for
+    // continuity, etc.). Bump lifetime_drops so a journal tail still
+    // shows the drop is happening.
+    state.lifetime_drops = state.lifetime_drops.saturating_add(1);
+    let held_secs = state
+        .connected_at
+        .map(|t| t.elapsed().as_secs())
+        .unwrap_or(0);
+    let last_ok_secs = state
+        .last_successful_query_at
+        .map(|t| t.elapsed().as_secs() as i64)
+        .unwrap_or(-1);
+    let (p50, p95, p99) = compute_percentiles(&state.recent_latencies_ms);
+    let scan_rssi_str = state
+        .last_scan_rssi
+        .map(|r| r.to_string())
+        .unwrap_or_else(|| "?".into());
+    warn!(
+        "PersistentSession: ForceReconnect — closing held conn \
+         (reason={}, held={}m{}s queries={} last_ok={}s_ago drops_total={} \
+         p50/p95/p99={}/{}/{}ms scan_rssi={})",
+        reason,
+        held_secs / 60,
+        held_secs % 60,
+        state.queries_since_connect,
+        last_ok_secs,
+        state.lifetime_drops,
+        p50,
+        p95,
+        p99,
+        scan_rssi_str,
+    );
+    // Same persistent-log row shape as a normal drop so cross-tester
+    // aggregation in the bundle works (`grep reason=ForceReconnect:`).
+    append_disconnect_log(
+        held_secs,
+        state.queries_since_connect,
+        last_ok_secs,
+        state.lifetime_drops,
+        p50,
+        p95,
+        p99,
+        state.last_scan_rssi,
+        state.framing_desync_recoveries,
+        &format!("ForceReconnect: {}", reason),
+    );
+    if let Some(conn) = state.conn.take() {
+        conn.close().await;
+    }
+    state.domains.clear();
+    state.connected_at = None;
+    state.queries_since_connect = 0;
+    state.query_timeout_retries = 0;
+    state.last_force_reconnect_at = Some(Instant::now());
+    write_status_file(state, ConnectionEvent::Disconnected);
+    ForceReconnectOutcome::Closed
 }
 
 /// Heuristic: does this error look like the BLE link dropped (vs a
