@@ -327,7 +327,7 @@ else
           _status="$(sampler_last_nudge_status)"
           _suffix=""
           [[ -n "$_status" ]] && _suffix=" — last nudge: $_status"
-          log "Tesla BLE: Keep-awake handled by telemetry sampler [$(nudge_label)]${_suffix}."
+          log "Tesla BLE: Keep awake nudged via sampler [$(nudge_label)]${_suffix}."
           retry=0
         # In-process bluez-based BLE — see crates/tesla_ble. Reads
         # VIN + BLE_ADAPTER from /root/sentryusb.conf, signs + sends one

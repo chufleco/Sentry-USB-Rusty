@@ -57,7 +57,12 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// successive failure doubles up to `RECONNECT_BACKOFF_MAX`. Any
 /// successful connection resets back to this value.
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_millis(1_500);
-const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
+// Raised 30s -> 180s post-cascade 2026-06-24. Tesla parked-sleep is
+// ~12m on / ~5m off (hardcoded car scheduler); a 30s cap meant we
+// hammered fresh scan+connect ~10x per offline window and starved
+// the link out of the next online window. 180s gives ~3 attempts
+// per cycle without sustaining refuse-cooldown.
+const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(180);
 
 /// Rebuild the cached adapter after this many consecutive connect
 /// failures — self-heals a wedged bluez session / hci reset. Success
@@ -1837,10 +1842,18 @@ async fn handle_force_reconnect(
 /// retry path.
 fn is_transport_error(e: &anyhow::Error) -> bool {
     let msg = format!("{e:#}");
+    // Narrowed 2026-06-24: dropped the bare "Peripheral" substring
+    // match. It caught btleplug errors with "Peripheral" anywhere in
+    // the chain — including auth/session/protocol faults the car
+    // returned over a perfectly healthy L2CAP link. Treating those
+    // as transport-dead tore down the GATT + cleared cached domains,
+    // forcing a fresh scan+handshake that pushed Tesla into refuse-
+    // cooldown. Remaining matches are anchored on patterns that
+    // genuinely mean "link is gone": notify channel closed, write
+    // syscall failed, btleplug "not connected" state.
     msg.contains("notification stream ended")
         || msg.contains("BLE write")
         || msg.contains("not connected")
-        || msg.contains("Peripheral")
 }
 
 /// Match the specific error shape produced by the GATT-layer query

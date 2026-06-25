@@ -1305,38 +1305,17 @@ async fn tick(
                              (attempt {}/3): {:#}",
                             *nudge_retry_count, e
                         );
-                        // v3.11.17 tactical recovery: after two consecutive
-                        // in-band nudge failures, ask PersistentSession to
-                        // force-close its current connection so the next
-                        // command reopens via the normal ensure_connected
-                        // path. Targets the "sampler thinks it has a
-                        // connection but writes fail / next nudge stuck
-                        // behind bad state" case observed on BCM Pi 5 +
-                        // Rock 4C+ even after the v3.11.16 query-timeout
-                        // absorption shipped. NOT expected to fix slot
-                        // contention — if the car is genuinely refusing
-                        // fresh connects, the subsequent reconnect will
-                        // fail too. Cooldown-gated inside the handler
-                        // (FORCE_RECONNECT_COOLDOWN = 90s) so a stuck
-                        // window doesn't thrash the radio.
-                        if *nudge_retry_count == 2 {
-                            match session
-                                .force_reconnect(format!(
-                                    "keep-awake nudge fail 2/3: {:#}",
-                                    e
-                                ))
-                                .await
-                            {
-                                Ok(outcome) => info!(
-                                    "keep-awake: ForceReconnect outcome={:?}",
-                                    outcome
-                                ),
-                                Err(fe) => warn!(
-                                    "keep-awake: ForceReconnect send failed: {:#}",
-                                    fe
-                                ),
-                            }
-                        }
+                        // v3.11.17 auto-ForceReconnect on 2/3 was REMOVED
+                        // post-bench-test on 4C+ 2026-06-24: tearing the
+                        // GATT down on a transient nudge wobble pushed
+                        // Tesla into a multi-hour refuse-cooldown that
+                        // only cleared on car reboot. Let the next loop
+                        // tick re-attempt on the held link; sampler's
+                        // existing reconnect-on-real-drop machinery
+                        // handles the actually-disconnected case. The
+                        // force_reconnect command still exists on
+                        // PersistentSession for explicit operator use,
+                        // but nothing fires it automatically.
                         if *nudge_retry_count >= 3 {
                             let notify_due = last_nudge_notification_at
                                 .map(|t| now.duration_since(t) >= Duration::from_secs(600))
