@@ -65,6 +65,15 @@ const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// a fresh D-Bus connection per reconnect).
 const ADAPTER_REBUILD_AFTER: u32 = 5;
 
+/// Flag the advertiser daemons watch to suppress advertising during a connect.
+const CONNECTING_FLAG_PATH: &str = "/tmp/ble_connecting";
+
+/// Heartbeat interval for the connecting flag (under the daemons' 15s max-age).
+const CONNECTING_FLAG_REFRESH: Duration = Duration::from_secs(5);
+
+/// Overall timeout for `Connection::open` (covers discovery/subscribe too).
+const CONNECTION_OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Seconds added to the *estimated* car clock to produce the
 /// `expires_at` field. Tesla caps this at a few minutes (commands
 /// stamped too far in the future are rejected as a replay-prevention
@@ -1465,6 +1474,40 @@ async fn handle_check_pairing(state: &mut SessionState) -> Result<PairingStatus>
     }
 }
 
+/// Write the connecting flag, refreshing its mtime.
+fn touch_connecting_flag() {
+    if let Err(e) = std::fs::write(CONNECTING_FLAG_PATH, b"1") {
+        warn!("AdvSuspend: could not write {}: {}", CONNECTING_FLAG_PATH, e);
+    }
+}
+
+/// RAII guard that suspends advertising for one connect via the connecting flag.
+struct AdvSuspend {
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl AdvSuspend {
+    fn enter(_adapter_name: Option<&str>) -> Self {
+        touch_connecting_flag();
+        let heartbeat = tokio::spawn(async move {
+            loop {
+                sleep(CONNECTING_FLAG_REFRESH).await;
+                touch_connecting_flag();
+            }
+        });
+        AdvSuspend { heartbeat: Some(heartbeat) }
+    }
+}
+
+impl Drop for AdvSuspend {
+    fn drop(&mut self) {
+        if let Some(hb) = self.heartbeat.take() {
+            hb.abort();
+        }
+        let _ = std::fs::remove_file(CONNECTING_FLAG_PATH);
+    }
+}
+
 /// Record an `ensure_connected` failure; after `ADAPTER_REBUILD_AFTER` in
 /// a row, drop the cached adapter so the next attempt rebuilds it.
 fn note_connect_failure(state: &mut SessionState) {
@@ -1506,34 +1549,42 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             }
         },
     };
-    // 30s scan window matches what the one-shot examples use; covers
-    // a car waking from sleep + advertising stabilizing.
-    let scan_result = match scan::scan_for_vin(&adapter, &state.vin, Duration::from_secs(30)).await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Connect failure — back off before letting the caller
-            // retry. Subsequent failures double the wait; success
-            // resets it.
-            note_connect_failure(state);
-            sleep(state.backoff).await;
-            state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-            return Err(e).context(ConnectFailure).context("scan failed");
+    // Suspend advertising across both the scan and the connect; Drop restores it.
+    let attempt = {
+        let _adv = AdvSuspend::enter(state.adapter_name.as_deref());
+        match scan::scan_for_vin(&adapter, &state.vin, Duration::from_secs(30)).await {
+            Ok(scan_result) => {
+                // Capture RSSI + MAC before Connection::open consumes the peripheral.
+                let scan_rssi = scan_result.rssi;
+                let peer_mac = scan_result.peripheral.address().to_string();
+                match tokio::time::timeout(
+                    CONNECTION_OPEN_TIMEOUT,
+                    Connection::open(scan_result.peripheral),
+                )
+                .await
+                {
+                    Ok(Ok(c)) => Ok((c, scan_rssi, peer_mac)),
+                    Ok(Err(e)) => Err(e).context(ConnectFailure).context("connect failed"),
+                    Err(_) => Err(anyhow::anyhow!(
+                        "Connection::open exceeded {}s (GATT discovery/subscribe hang)",
+                        CONNECTION_OPEN_TIMEOUT.as_secs()
+                    ))
+                    .context(ConnectFailure)
+                    .context("connect failed"),
+                }
+            }
+            Err(e) => Err(e).context(ConnectFailure).context("scan failed"),
         }
     };
 
-    // Capture RSSI + MAC before Connection::open consumes the
-    // peripheral; address() is cheap and the status file needs the MAC.
-    let scan_rssi = scan_result.rssi;
-    let peer_mac = scan_result.peripheral.address().to_string();
-
-    let conn = match Connection::open(scan_result.peripheral).await {
-        Ok(c) => c,
+    let (conn, scan_rssi, peer_mac) = match attempt {
+        Ok(t) => t,
         Err(e) => {
+            // Connect failure — back off (doubling) before the caller retries.
             note_connect_failure(state);
             sleep(state.backoff).await;
             state.backoff = (state.backoff * 2).min(RECONNECT_BACKOFF_MAX);
-            return Err(e).context(ConnectFailure).context("connect failed");
+            return Err(e);
         }
     };
 

@@ -36,6 +36,19 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format='[BLE] %(levelname)s %(message)s')
 log = logging.getLogger('sentryusb-ble')
 
+# Fresh flag = a central connect is in flight; defer advertising while it is.
+CONNECTING_FLAG_PATH = '/tmp/ble_connecting'
+CONNECTING_FLAG_MAX_AGE_S = 15  # ignore a stale flag a crashed connect left behind
+
+
+def connect_in_flight():
+    """True while a central (re)connect is in flight (flag fresh)."""
+    try:
+        age = time.time() - os.stat(CONNECTING_FLAG_PATH).st_mtime
+    except OSError:
+        return False
+    return 0 <= age < CONNECTING_FLAG_MAX_AGE_S
+
 # ============================================================
 # D-Bus policy self-healing
 # ============================================================
@@ -1127,6 +1140,11 @@ class Advertisement(dbus.service.Object):
 
     def _reregister(self, retry_count=0):
         max_retries = 5
+        # Defer while a central connect is in flight (no retry consumed).
+        if connect_in_flight():
+            log.info('Re-registration deferred: central connect in flight')
+            GLib.timeout_add(1000, self._reregister, retry_count)
+            return False
         log.info(f'Re-registering advertisement... (attempt {retry_count + 1})')
 
         def on_success():
@@ -1332,7 +1350,15 @@ def enable_controller_advertising(adapter_path):
         log.warning(f'btmgmt mgmt socket still unresponsive after {PROBE_CAP_S}s — flag set may fail')
 
     # Mgmt socket is responsive — set each flag with up to 3 quick retries.
+    # 'advertising' is deferred while a connect is in flight; the adv helper
+    # re-asserts it after. connectable/bondable are always safe to set.
+    deferred_adv = False
     for flag in required:
+        if flag == 'advertising' and connect_in_flight():
+            deferred_adv = True
+            log.info(f'Deferring "advertising" flag on {hci}: central connect in '
+                     'flight (BCM4345C0 0x3c race); adv helper re-asserts it after')
+            continue
         for attempt in range(1, 4):
             if flag in current_flags():
                 if attempt > 1:
@@ -1349,7 +1375,8 @@ def enable_controller_advertising(adapter_path):
         else:
             log.warning(f'Could not enable {flag} on {hci} after 3 attempts — pair attempts may fail')
 
-    missing = set(required) - current_flags()
+    check_required = tuple(f for f in required if not (f == 'advertising' and deferred_adv))
+    missing = set(check_required) - current_flags()
     if missing:
         log.warning(f'Controller flags incomplete on {hci}: missing {sorted(missing)}')
     else:
@@ -1614,10 +1641,19 @@ def main():
     adv = Advertisement(bus, 0, 'peripheral', ad_manager,
                         service_manager=service_manager, app=app,
                         local_name=ble_name)
-    ad_manager.RegisterAdvertisement(
-        adv.get_path(), {},
-        reply_handler=register_ad_cb,
-        error_handler=register_ad_error_cb)
+
+    # Defer initial advertisement registration while a connect is in flight.
+    def register_initial_adv():
+        if connect_in_flight():
+            log.info('Initial advertisement deferred: central connect in flight')
+            GLib.timeout_add(1000, register_initial_adv)
+            return False
+        ad_manager.RegisterAdvertisement(
+            adv.get_path(), {},
+            reply_handler=register_ad_cb,
+            error_handler=register_ad_error_cb)
+        return False
+    register_initial_adv()
 
     log.info(f'SentryUSB BLE peripheral started: {ble_name}')
     log.info(f'WiFi Setup Service: {WIFI_SERVICE_UUID}')
