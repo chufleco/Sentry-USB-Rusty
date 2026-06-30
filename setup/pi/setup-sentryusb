@@ -36,6 +36,44 @@ function setup_progress () {
   echo "$@"
 }
 
+# Enable bluetoothd --experimental only on legacy BlueZ (< 5.55); remove the drop-in
+# on newer BlueZ. >= 5.55 exposes LEAdvertisingManager1 natively, and --experimental
+# there registers LE Audio services that trigger spurious Android pairing prompts.
+function configure_bluez_experimental () {
+  local override btdaemon ver major minor
+  override=/etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf
+  btdaemon=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{print $1}')
+  btdaemon=${btdaemon:-$(command -v bluetoothd || find /usr/lib/bluetooth /usr/sbin -maxdepth 1 -name bluetoothd -print -quit 2>/dev/null)}
+  if [ -z "$btdaemon" ] || [ ! -x "$btdaemon" ]; then
+    setup_progress "WARNING: could not detect bluetoothd path, skipping --experimental config"
+    return 0
+  fi
+  ver=$("$btdaemon" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  major=${ver%%.*}
+  minor=${ver##*.}
+  # Blank/unknown version is treated as modern (>= 5.55): default to NOT enabling the flag.
+  if [ -n "$ver" ] && { [ "$major" -lt 5 ] || { [ "$major" -eq 5 ] && [ "$minor" -lt 55 ]; }; }; then
+    mkdir -p /etc/systemd/system/bluetooth.service.d
+    cat > "$override" << EOF
+[Service]
+ExecStart=
+ExecStart=$btdaemon --experimental
+EOF
+    systemctl daemon-reload
+    systemctl restart bluetooth 2>/dev/null || true
+    sleep 2
+    setup_progress "bluetoothd --experimental enabled for legacy BlueZ ${ver} ($btdaemon)"
+  elif [ -f "$override" ]; then
+    rm -f "$override"
+    systemctl daemon-reload
+    systemctl restart bluetooth 2>/dev/null || true
+    sleep 2
+    setup_progress "removed stale --experimental drop-in (BlueZ ${ver:-modern} exposes LEAdvertisingManager1 natively)"
+  else
+    setup_progress "bluetoothd --experimental not needed (BlueZ ${ver:-modern} >= 5.55)"
+  fi
+}
+
 function curlwrapper () {
   setup_progress "curl $*" > /dev/null
   local attempts=0
@@ -411,26 +449,8 @@ function install_ble_daemon () {
     setup_progress "D-Bus policy installed for BLE daemon"
   fi
 
-  # BlueZ 5.69+ on Raspberry Pi requires --experimental for reliable LE peripheral
-  # advertisement registration. Without it, RegisterAdvertisement returns
-  # org.bluez.Error.Failed on many Pi hardware/firmware combinations.
-  # Detect actual bluetoothd binary path before writing override.
-  BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{print $1}')
-  BTDAEMON=${BTDAEMON:-$(command -v bluetoothd || find /usr/lib/bluetooth /usr/sbin -maxdepth 1 -name bluetoothd -print -quit 2>/dev/null)}
-  if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
-    mkdir -p /etc/systemd/system/bluetooth.service.d
-    cat > /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf << EOF
-[Service]
-ExecStart=
-ExecStart=$BTDAEMON --experimental
-EOF
-    systemctl daemon-reload
-    systemctl restart bluetooth 2>/dev/null || true
-    sleep 2
-    setup_progress "bluetoothd experimental mode enabled ($BTDAEMON)"
-  else
-    setup_progress "WARNING: Could not find bluetoothd binary, skipping --experimental override"
-  fi
+  # --experimental only on legacy BlueZ (< 5.55); see configure_bluez_experimental.
+  configure_bluez_experimental
 
   # Install the systemd service file
   copy_script server/ble/sentryusb-ble.service /etc/systemd/system || true
@@ -1080,21 +1100,8 @@ function cmd_install_ble {
     setup_progress "D-Bus policy installed for BLE daemon"
   fi
 
-  # Set up bluetoothd --experimental override with the correct detected path.
-  # --experimental enables LEAdvertisingManager1 on older BlueZ versions.
-  BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{print $1}')
-  BTDAEMON=${BTDAEMON:-$(command -v bluetoothd 2>/dev/null)}
-  if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
-    mkdir -p /etc/systemd/system/bluetooth.service.d
-    cat > /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf << EOF
-[Service]
-ExecStart=
-ExecStart=$BTDAEMON --experimental
-EOF
-    setup_progress "bluetoothd experimental mode enabled ($BTDAEMON)"
-  else
-    setup_progress "WARNING: could not detect bluetoothd path, skipping --experimental override"
-  fi
+  # --experimental only on legacy BlueZ (< 5.55); see configure_bluez_experimental.
+  configure_bluez_experimental
 
   # Install Avahi mDNS advertisement so the iOS app can discover the Pi over WiFi
   mkdir -p /etc/avahi/services

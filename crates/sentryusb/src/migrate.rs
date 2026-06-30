@@ -249,17 +249,30 @@ for pkg in python3-dbus python3-gi bluez; do
   fi
 done
 
-# ── Ensure bluetoothd --experimental override ──
-if [ ! -f /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf ]; then
-  BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{{print $1}}')
-  BTDAEMON=${{BTDAEMON:-$(command -v bluetoothd 2>/dev/null)}}
-  if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
-    mkdir -p /etc/systemd/system/bluetooth.service.d
-    cat > /etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf << BTEOF
+# ── Configure bluetoothd --experimental by BlueZ version ──
+# Legacy BlueZ (< 5.55) needs it for LEAdvertisingManager1; newer BlueZ does not, and
+# the flag there registers LE Audio services that trigger Android pairing prompts.
+BTOVERRIDE=/etc/systemd/system/bluetooth.service.d/sentryusb-experimental.conf
+BTDAEMON=$(systemctl cat bluetooth.service 2>/dev/null | grep '^ExecStart=' | head -1 | sed 's/ExecStart=//' | awk '{{print $1}}')
+BTDAEMON=${{BTDAEMON:-$(command -v bluetoothd 2>/dev/null)}}
+if [ -n "$BTDAEMON" ] && [ -x "$BTDAEMON" ]; then
+  BTVER=$("$BTDAEMON" --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' | head -1)
+  BTMAJ=${{BTVER%%.*}}
+  BTMIN=${{BTVER##*.}}
+  if [ -n "$BTVER" ] && {{ [ "$BTMAJ" -lt 5 ] || {{ [ "$BTMAJ" -eq 5 ] && [ "$BTMIN" -lt 55 ]; }}; }}; then
+    if [ ! -f "$BTOVERRIDE" ]; then
+      mkdir -p /etc/systemd/system/bluetooth.service.d
+      cat > "$BTOVERRIDE" << BTEOF
 [Service]
 ExecStart=
 ExecStart=$BTDAEMON --experimental
 BTEOF
+      systemctl daemon-reload
+      systemctl restart bluetooth 2>/dev/null || true
+      sleep 2
+    fi
+  elif [ -f "$BTOVERRIDE" ]; then
+    rm -f "$BTOVERRIDE"
     systemctl daemon-reload
     systemctl restart bluetooth 2>/dev/null || true
     sleep 2
