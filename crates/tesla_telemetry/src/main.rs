@@ -451,6 +451,7 @@ async fn main() -> Result<()> {
                                 || usb_watch::observe() == CarState::Asleep,
                             lock::is_archive_active(),
                             held_radio,
+                            last_charging_state,
                         )
                         .await;
                     }

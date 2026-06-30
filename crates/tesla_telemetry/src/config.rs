@@ -16,6 +16,10 @@ pub const DEFAULT_ADAPTER: &str = "hci0";
 /// makes Tesla occasionally report a neighbor's address.
 pub const DEFAULT_HOME_RADIUS_M: f64 = 120.0;
 
+/// Default post-charge-complete release grace (minutes) when
+/// `KEEP_ACCESSORY_CHARGE_GRACE_MIN` is unset.
+pub const DEFAULT_CHARGE_GRACE_MIN: u64 = 45;
+
 /// Keep-Accessory-Power automation config (see `keep_accessory.rs`).
 /// Inert unless the user declares their Pi is powered from the 12V
 /// accessory outlet (`KEEP_ACCESSORY_ENABLED`) and sets a home
@@ -26,6 +30,10 @@ pub struct KeepAccessoryConfig {
     pub home_lat: Option<f64>,
     pub home_lon: Option<f64>,
     pub home_radius_m: f64,
+    /// Opt-in: hold 12V through a home charge instead of releasing after the archive.
+    pub hold_for_charge: bool,
+    /// Minutes to keep 12V on after a charge completes before releasing.
+    pub charge_grace_min: u64,
 }
 
 /// Snapshot of the BLE-relevant config values.
@@ -158,11 +166,22 @@ impl BleConfig {
             .and_then(|s| s.trim().parse::<f64>().ok())
             .filter(|r| *r > 0.0)
             .unwrap_or(DEFAULT_HOME_RADIUS_M);
+        let ka_hold_for_charge = active
+            .get("KEEP_ACCESSORY_HOLD_FOR_CHARGE")
+            .map(|v| matches!(v.trim(), "yes" | "true" | "1"))
+            .unwrap_or(false);
+        let charge_grace_min = active
+            .get("KEEP_ACCESSORY_CHARGE_GRACE_MIN")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .filter(|m| *m > 0)
+            .unwrap_or(DEFAULT_CHARGE_GRACE_MIN);
         let keep_accessory = KeepAccessoryConfig {
             enabled: ka_enabled,
             home_lat,
             home_lon,
             home_radius_m,
+            hold_for_charge: ka_hold_for_charge,
+            charge_grace_min,
         };
 
         // Automatic Away Mode. Like keep-accessory it's a write-once

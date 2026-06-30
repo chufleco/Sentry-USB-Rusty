@@ -26,6 +26,8 @@ export interface CarStatusSample {
   ts: number | null
   // Age of the envelope (most recent state poll), in seconds.
   seconds_ago?: number | null
+  // Live gear: "Park" / "Drive" / "Reverse" / "Neutral" / "Unknown".
+  shift_state?: string | null
   battery_pct?: number | null
   interior_temp_c?: number | null
   exterior_temp_c?: number | null
@@ -168,17 +170,29 @@ export function CarStatusCard({
     return () => clearInterval(id)
   }, [])
 
+  // Live gear decides Parked vs Driving. Gate on freshness so a stale
+  // Drive sample from before the car slept doesn't read "Driving".
+  const isDriving =
+    (sample?.shift_state === "Drive" ||
+      sample?.shift_state === "Reverse" ||
+      sample?.shift_state === "Neutral") &&
+    sample?.seconds_ago != null &&
+    sample.seconds_ago >= 0 &&
+    sample.seconds_ago <= 120
+  const statusLabel = isDriving ? "Driving" : "Parked"
+
   // Derived parked duration. We treat "latest drive ended in the
   // past" as the parked-since timestamp; if there's no recorded
   // drive yet we just show the state badge without a duration.
   const parkedDuration = useMemo(() => {
+    if (isDriving) return null
     if (!latestDriveEnd) return null
     const t = new Date(latestDriveEnd).getTime()
     if (!Number.isFinite(t)) return null
     const delta = nowMs - t
     if (delta < 60_000) return null
     return formatDuration(delta)
-  }, [latestDriveEnd, nowMs])
+  }, [isDriving, latestDriveEnd, nowMs])
 
   const tireStatus = deriveTireStatus(sample)
   const haveTireData =
@@ -221,7 +235,7 @@ export function CarStatusCard({
           <Car className="h-4 w-4" />
         </span>
         <div className="min-w-0 flex-1">
-          <div className="text-sm font-semibold text-slate-100">Parked</div>
+          <div className="text-sm font-semibold text-slate-100">{statusLabel}</div>
           {parkedDuration && (
             <div className="text-[11px] text-slate-500">{parkedDuration}</div>
           )}

@@ -35,11 +35,18 @@ use sentryusb_tesla_ble::{actions, manager::PersistentSession};
 use tracing::{info, warn};
 
 use crate::config::KeepAccessoryConfig;
+use crate::sample::ChargingState;
 
 /// After arriving home + parked, how long to keep power on waiting for
 /// an archive to START before concluding there's nothing to archive
 /// and turning off. Covers archiveloop's settle/spawn latency.
 const ARCHIVE_START_GRACE: Duration = Duration::from_secs(5 * 60);
+
+/// Absolute cap on a single charge-hold (bounds drain if the car sits plugged-in-but-idle).
+const CHARGE_HOLD_MAX: Duration = Duration::from_secs(18 * 60 * 60);
+
+/// Cadence for the persistent charge-hold heartbeat (durable last-seen across a brownout).
+const CHARGE_HOLD_HEARTBEAT: Duration = Duration::from_secs(5 * 60);
 
 /// How many consecutive BLE send failures before we push a "couldn't set
 /// accessory power" alert — high enough that a transient blip that
@@ -70,6 +77,18 @@ pub struct KeepAccessoryState {
     /// One-shot guard so the "couldn't set accessory power" push fires once
     /// per failure streak, not every retry tick (reset on success).
     fail_notified: bool,
+    /// When we began holding 12V for a charge (`None` while not eligible).
+    charge_hold_since: Option<Instant>,
+    /// When the charge first read `Complete` this hold (`None` until then).
+    charge_complete_at: Option<Instant>,
+    /// Last charge-hold heartbeat write (`None` until the first).
+    charge_hb_at: Option<Instant>,
+    /// One-shot guard for the "holding power for charge" push (re-armed when
+    /// no longer holding for charge).
+    charge_hold_notified: bool,
+    /// One-shot guard for the "charge complete — releasing soon" push
+    /// (re-armed when no longer holding for charge).
+    charge_grace_notified: bool,
 }
 
 /// Great-circle distance in meters (haversine).
@@ -89,12 +108,18 @@ fn distance_m(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> f64 {
 ///
 /// Kept pure (no I/O, no time) so the home→OFF logic is unit-tested
 /// without a live test that would power the Pi off.
+///
+/// The `charge_*` flags are false unless `hold_for_charge` is on and the cable is connected.
+#[allow(clippy::too_many_arguments)]
 fn decide_desired(
     is_home: bool,
     parked: bool,
     archive_active: bool,
     archive_seen_active: bool,
     grace_expired: bool,
+    charge_hold: bool,
+    charge_complete_grace: bool,
+    charge_done: bool,
 ) -> Option<(bool, &'static str)> {
     if !is_home {
         // Away: pre-arm/hold ON (Sentry coverage while parked away).
@@ -104,6 +129,13 @@ fn decide_desired(
         None
     } else if archive_active {
         Some((true, "home, archiving — holding power"))
+    } else if charge_hold {
+        // Plugged in — hold 12V instead of releasing after the archive.
+        Some((true, "home, plugged in — holding for charge"))
+    } else if charge_complete_grace {
+        Some((true, "home, charge complete — releasing soon"))
+    } else if charge_done {
+        Some((false, "home, charge complete — releasing"))
     } else if archive_seen_active {
         Some((false, "home, archive finished — releasing"))
     } else if !grace_expired {
@@ -124,6 +156,8 @@ fn decide_desired(
 ///   quiet-mode signal), NOT shift state alone.
 /// * `archive_active` — `/tmp/archive_status.json` fresh (archiveloop running)
 /// * `radio_held` — the daemon currently owns the radio (session usable)
+/// * `charging_state` — last decoded charge state (only used when `hold_for_charge` is on)
+#[allow(clippy::too_many_arguments)]
 pub async fn evaluate(
     cfg: &KeepAccessoryConfig,
     session: &PersistentSession,
@@ -133,6 +167,7 @@ pub async fn evaluate(
     parked: bool,
     archive_active: bool,
     radio_held: bool,
+    charging_state: Option<ChargingState>,
 ) {
     if !cfg.enabled {
         return; // feature off — the "Pi powered from 12V" gate
@@ -167,12 +202,118 @@ pub async fn evaluate(
         .map(|t| t.elapsed() >= ARCHIVE_START_GRACE)
         .unwrap_or(false);
 
+    // Charge-hold bookkeeping: track hold-start (cap) + first Complete (grace) while eligible.
+    let cable_connected = cfg.hold_for_charge
+        && matches!(
+            charging_state,
+            Some(
+                ChargingState::Starting
+                    | ChargingState::Charging
+                    | ChargingState::Calibrating
+                    | ChargingState::Complete
+                    | ChargingState::Stopped
+                    | ChargingState::NoPower
+            )
+        );
+    let charge_eligible = cfg.hold_for_charge && is_home && parked && cable_connected;
+    // A charging car parked at home does not un-park. The sampler's `parked`
+    // can still flicker false mid-charge (HW3 reads shift_state=Unknown, and
+    // Tesla's periodic wake window briefly un-quiets USB), so a transient
+    // ineligibility while we're still home + plugged in is not authoritative.
+    // Hold the charge state steady through it instead of tearing down and
+    // re-firing the entry push. Only a real exit (left home / cable unplugged)
+    // releases.
+    let charge_session_live = cfg.hold_for_charge && is_home && cable_connected;
+    if charge_eligible {
+        if state.charge_hold_since.is_none() {
+            state.charge_hold_since = Some(Instant::now());
+            state.charge_complete_at = None;
+        }
+        if charging_state == Some(ChargingState::Complete) && state.charge_complete_at.is_none() {
+            state.charge_complete_at = Some(Instant::now());
+        }
+    } else if state.charge_hold_since.is_some() && charge_session_live {
+        // transient ineligibility — hold steady, do not re-arm notifications
+    } else {
+        state.charge_hold_since = None;
+        state.charge_complete_at = None;
+        state.charge_hold_notified = false;
+        state.charge_grace_notified = false;
+    }
+    // Post-complete release grace, runtime-configurable (default 45m).
+    let charge_grace = Duration::from_secs(cfg.charge_grace_min.saturating_mul(60));
+    let hold_capped = state
+        .charge_hold_since
+        .map(|t| t.elapsed() >= CHARGE_HOLD_MAX)
+        .unwrap_or(false);
+    let complete_grace_active = state
+        .charge_complete_at
+        .map(|t| t.elapsed() < charge_grace)
+        .unwrap_or(false);
+    // Mutually-exclusive charge signals: holding / in release-grace / done.
+    let charge_done = charge_eligible
+        && (hold_capped || (state.charge_complete_at.is_some() && !complete_grace_active));
+    let charge_complete_grace = charge_eligible && !charge_done && complete_grace_active;
+    let charge_hold = charge_eligible && !charge_done && !charge_complete_grace;
+
+    // Charge-hold pushes: announce entering the hold and the post-complete
+    // grace once each. The notified flags reset only on a real teardown
+    // (cable unplugged / left home), so a quiet-window flicker can't
+    // double-fire the "Holding power for charge" push.
+    if charge_hold && !state.charge_hold_notified {
+        notify_event(
+            "Holding power for charge",
+            "Plugged in at home — keeping accessory power on so the car finishes charging before the Pi powers down.",
+        )
+        .await;
+        state.charge_hold_notified = true;
+    }
+    if charge_complete_grace && !state.charge_grace_notified {
+        let msg = format!(
+            "Charging complete — releasing accessory power in ~{} minutes, then the Pi powers down.",
+            cfg.charge_grace_min
+        );
+        notify_event("Charge complete", &msg).await;
+        state.charge_grace_notified = true;
+    }
+
+    // Throttled heartbeat so a brownout mid-hold leaves a durable last-seen line.
+    if charge_hold || charge_complete_grace {
+        let due = state
+            .charge_hb_at
+            .map(|t| t.elapsed() >= CHARGE_HOLD_HEARTBEAT)
+            .unwrap_or(true);
+        if due {
+            state.charge_hb_at = Some(Instant::now());
+            let line = if charge_complete_grace {
+                let rem_min = state
+                    .charge_complete_at
+                    .map(|t| charge_grace.saturating_sub(t.elapsed()).as_secs() / 60)
+                    .unwrap_or(0);
+                format!("charge-hold heartbeat: complete — releasing in ~{rem_min}m")
+            } else {
+                let held_min = state
+                    .charge_hold_since
+                    .map(|t| t.elapsed().as_secs() / 60)
+                    .unwrap_or(0);
+                format!("charge-hold heartbeat: holding for charge ({held_min}m held)")
+            };
+            crate::diag_log::log_event(&format!("keep-accessory: {line}"));
+            log_persistent(&line);
+        }
+    } else {
+        state.charge_hb_at = None;
+    }
+
     let Some((desired, why)) = decide_desired(
         is_home,
         parked,
         archive_active,
         state.archive_seen_active,
         grace_expired,
+        charge_hold,
+        charge_complete_grace,
+        charge_done,
     ) else {
         return; // no change warranted (home but moving)
     };
@@ -366,37 +507,64 @@ mod tests {
     // ── decision-core tests (the home→OFF path, verified without a
     //    live test that would power the Pi off) ──
 
+    // decide_desired(is_home, parked, archive_active, archive_seen_active,
+    //                grace_expired, charge_hold, charge_complete_grace, charge_done)
     #[test]
     fn away_is_always_on() {
         // Away → ON regardless of parked / archive / grace.
-        assert_eq!(decide_desired(false, false, false, false, false), Some((true, "away from home")));
-        assert_eq!(decide_desired(false, true, true, true, true).map(|d| d.0), Some(true));
+        assert_eq!(decide_desired(false, false, false, false, false, false, false, false), Some((true, "away from home")));
+        assert_eq!(decide_desired(false, true, true, true, true, false, false, false).map(|d| d.0), Some(true));
     }
 
     #[test]
     fn home_but_moving_is_untouched() {
-        assert_eq!(decide_desired(true, false, false, false, false), None);
+        assert_eq!(decide_desired(true, false, false, false, false, false, false, false), None);
     }
 
     #[test]
     fn home_parked_archiving_holds_on() {
-        assert_eq!(decide_desired(true, true, true, false, false).map(|d| d.0), Some(true));
+        assert_eq!(decide_desired(true, true, true, false, false, false, false, false).map(|d| d.0), Some(true));
     }
 
     #[test]
     fn home_parked_archive_finished_turns_off() {
         // Saw an archive run (archive_seen_active), now idle → OFF.
-        assert_eq!(decide_desired(true, true, false, true, false).map(|d| d.0), Some(false));
+        assert_eq!(decide_desired(true, true, false, true, false, false, false, false).map(|d| d.0), Some(false));
     }
 
     #[test]
     fn home_parked_within_grace_holds_on() {
         // No archive yet, grace not expired → hold ON, wait for it.
-        assert_eq!(decide_desired(true, true, false, false, false).map(|d| d.0), Some(true));
+        assert_eq!(decide_desired(true, true, false, false, false, false, false, false).map(|d| d.0), Some(true));
     }
 
     #[test]
     fn home_parked_grace_expired_nothing_to_archive_turns_off() {
-        assert_eq!(decide_desired(true, true, false, false, true).map(|d| d.0), Some(false));
+        assert_eq!(decide_desired(true, true, false, false, true, false, false, false).map(|d| d.0), Some(false));
+    }
+
+    // ── charge-hold (opt-in) tests ──
+
+    #[test]
+    fn charge_hold_overrides_archive_finished_release() {
+        // Archive done (would normally release), but plugged in waiting for a
+        // charge → hold ON.
+        assert_eq!(
+            decide_desired(true, true, false, true, true, true, false, false),
+            Some((true, "home, plugged in — holding for charge"))
+        );
+    }
+
+    #[test]
+    fn charge_complete_grace_holds_then_done_releases() {
+        // Within the post-complete grace → ON; after it (charge_done) → OFF.
+        assert_eq!(decide_desired(true, true, false, true, true, false, true, false).map(|d| d.0), Some(true));
+        assert_eq!(decide_desired(true, true, false, true, true, false, false, true).map(|d| d.0), Some(false));
+    }
+
+    #[test]
+    fn active_archive_beats_charge_hold() {
+        // An in-progress archive still wins (archive_active first).
+        assert_eq!(decide_desired(true, true, true, false, false, true, false, false).map(|d| d.0), Some(true));
     }
 }
