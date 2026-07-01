@@ -1481,6 +1481,45 @@ fn touch_connecting_flag() {
     }
 }
 
+/// hci index from an adapter name like "hci0"; defaults to 0.
+fn hci_index(adapter_name: Option<&str>) -> u8 {
+    adapter_name
+        .and_then(|n| n.strip_prefix("hci"))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
+/// Set the kernel mgmt advertising setting via btmgmt. stdin is piped and
+/// closed immediately (btmgmt blocks forever on a null stdin) and the call is
+/// killed after 3s (btmgmt can hang on a contended mgmt socket).
+async fn set_mgmt_advertising(hci_idx: u8, on: bool) {
+    let arg = if on { "on" } else { "off" };
+    let idx = hci_idx.to_string();
+    let mut child = match tokio::process::Command::new("btmgmt")
+        .args(["--index", &idx, "advertising", arg])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("AdvSuspend: spawning btmgmt advertising {arg} failed: {e}");
+            return;
+        }
+    };
+    drop(child.stdin.take());
+    match tokio::time::timeout(Duration::from_secs(3), child.wait()).await {
+        Ok(Ok(status)) if status.success() => {}
+        Ok(Ok(status)) => warn!("AdvSuspend: btmgmt advertising {arg} exited {status}"),
+        Ok(Err(e)) => warn!("AdvSuspend: btmgmt advertising {arg}: {e}"),
+        Err(_) => {
+            warn!("AdvSuspend: btmgmt advertising {arg} timed out — killing");
+            let _ = child.kill().await;
+        }
+    }
+}
+
 /// RAII guard that suspends advertising for one connect via the connecting flag.
 struct AdvSuspend {
     heartbeat: Option<tokio::task::JoinHandle<()>>,
@@ -1549,7 +1588,11 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             }
         },
     };
-    // Suspend advertising across both the scan and the connect; Drop restores it.
+    // Drop the mgmt advertising setting for the connect window; restored after
+    // the attempt. With it set, chips without simultaneous-role support
+    // (BCM4345C0) connect as peripheral via directed advertising → HCI 0x3c.
+    let hci_idx = hci_index(state.adapter_name.as_deref());
+    set_mgmt_advertising(hci_idx, false).await;
     let attempt = {
         let _adv = AdvSuspend::enter(state.adapter_name.as_deref());
         match scan::scan_for_vin(&adapter, &state.vin, Duration::from_secs(30)).await {
@@ -1576,6 +1619,7 @@ async fn ensure_connected(state: &mut SessionState) -> Result<()> {
             Err(e) => Err(e).context(ConnectFailure).context("scan failed"),
         }
     };
+    set_mgmt_advertising(hci_idx, true).await;
 
     let (conn, scan_rssi, peer_mac) = match attempt {
         Ok(t) => t,
