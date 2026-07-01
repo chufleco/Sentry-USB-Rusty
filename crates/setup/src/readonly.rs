@@ -213,6 +213,30 @@ pub async fn make_readonly(env: &SetupEnv, emitter: &SetupEmitter) -> Result<boo
         let _ = sentryusb_shell::run("chmod", &["700", "/mutable/.bluetooth"]).await;
     }
 
+    // ---- SentryUSB runtime credentials (/root/.sentryusb) ----
+    // The cloud uploader and notification setup write credential JSON to
+    // /root/.sentryusb at RUNTIME — cloud pairing and notification config are
+    // post-setup user actions, so there is no read-write window during setup.
+    // On a read-only root that write fails ("set credentials") and cloud
+    // pairing hangs forever on "waiting for browser to finish". Bind-mount
+    // from .sentryusb (dot-prefixed so the folder is hidden from
+    // Finder/Explorer when the drive is plugged into a computer) so the
+    // credentials persist on the writable /mutable partition.
+    if !Path::new("/mutable/.sentryusb").is_dir() {
+        emitter.progress("Creating /mutable/.sentryusb for cloud/notification credential persistence");
+        let _ = std::fs::create_dir_all("/mutable/.sentryusb");
+        if Path::new("/root/.sentryusb").is_dir()
+            && std::fs::read_dir("/root/.sentryusb")
+                .map(|mut e| e.next().is_some())
+                .unwrap_or(false)
+        {
+            let _ = sentryusb_shell::run(
+                "cp", &["-a", "/root/.sentryusb/.", "/mutable/.sentryusb/"],
+            ).await;
+        }
+        let _ = sentryusb_shell::run("chmod", &["700", "/mutable/.sentryusb"]).await;
+    }
+
     // ---- DHCP lease directories: real dirs for tmpfs (not symlinks) ----
     if Path::new("/var/lib/dhcp").is_symlink() {
         emitter.progress("Replacing /var/lib/dhcp symlink with directory for tmpfs");
@@ -662,6 +686,18 @@ fn update_fstab() -> Result<()> {
         fstab.push_str(
             "/mutable/.bluetooth /var/lib/bluetooth none \
              bind,x-systemd.requires-mounts-for=/mutable,x-systemd.before=bluetooth.service 0 0\n",
+        );
+    }
+
+    // Bind-mount /mutable/.sentryusb over /root/.sentryusb so the cloud
+    // uploader and notification setup can persist credential JSON written at
+    // runtime on the read-only root FS. Without this, cloud pairing fails at
+    // "set credentials" and hangs. x-systemd.before ensures the bind is in
+    // place before the daemon reads/writes credentials at startup.
+    if !fstab_has_mountpoint(&fstab, "/root/.sentryusb") {
+        fstab.push_str(
+            "/mutable/.sentryusb /root/.sentryusb none \
+             bind,x-systemd.requires-mounts-for=/mutable,x-systemd.before=sentryusb.service 0 0\n",
         );
     }
 
