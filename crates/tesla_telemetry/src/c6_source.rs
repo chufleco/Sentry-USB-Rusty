@@ -191,6 +191,55 @@ pub fn apply_charge(fields: &Map<String, Value>, s: &mut Sample) {
     }
 }
 
+/// Tesla reports TPMS in bar; the DB column is PSI. VERIFIED against a live
+/// car: C6 `tpms_pressure_fl` 2.9 bar == sampler `tire_fl_psi` 42.1.
+const BAR_TO_PSI: f64 = 14.5038;
+
+/// Map the C6 `climate` domain. C6 temps are already Celsius, matching the DB.
+pub fn apply_climate(fields: &Map<String, Value>, s: &mut Sample) {
+    if let Some(t) = fields.get("inside_temp_celsius").and_then(|v| v.as_f64()) {
+        s.interior_temp_c = Some(t);
+    }
+    if let Some(t) = fields.get("outside_temp_celsius").and_then(|v| v.as_f64()) {
+        s.exterior_temp_c = Some(t);
+    }
+    if let Some(on) = fields.get("is_climate_on").and_then(|v| v.as_bool()) {
+        s.hvac_on = Some(on);
+    }
+}
+
+/// Map the C6 `drive` domain. Only the odometer maps to a `Sample` column —
+/// the C6 `drive` telemetry carries NO location_name/GPS (Tesla doesn't bundle
+/// it in `state drive`, and the C6 doesn't poll `state location`). Those fields
+/// stay None here and are sourced from SEI / the sampler's own location poll.
+pub fn apply_drive(fields: &Map<String, Value>, s: &mut Sample) {
+    if let Some(od) = fields.get("odometer_miles").and_then(|v| v.as_f64()) {
+        s.odometer_mi = Some(od);
+    }
+}
+
+/// Map the C6 `tires` domain, converting bar → PSI to match the DB column.
+pub fn apply_tires(fields: &Map<String, Value>, s: &mut Sample) {
+    let psi = |k: &str| {
+        fields
+            .get(k)
+            .and_then(|v| v.as_f64())
+            .map(|bar| bar * BAR_TO_PSI)
+    };
+    if let Some(p) = psi("tpms_pressure_fl") {
+        s.tire_fl_psi = Some(p);
+    }
+    if let Some(p) = psi("tpms_pressure_fr") {
+        s.tire_fr_psi = Some(p);
+    }
+    if let Some(p) = psi("tpms_pressure_rl") {
+        s.tire_rl_psi = Some(p);
+    }
+    if let Some(p) = psi("tpms_pressure_rr") {
+        s.tire_rr_psi = Some(p);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +334,47 @@ mod tests {
         assert_eq!(s.charge_limit_soc, Some(85));
         assert_eq!(s.charge_minutes_to_full, Some(145));
         assert_eq!(s.charging_state.as_deref(), Some("charging")); // lowercased
+    }
+
+    #[test]
+    fn apply_climate_maps_celsius_direct() {
+        let fields: Map<String, Value> = serde_json::from_str(
+            r#"{"inside_temp_celsius":26.6,"outside_temp_celsius":21.0,"is_climate_on":false}"#,
+        )
+        .unwrap();
+        let mut s = Sample::default();
+        apply_climate(&fields, &mut s);
+        assert_eq!(s.interior_temp_c, Some(26.6));
+        assert_eq!(s.exterior_temp_c, Some(21.0));
+        assert_eq!(s.hvac_on, Some(false));
+    }
+
+    #[test]
+    fn apply_drive_maps_odometer_and_leaves_location_none() {
+        let fields: Map<String, Value> = serde_json::from_str(
+            r#"{"shift_state":"Invalid","odometer_miles":45459.04}"#,
+        )
+        .unwrap();
+        let mut s = Sample::default();
+        apply_drive(&fields, &mut s);
+        assert_eq!(s.odometer_mi, Some(45459.04));
+        // C6 drive carries no location — must NOT invent one.
+        assert!(s.location_name.is_none());
+        assert!(s.latitude.is_none() && s.longitude.is_none());
+    }
+
+    #[test]
+    fn apply_tires_converts_bar_to_psi() {
+        // Live-verified: 2.9 bar == 42.1 psi.
+        let fields: Map<String, Value> = serde_json::from_str(
+            r#"{"tpms_pressure_fl":2.9,"tpms_pressure_fr":2.825,"tpms_pressure_rl":2.85,"tpms_pressure_rr":2.875}"#,
+        )
+        .unwrap();
+        let mut s = Sample::default();
+        apply_tires(&fields, &mut s);
+        // 2.9 * 14.5038 = 42.06 (NOT 2.9 — the bug we're preventing).
+        assert!((s.tire_fl_psi.unwrap() - 42.06).abs() < 0.1, "fl={:?}", s.tire_fl_psi);
+        assert!((s.tire_fr_psi.unwrap() - 40.97).abs() < 0.1);
+        assert!(s.tire_rl_psi.unwrap() > 40.0 && s.tire_rl_psi.unwrap() < 43.0);
     }
 }
