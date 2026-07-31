@@ -199,16 +199,21 @@ pub fn record_fallback() -> u64 {
 
 /// Map the C6 `charge` domain fields onto a `Sample`. Field names are the C6's
 /// telemetry keys (`{"state":"charge", ...}`); targets are the exact DB columns
-/// the BLE path writes, so a C6-sourced row is byte-identical to a BLE one
-/// except `source`. Only charge fields are touched — climate/drive/tires get
-/// their own `apply_*` in the follow-up; unknown/missing keys stay None.
-pub fn apply_charge(fields: &Map<String, Value>, s: &mut Sample) {
+/// the BLE path writes, so a C6-sourced row matches a BLE one except `source`.
+/// Returns true if it populated at least the SoC or charging_state — a fresh
+/// but empty/sparse payload returns false so the caller falls back to BLE
+/// rather than write a hollow row and suppress the real result.
+pub fn apply_charge(fields: &Map<String, Value>, s: &mut Sample) -> bool {
     let f_i32 = |k: &str| fields.get(k).and_then(|v| v.as_i64()).map(|n| n as i32);
     let f_f32 = |k: &str| fields.get(k).and_then(|v| v.as_f64()).map(|n| n as f32);
     let f_f64 = |k: &str| fields.get(k).and_then(|v| v.as_f64());
+    let mut populated = false;
 
-    if let Some(b) = f_f64("battery_level") {
+    // Prefer usable_battery_level (Tesla app's headline %), fall back to raw
+    // battery_level — mirrors sample_charge_ble so C6 rows match BLE rows.
+    if let Some(b) = f_f64("usable_battery_level").or_else(|| f_f64("battery_level")) {
         s.battery_pct = Some(b);
+        populated = true;
     }
     s.charger_power_kw = f_i32("charger_power").or(s.charger_power_kw);
     s.charger_actual_current_a = f_i32("charger_actual_current").or(s.charger_actual_current_a);
@@ -221,56 +226,72 @@ pub fn apply_charge(fields: &Map<String, Value>, s: &mut Sample) {
     if let Some(cs) = fields.get("charging_state").and_then(|v| v.as_str()) {
         // DB stores charging_state lowercase (matches ChargingState::as_db_str).
         s.charging_state = Some(cs.to_lowercase());
+        populated = true;
     }
+    populated
 }
 
 /// Tesla reports TPMS in bar; the DB column is PSI. VERIFIED against a live
-/// car: C6 `tpms_pressure_fl` 2.9 bar == sampler `tire_fl_psi` 42.1.
+/// car: C6 `tpms_pressure_fl` 2.9 bar == sampler `tire_fl_psi` 42.1. Rounds to
+/// 0.1 psi to match `sample_ble::bar_to_psi` exactly.
 const BAR_TO_PSI: f64 = 14.5038;
+fn bar_to_psi(bar: f64) -> f64 {
+    ((bar * BAR_TO_PSI) * 10.0).round() / 10.0
+}
 
 /// Map the C6 `climate` domain. C6 temps are already Celsius, matching the DB.
-pub fn apply_climate(fields: &Map<String, Value>, s: &mut Sample) {
+/// Returns true if any field was populated (else caller falls back to BLE).
+pub fn apply_climate(fields: &Map<String, Value>, s: &mut Sample) -> bool {
+    let mut populated = false;
     if let Some(t) = fields.get("inside_temp_celsius").and_then(|v| v.as_f64()) {
         s.interior_temp_c = Some(t);
+        populated = true;
     }
     if let Some(t) = fields.get("outside_temp_celsius").and_then(|v| v.as_f64()) {
         s.exterior_temp_c = Some(t);
+        populated = true;
     }
     if let Some(on) = fields.get("is_climate_on").and_then(|v| v.as_bool()) {
         s.hvac_on = Some(on);
+        populated = true;
     }
+    populated
 }
 
-/// Map the C6 `drive` domain. Only the odometer maps to a `Sample` column —
-/// the C6 `drive` telemetry carries NO location_name/GPS (Tesla doesn't bundle
-/// it in `state drive`, and the C6 doesn't poll `state location`). Those fields
-/// stay None here and are sourced from SEI / the sampler's own location poll.
-pub fn apply_drive(fields: &Map<String, Value>, s: &mut Sample) {
+/// Map the C6 `drive` domain odometer. The C6 `drive` telemetry carries NO
+/// location_name/GPS (Tesla doesn't bundle it in `state drive`, and the C6
+/// doesn't poll `state location`), so those stay None and are sourced from SEI
+/// / the sampler's own location poll. Returns true if the odometer was present.
+pub fn apply_drive(fields: &Map<String, Value>, s: &mut Sample) -> bool {
     if let Some(od) = fields.get("odometer_miles").and_then(|v| v.as_f64()) {
         s.odometer_mi = Some(od);
+        return true;
     }
+    false
 }
 
-/// Map the C6 `tires` domain, converting bar → PSI to match the DB column.
-pub fn apply_tires(fields: &Map<String, Value>, s: &mut Sample) {
-    let psi = |k: &str| {
-        fields
-            .get(k)
-            .and_then(|v| v.as_f64())
-            .map(|bar| bar * BAR_TO_PSI)
-    };
+/// Map the C6 `tires` domain, bar → PSI (rounded to 0.1) to match the DB
+/// column. Returns true if at least one pressure was populated.
+pub fn apply_tires(fields: &Map<String, Value>, s: &mut Sample) -> bool {
+    let psi = |k: &str| fields.get(k).and_then(|v| v.as_f64()).map(bar_to_psi);
+    let mut populated = false;
     if let Some(p) = psi("tpms_pressure_fl") {
         s.tire_fl_psi = Some(p);
+        populated = true;
     }
     if let Some(p) = psi("tpms_pressure_fr") {
         s.tire_fr_psi = Some(p);
+        populated = true;
     }
     if let Some(p) = psi("tpms_pressure_rl") {
         s.tire_rl_psi = Some(p);
+        populated = true;
     }
     if let Some(p) = psi("tpms_pressure_rr") {
         s.tire_rr_psi = Some(p);
+        populated = true;
     }
+    populated
 }
 
 #[cfg(test)]
@@ -404,10 +425,29 @@ mod tests {
         )
         .unwrap();
         let mut s = Sample::default();
-        apply_tires(&fields, &mut s);
-        // 2.9 * 14.5038 = 42.06 (NOT 2.9 — the bug we're preventing).
-        assert!((s.tire_fl_psi.unwrap() - 42.06).abs() < 0.1, "fl={:?}", s.tire_fl_psi);
-        assert!((s.tire_fr_psi.unwrap() - 40.97).abs() < 0.1);
-        assert!(s.tire_rl_psi.unwrap() > 40.0 && s.tire_rl_psi.unwrap() < 43.0);
+        assert!(apply_tires(&fields, &mut s));
+        // 2.9 bar * 14.5038 = 42.06, rounded to 0.1 = 42.1 (matches BLE bar_to_psi).
+        assert_eq!(s.tire_fl_psi, Some(42.1));
+        assert_eq!(s.tire_fr_psi, Some(41.0));
+    }
+
+    #[test]
+    fn apply_returns_false_on_empty_payload_so_caller_falls_back() {
+        let empty: Map<String, Value> = Map::new();
+        let mut s = Sample::default();
+        assert!(!apply_charge(&empty, &mut s));
+        assert!(!apply_climate(&empty, &mut s));
+        assert!(!apply_drive(&empty, &mut s));
+        assert!(!apply_tires(&empty, &mut s));
+    }
+
+    #[test]
+    fn apply_charge_prefers_usable_battery_level() {
+        let fields: Map<String, Value> =
+            serde_json::from_str(r#"{"battery_level":60,"usable_battery_level":57,"charging_state":"Charging"}"#)
+                .unwrap();
+        let mut s = Sample::default();
+        assert!(apply_charge(&fields, &mut s));
+        assert_eq!(s.battery_pct, Some(57.0)); // usable, not raw 60
     }
 }

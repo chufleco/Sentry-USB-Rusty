@@ -1191,9 +1191,11 @@ async fn tick(
         }
 
         // ── 2. CLIMATE (every 60s) ──
-        if !connect_failed && schedule.climate_due(tick_now) {
+        if (cfg.c6_primary || !connect_failed) && schedule.climate_due(tick_now) {
             let success = if cfg.c6_primary && c6_took_climate(&c6_snap, now_ms, &mut sample) {
                 true
+            } else if connect_failed {
+                false // BLE unreachable this tick (flag-off only; C6 tried above)
             } else { match sample_ble::sample_climate_ble(session).await {
                 Ok(c) => {
                     if cfg.experimental {
@@ -1218,7 +1220,7 @@ async fn tick(
         }
 
         // ── 3. CHARGE (every 60s, or 15s while DC fast charging) ──
-        if !connect_failed && schedule.charge_due(tick_now) {
+        if (cfg.c6_primary || !connect_failed) && schedule.charge_due(tick_now) {
             // Set in the Ok arm when this poll sees DC fast charging; picks
             // the 15s vs 60s next-charge cadence in `mark_charge` below.
             let mut fast_charging = false;
@@ -1226,6 +1228,8 @@ async fn tick(
                 && c6_took_charge(&c6_snap, now_ms, &mut sample, last_charging_state, &mut fast_charging)
             {
                 true
+            } else if connect_failed {
+                false // BLE unreachable this tick (flag-off only; C6 tried above)
             } else { match sample_ble::sample_charge_ble(session).await {
                 Ok(c) => {
                     if cfg.experimental {
@@ -1312,9 +1316,11 @@ async fn tick(
         }
 
         // ── 5. TIRES (every 5 min) ──
-        if !connect_failed && schedule.tires_due(tick_now) {
+        if (cfg.c6_primary || !connect_failed) && schedule.tires_due(tick_now) {
             let success = if cfg.c6_primary && c6_took_tires(&c6_snap, now_ms, &mut sample) {
                 true
+            } else if connect_failed {
+                false // BLE unreachable this tick (flag-off only; C6 tried above)
             } else { match sample_ble::sample_tires_ble(session).await {
                 Ok(t) => {
                     try_sync_clock(t.meta);
@@ -2091,52 +2097,56 @@ mod tests {
 // records the fallback (the replacement-viability metric) with its reason.
 // Only wired when TELEMETRY_SOURCE=c6_primary; dead on a normal box.
 
+/// Log a fallback with its reason and the running count. Centralizes the metric
+/// so every "did not use C6" path (incl. NoSnapshot and empty payloads) counts.
+fn c6_fallback(domain: &str, reason: &str) -> bool {
+    let n = c6_source::record_fallback();
+    debug!(domain, reason, fallbacks = n, "C6 not used -> in-process BLE");
+    false
+}
+
 fn c6_took_drive(
     snap: &Option<c6_source::C6Snapshot>,
     now_ms: u64,
     sample: &mut Sample,
     shift_state_observed: &mut Option<sample::ShiftState>,
 ) -> bool {
-    let s = match snap {
-        Some(s) => s,
-        None => return false,
-    };
-    match c6_source::decide_domain(Some(s), "drive", now_ms) {
+    match c6_source::decide_domain(snap.as_ref(), "drive", now_ms) {
         c6_source::Source::C6 => {
-            if let Some((fields, _)) = s.domains.get("drive") {
-                c6_source::apply_drive(fields, sample);
-                // Side-effect: feed the mode machine's drive-detection input.
-                if let Some(ss) = fields.get("shift_state").and_then(|v| v.as_str()) {
-                    *shift_state_observed = Some(sample::ShiftState::from_c6_str(ss));
-                }
-                return true;
+            let (fields, _) = snap.as_ref().unwrap().domains.get("drive").unwrap();
+            let shift = fields
+                .get("shift_state")
+                .and_then(|v| v.as_str())
+                .map(sample::ShiftState::from_c6_str)
+                .unwrap_or(sample::ShiftState::Unknown);
+            // Only satisfy drive from C6 when parked. An active drive needs the
+            // BLE drive poll for the reverse-geocoded address (the C6 carries
+            // none) and fresh GPS — otherwise moving rows get stamped with a
+            // stale held address.
+            if !matches!(shift, sample::ShiftState::Park | sample::ShiftState::Unknown) {
+                return c6_fallback("drive", "driving_needs_ble_address");
             }
-            false
+            if !c6_source::apply_drive(fields, sample) {
+                return c6_fallback("drive", "empty_payload");
+            }
+            *shift_state_observed = Some(shift); // mode drive-detection input
+            true
         }
-        c6_source::Source::FallbackBle(r) => {
-            debug!(domain = "drive", reason = r.as_str(), n = c6_source::record_fallback(), "C6 unavailable -> BLE");
-            false
-        }
+        c6_source::Source::FallbackBle(r) => c6_fallback("drive", r.as_str()),
     }
 }
 
 fn c6_took_climate(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut Sample) -> bool {
-    let s = match snap {
-        Some(s) => s,
-        None => return false,
-    };
-    match c6_source::decide_domain(Some(s), "climate", now_ms) {
+    match c6_source::decide_domain(snap.as_ref(), "climate", now_ms) {
         c6_source::Source::C6 => {
-            if let Some((fields, _)) = s.domains.get("climate") {
-                c6_source::apply_climate(fields, sample);
-                return true;
+            let (fields, _) = snap.as_ref().unwrap().domains.get("climate").unwrap();
+            if c6_source::apply_climate(fields, sample) {
+                true
+            } else {
+                c6_fallback("climate", "empty_payload")
             }
-            false
         }
-        c6_source::Source::FallbackBle(r) => {
-            debug!(domain = "climate", reason = r.as_str(), n = c6_source::record_fallback(), "C6 unavailable -> BLE");
-            false
-        }
+        c6_source::Source::FallbackBle(r) => c6_fallback("climate", r.as_str()),
     }
 }
 
@@ -2147,49 +2157,38 @@ fn c6_took_charge(
     last_charging_state: &mut Option<TimedReading<sample::ChargingState>>,
     fast_charging: &mut bool,
 ) -> bool {
-    let s = match snap {
-        Some(s) => s,
-        None => return false,
-    };
-    match c6_source::decide_domain(Some(s), "charge", now_ms) {
+    match c6_source::decide_domain(snap.as_ref(), "charge", now_ms) {
         c6_source::Source::C6 => {
-            if let Some((fields, _)) = s.domains.get("charge") {
-                c6_source::apply_charge(fields, sample);
-                // Side-effect: charging_state gates keep-awake + the location
-                // poll, and (with power) the DC-fast 15s cadence. Critical path.
-                if let Some(cs) = fields.get("charging_state").and_then(|v| v.as_str()) {
-                    let parsed = sample::ChargingState::from_c6_str(cs);
-                    *last_charging_state = Some(TimedReading::now(parsed));
-                    let power = fields.get("charger_power").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
-                    *fast_charging = parsed.is_active_charging() && power > FAST_CHARGE_THRESHOLD_KW;
-                }
-                return true;
+            let (fields, _) = snap.as_ref().unwrap().domains.get("charge").unwrap();
+            // charging_state gates keep-awake — if the C6 payload lacks it, fall
+            // back to BLE so the gate always gets a fresh authoritative value.
+            let cs = match fields.get("charging_state").and_then(|v| v.as_str()) {
+                Some(cs) => cs,
+                None => return c6_fallback("charge", "no_charging_state"),
+            };
+            if !c6_source::apply_charge(fields, sample) {
+                return c6_fallback("charge", "empty_payload");
             }
-            false
+            let parsed = sample::ChargingState::from_c6_str(cs);
+            *last_charging_state = Some(TimedReading::now(parsed));
+            let power = fields.get("charger_power").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
+            *fast_charging = parsed.is_active_charging() && power > FAST_CHARGE_THRESHOLD_KW;
+            true
         }
-        c6_source::Source::FallbackBle(r) => {
-            debug!(domain = "charge", reason = r.as_str(), n = c6_source::record_fallback(), "C6 unavailable -> BLE");
-            false
-        }
+        c6_source::Source::FallbackBle(r) => c6_fallback("charge", r.as_str()),
     }
 }
 
 fn c6_took_tires(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut Sample) -> bool {
-    let s = match snap {
-        Some(s) => s,
-        None => return false,
-    };
-    match c6_source::decide_domain(Some(s), "tires", now_ms) {
+    match c6_source::decide_domain(snap.as_ref(), "tires", now_ms) {
         c6_source::Source::C6 => {
-            if let Some((fields, _)) = s.domains.get("tires") {
-                c6_source::apply_tires(fields, sample);
-                return true;
+            let (fields, _) = snap.as_ref().unwrap().domains.get("tires").unwrap();
+            if c6_source::apply_tires(fields, sample) {
+                true
+            } else {
+                c6_fallback("tires", "empty_payload")
             }
-            false
         }
-        c6_source::Source::FallbackBle(r) => {
-            debug!(domain = "tires", reason = r.as_str(), n = c6_source::record_fallback(), "C6 unavailable -> BLE");
-            false
-        }
+        c6_source::Source::FallbackBle(r) => c6_fallback("tires", r.as_str()),
     }
 }
