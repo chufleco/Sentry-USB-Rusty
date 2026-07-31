@@ -26,6 +26,20 @@ impl ShiftState {
     pub fn is_park(self) -> bool {
         matches!(self, ShiftState::Park)
     }
+
+    /// Parse the C6's decoded `shift_state` string. The C6 delivers already-
+    /// decoded Tesla values (`"P"`/`"R"`/`"N"`/`"D"`, or `"Invalid"` when the
+    /// car omits it). Anything else — including `"Invalid"` — maps to `Unknown`,
+    /// mirroring the BLE path's protobuf `_ => Unknown`.
+    pub fn from_c6_str(s: &str) -> ShiftState {
+        match s.trim() {
+            "P" | "Park" => ShiftState::Park,
+            "R" | "Reverse" => ShiftState::Reverse,
+            "N" | "Neutral" => ShiftState::Neutral,
+            "D" | "Drive" => ShiftState::Drive,
+            _ => ShiftState::Unknown,
+        }
+    }
 }
 
 /// Tesla `ChargeState.charging_state` oneof, flattened so the phase
@@ -45,6 +59,23 @@ pub enum ChargingState {
 }
 
 impl ChargingState {
+    /// Parse the C6's decoded `charging_state` string (`"Charging"`,
+    /// `"Stopped"`, …) into the enum. Case-insensitive; the accepted spellings
+    /// are exactly the inverse of `as_db_str`, so the two stay in lockstep.
+    /// Unrecognized/absent → `Unknown` (the phase machine's safe default).
+    pub fn from_c6_str(s: &str) -> ChargingState {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "disconnected" => ChargingState::Disconnected,
+            "nopower" => ChargingState::NoPower,
+            "starting" => ChargingState::Starting,
+            "charging" => ChargingState::Charging,
+            "complete" => ChargingState::Complete,
+            "stopped" => ChargingState::Stopped,
+            "calibrating" => ChargingState::Calibrating,
+            _ => ChargingState::Unknown,
+        }
+    }
+
     /// The three states that keep the car awake on its own; the sampler
     /// stays Active while true even if shift_state is Park (quieting
     /// would leave battery % stale mid-charge).
@@ -361,3 +392,44 @@ pub fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+
+#[cfg(test)]
+mod c6_parse_tests {
+    use super::*;
+
+    #[test]
+    fn shift_state_from_c6_str() {
+        assert_eq!(ShiftState::from_c6_str("P"), ShiftState::Park);
+        assert_eq!(ShiftState::from_c6_str("D"), ShiftState::Drive);
+        assert_eq!(ShiftState::from_c6_str("R"), ShiftState::Reverse);
+        assert_eq!(ShiftState::from_c6_str("N"), ShiftState::Neutral);
+        // "Invalid" (parked/omitted) must NOT read as Park — mirrors BLE _ => Unknown.
+        assert_eq!(ShiftState::from_c6_str("Invalid"), ShiftState::Unknown);
+        assert_eq!(ShiftState::from_c6_str(""), ShiftState::Unknown);
+        assert!(!ShiftState::from_c6_str("Invalid").is_park());
+    }
+
+    #[test]
+    fn charging_state_from_c6_str_gates_keep_awake_correctly() {
+        // The critical one: "Charging" must keep the car awake.
+        assert_eq!(ChargingState::from_c6_str("Charging"), ChargingState::Charging);
+        assert!(ChargingState::from_c6_str("Charging").is_active_charging());
+        assert!(ChargingState::from_c6_str("Starting").is_active_charging());
+        // Stopped/Complete/Disconnected must NOT keep it awake.
+        assert!(!ChargingState::from_c6_str("Stopped").is_active_charging());
+        assert!(!ChargingState::from_c6_str("Complete").is_active_charging());
+        assert!(!ChargingState::from_c6_str("Disconnected").is_active_charging());
+        assert_eq!(ChargingState::from_c6_str("garbage"), ChargingState::Unknown);
+    }
+
+    #[test]
+    fn from_c6_str_is_inverse_of_as_db_str() {
+        for cs in [
+            ChargingState::Disconnected, ChargingState::NoPower, ChargingState::Starting,
+            ChargingState::Charging, ChargingState::Complete, ChargingState::Stopped,
+            ChargingState::Calibrating, ChargingState::Unknown,
+        ] {
+            assert_eq!(ChargingState::from_c6_str(cs.as_db_str()), cs, "roundtrip {:?}", cs);
+        }
+    }
+}

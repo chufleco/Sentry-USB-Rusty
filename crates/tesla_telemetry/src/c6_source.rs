@@ -171,6 +171,26 @@ pub fn decide(
     Source::C6
 }
 
+/// Per-domain freshness policy: (expected cadence secs, SLA multiplier),
+/// matching the C6 supervisor's poll cadences. Charge is tighter because it
+/// gates keep-awake; the rest get the generous default.
+fn domain_policy(domain: &str) -> (u64, u64) {
+    match domain {
+        "drive" => (15, SLA_MULTIPLIER),
+        "climate" => (60, SLA_MULTIPLIER),
+        "charge" => (60, CHARGE_SLA_MULTIPLIER),
+        "closures" => (60, SLA_MULTIPLIER),
+        "tires" => (300, SLA_MULTIPLIER),
+        _ => (60, SLA_MULTIPLIER),
+    }
+}
+
+/// `decide` with the per-domain policy baked in — the tick-loop entry point.
+pub fn decide_domain(snapshot: Option<&C6Snapshot>, domain: &str, now_ms: u64) -> Source {
+    let (cadence, mult) = domain_policy(domain);
+    decide(snapshot, domain, cadence, mult, now_ms)
+}
+
 /// Record a fallback (call once each time the selector chooses in-process BLE
 /// because the C6 wasn't trustworthy). Returns the running total.
 pub fn record_fallback() -> u64 {
