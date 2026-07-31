@@ -145,6 +145,15 @@ impl<T: Copy> TimedReading<T> {
         Self { value, at: Instant::now() }
     }
 
+    /// Stamp with a value already `age` old (e.g. a C6 snapshot value delivered
+    /// some time ago). Backdates `at` so the gate's freshness check ages it from
+    /// when the reading was actually valid — NOT from now — so a stale C6 charge
+    /// state can't masquerade as fresh and defeat the keep-awake gate.
+    fn at_age(value: T, age: Duration) -> Self {
+        let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
+        Self { value, at }
+    }
+
     /// The value if read within `max_age`, else None (treat as unread).
     fn fresh(&self, max_age: Duration) -> Option<T> {
         (self.at.elapsed() < max_age).then_some(self.value)
@@ -1083,10 +1092,15 @@ async fn tick(
         // per-domain helpers all short-circuit to false and we poll BLE as
         // before. Cheap ~4KB tmpfs read.
         let c6_snap = if cfg.c6_primary { c6_source::read_snapshot() } else { None };
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // Only stamped when C6-primary; the flag-off path never reads it.
+        let now_ms = if cfg.c6_primary {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         // Set when a sub-sampler failed at the connect layer (scan /
         // adapter / GATT connect) — the car is unreachable, so each
         // remaining sub-sampler this tick would redo the same 30s scan
@@ -2119,12 +2133,18 @@ fn c6_took_drive(
                 .and_then(|v| v.as_str())
                 .map(sample::ShiftState::from_c6_str)
                 .unwrap_or(sample::ShiftState::Unknown);
-            // Only satisfy drive from C6 when parked. An active drive needs the
-            // BLE drive poll for the reverse-geocoded address (the C6 carries
-            // none) and fresh GPS — otherwise moving rows get stamped with a
-            // stale held address.
-            if !matches!(shift, sample::ShiftState::Park | sample::ShiftState::Unknown) {
-                return c6_fallback("drive", "driving_needs_ble_address");
+            // Only satisfy drive from C6 when the car is genuinely PARKED. An
+            // active drive needs the BLE drive poll for the reverse-geocoded
+            // address (the C6 carries none) and fresh GPS. Tesla emits an
+            // Invalid/SNA shift (-> Unknown) transiently WHILE DRIVING too, so
+            // Unknown alone isn't proof of parked — require ~zero drive power
+            // before trusting it, else fall back to BLE. A parked car (incl.
+            // parked-and-charging) shows ~0 drive power; motion shows non-zero.
+            let drive_power = fields.get("power").and_then(|v| v.as_i64()).unwrap_or(0);
+            let parked = matches!(shift, sample::ShiftState::Park)
+                || (matches!(shift, sample::ShiftState::Unknown) && drive_power.abs() < 1);
+            if !parked {
+                return c6_fallback("drive", "moving_needs_ble_address");
             }
             if !c6_source::apply_drive(fields, sample) {
                 return c6_fallback("drive", "empty_payload");
@@ -2159,7 +2179,7 @@ fn c6_took_charge(
 ) -> bool {
     match c6_source::decide_domain(snap.as_ref(), "charge", now_ms) {
         c6_source::Source::C6 => {
-            let (fields, _) = snap.as_ref().unwrap().domains.get("charge").unwrap();
+            let (fields, updated_at) = snap.as_ref().unwrap().domains.get("charge").unwrap();
             // charging_state gates keep-awake — if the C6 payload lacks it, fall
             // back to BLE so the gate always gets a fresh authoritative value.
             let cs = match fields.get("charging_state").and_then(|v| v.as_str()) {
@@ -2170,7 +2190,11 @@ fn c6_took_charge(
                 return c6_fallback("charge", "empty_payload");
             }
             let parsed = sample::ChargingState::from_c6_str(cs);
-            *last_charging_state = Some(TimedReading::now(parsed));
+            // Stamp the keep-awake gate input with the snapshot's REAL age, not
+            // now — a C6 value delivered N ms ago must age from then, so a stale
+            // "Stopped" can't hold the gate open (or let the car sleep) falsely.
+            let age = std::time::Duration::from_millis(now_ms.saturating_sub(*updated_at));
+            *last_charging_state = Some(TimedReading::at_age(parsed, age));
             let power = fields.get("charger_power").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             *fast_charging = parsed.is_active_charging() && power > FAST_CHARGE_THRESHOLD_KW;
             true
@@ -2190,5 +2214,21 @@ fn c6_took_tires(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut
             }
         }
         c6_source::Source::FallbackBle(r) => c6_fallback("tires", r.as_str()),
+    }
+}
+
+#[cfg(test)]
+mod timed_reading_tests {
+    use super::*;
+
+    #[test]
+    fn at_age_ages_from_delivery_not_now() {
+        // A value delivered 5s ago, checked against a 3s window, must read stale
+        // (the C6-stale-charge keep-awake bug: now() would wrongly read fresh).
+        let tr = TimedReading::at_age(42u8, Duration::from_secs(5));
+        assert_eq!(tr.fresh(Duration::from_secs(3)), None, "5s-old value must be stale at 3s window");
+        assert_eq!(tr.fresh(Duration::from_secs(10)), Some(42), "fresh within a 10s window");
+        // now() by contrast is fresh at 3s.
+        assert_eq!(TimedReading::now(42u8).fresh(Duration::from_secs(3)), Some(42));
     }
 }
