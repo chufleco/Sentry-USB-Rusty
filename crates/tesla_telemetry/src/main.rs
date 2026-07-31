@@ -23,6 +23,7 @@ mod db;
 mod diag_log;
 mod keep_accessory;
 mod lock;
+mod c6_source;
 mod sample;
 mod sample_ble;
 mod usb_watch;
