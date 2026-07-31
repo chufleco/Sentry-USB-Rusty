@@ -54,11 +54,13 @@ pub struct C6Snapshot {
 }
 
 impl C6Snapshot {
-    /// Parse the supervisor snapshot JSON. Shape mirrors the supervisor's
-    /// `status_json`: `{ healthy, last_heartbeat_age_ms, domains: { <d>: {
-    /// updated_at_ms, ...fields } } }`. Returns None on any structural miss so
-    /// the caller treats an unreadable/garbage snapshot as "C6 unavailable"
-    /// and falls back — never trusts a half-parsed snapshot.
+    /// Parse the supervisor snapshot JSON. Shape combines the supervisor's
+    /// `status_json` (health) with `telemetry_json` (domains), which nests the
+    /// per-domain payload under a `fields` key:
+    /// `{ healthy, last_heartbeat_age_ms, domains: { <d>: { updated_at_ms,
+    /// fields: { ... } } } }`. Returns None on any structural miss so the
+    /// caller treats an unreadable/garbage snapshot as "C6 unavailable" and
+    /// falls back — never trusts a half-parsed snapshot.
     pub fn parse(json: &str) -> Option<C6Snapshot> {
         let v: Value = serde_json::from_str(json).ok()?;
         let healthy = v.get("healthy")?.as_bool()?;
@@ -74,13 +76,24 @@ impl C6Snapshot {
                     Some(t) => t,
                     None => continue, // no freshness stamp => unusable
                 };
-                let mut fields = obj.clone();
-                fields.remove("updated_at_ms");
+                let fields = match obj.get("fields").and_then(|f| f.as_object()) {
+                    Some(f) => f.clone(),
+                    None => continue, // no payload => unusable
+                };
                 domains.insert(name.clone(), (fields, updated_at_ms));
             }
         }
         Some(C6Snapshot { healthy, last_heartbeat_age_ms, domains })
     }
+}
+
+/// Read + parse the current supervisor snapshot from tmpfs. Returns None if
+/// the file is missing or unparseable — the caller treats that as "C6
+/// unavailable" and polls BLE. Cheap (~4 KB tmpfs read); the tick calls it once
+/// per cycle and reuses the result across domains.
+pub fn read_snapshot() -> Option<C6Snapshot> {
+    let json = std::fs::read_to_string(SNAPSHOT_PATH).ok()?;
+    C6Snapshot::parse(&json)
 }
 
 /// Why the sampler is (or isn't) using the C6 for a domain this tick.
@@ -303,13 +316,13 @@ mod tests {
     #[test]
     fn parse_reads_health_and_domain_freshness() {
         let json = r#"{"healthy":true,"last_heartbeat_age_ms":1200,
-            "domains":{"charge":{"updated_at_ms":170000,"battery_level":59,"charging_state":"Charging"}}}"#;
+            "domains":{"charge":{"updated_at_ms":170000,"fields":{"battery_level":59,"charging_state":"Charging"}}}}"#;
         let s = C6Snapshot::parse(json).unwrap();
         assert!(s.healthy);
         assert_eq!(s.last_heartbeat_age_ms, Some(1200));
         let (fields, ts) = s.domains.get("charge").unwrap();
         assert_eq!(*ts, 170000);
-        assert!(fields.get("updated_at_ms").is_none()); // stripped
+        assert!(fields.get("updated_at_ms").is_none()); // not part of fields payload
         assert_eq!(fields.get("battery_level").unwrap().as_i64(), Some(59));
     }
 

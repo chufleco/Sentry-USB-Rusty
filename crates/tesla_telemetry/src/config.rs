@@ -43,6 +43,12 @@ pub struct BleConfig {
     /// Master switch (`BLE_KEEP_AWAKE_ENABLED`); when false the sampler skips
     /// the CPC nudge. Pin/archive behavior is unchanged. Missing key => false.
     pub keep_awake_enabled: bool,
+    /// Telemetry source. When true (`TELEMETRY_SOURCE=c6_primary`), the sampler
+    /// prefers the ESP32-C6 co-processor's readings and only polls BLE itself
+    /// when the C6 is genuinely failing (see `c6_source`). Default OFF — a
+    /// normal box polls BLE exactly as before; this only activates on a
+    /// C6-equipped box that opts in for the C6-primary soak.
+    pub c6_primary: bool,
 }
 
 /// Default keep-awake nudge interval in seconds.
@@ -59,6 +65,7 @@ impl Default for BleConfig {
             experimental: false,
             keep_awake_interval_secs: DEFAULT_KEEP_AWAKE_INTERVAL_SECS,
             keep_awake_enabled: false,
+            c6_primary: false,
         }
     }
 }
@@ -176,6 +183,11 @@ impl BleConfig {
             )
             .as_deref(),
         );
+        // Telemetry source selector. Only "c6_primary" flips the sampler to
+        // prefer the C6; anything else (incl. unset) keeps the BLE-only path.
+        let c6_primary = sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE")
+            .map(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
+            .unwrap_or(false);
 
         Ok(Self {
             enabled,
@@ -186,6 +198,7 @@ impl BleConfig {
             experimental,
             keep_awake_interval_secs,
             keep_awake_enabled,
+            c6_primary,
         })
     }
 }
