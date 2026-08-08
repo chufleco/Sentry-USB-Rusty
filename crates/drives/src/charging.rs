@@ -102,6 +102,9 @@ pub struct ChargeSessionSummary {
     /// tag/rate engine. Lets the UI show the cost as manually set and skip
     /// the "set a rate" hint.
     pub cost_overridden: bool,
+    /// Charged inside the configured home geofence. Set by the api crate;
+    /// `false` in the cloud blob. Drives the auto "Home" chip + Home rate.
+    pub at_home: bool,
 }
 
 /// One point on the detail charts. Carries every per-sample series the
@@ -385,6 +388,9 @@ pub fn summarize(rows: &[ChargeRow]) -> ChargeSessionSummary {
         currency: String::new(),
         fast_charging: peak_power_kw.is_some_and(|p| p > FAST_CHARGE_THRESHOLD_KW),
         cost_overridden: false,
+        // Derived by the api crate from the home geofence; stays false here
+        // (and in the cloud blob, which never fills it).
+        at_home: false,
     }
 }
 
