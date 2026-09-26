@@ -212,8 +212,18 @@ enum IpcError {
 /// Map `NoAnswer` per mode: flag off = stock (fall back to direct BLE);
 /// c6_primary = refuse (a slow daemon's session plus ours = two Pi signers,
 /// and the C6 may hold the same key).
+/// TELEMETRY_SOURCE=c6_primary is configured, ignoring the C6_BACKFILL gate:
+/// in ANY C6 mode a slow daemon may still be signing on the Pi key, so a
+/// no-answer must not fall through to a second direct session.
+fn c6_primary_configured() -> bool {
+    sentryusb_config::parse_file(sentryusb_config::find_config_path())
+        .ok()
+        .and_then(|(a, c)| sentryusb_config::get_config_value(&a, &c, "TELEMETRY_SOURCE"))
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
+}
+
 fn no_answer_policy<T>(r: Result<T, IpcError>) -> Result<T, IpcFail> {
-    no_answer_policy_with(r, c6_owns_link() && std::path::Path::new(C6_DEVICE).exists())
+    no_answer_policy_with(r, c6_primary_configured() && std::path::Path::new(C6_DEVICE).exists())
 }
 
 fn no_answer_policy_with<T>(r: Result<T, IpcError>, c6_mode: bool) -> Result<T, IpcFail> {
@@ -796,6 +806,12 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
         }
         return DirectBle::Stock;
     }
+    // A C6 is physically present: coordinate whatever TELEMETRY_SOURCE says right
+    // now. Onboarding can flip the flag on mid-action, and the daemon would then
+    // grant the C6 after its settle while this direct action is still open —
+    // two signers on the shared key. Claiming (below) publishes our lease so the
+    // supervisor parks the C6 and the daemon defers. `c6_primary` unused here.
+    let _ = c6_primary;
     let grant_now = parsed.as_ref().is_some_and(|v| {
         v.get("owner").and_then(|x| x.as_str()) == Some("c6")
             && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
@@ -826,10 +842,8 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
     // been flipped while the daemon was down); otherwise flag off = stock.
     if grant_recent {
         DirectBle::Block
-    } else if c6_primary {
-        DirectBle::Claim
     } else {
-        DirectBle::Stock
+        DirectBle::Claim
     }
 }
 
@@ -973,11 +987,11 @@ mod tests {
 
     #[test]
     fn c6_absent_or_flag_off_is_stock_behaviour() {
-        assert_eq!(direct_ble_decision(true, false, None, "b", 1), DirectBle::Stock);
+        assert_eq!(direct_ble_decision(true, false, None, "b", 1), DirectBle::Stock); // no C6, no lease
+        assert_eq!(direct_ble_decision(false, true, None, "b", 1), DirectBle::Claim); // C6 present: coordinate even flag-off
         assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Stock);
         // Symlink gone but a grant is live / just expired: a powered chip may be mid-command.
         assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Block);
-        assert_eq!(direct_ble_decision(false, true, None, "b", 1), DirectBle::Stock);
         // Flag flipped off while a grant is still live: never direct.
         assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::RouteC6);
     }
