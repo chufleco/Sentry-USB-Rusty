@@ -632,6 +632,10 @@ async fn tick(
     // in settings, and (b) on a Pi with no BLE key file turned the
     // intended 60s idle poll into a 5s retry spin with a warning logged
     // every cycle.
+    // C6-primary with the sampler idle (BLE off / no VIN): the C6 may own the car.
+    if (!cfg.enabled || cfg.vin.is_empty()) && cfg.c6_primary && !cfg.c6_backfill {
+        c6_release(ble_session, held_radio, c6_link).await;
+    }
     if !cfg.enabled {
         if *held_radio {
             info!("BLE disabled in settings — releasing radio");
@@ -670,16 +674,7 @@ async fn tick(
         }
         match owner {
             c6_coord::Owner::C6 => {
-                if let Some(h) = ble_session.take() {
-                    info!("C6 owns the car link: closing the sampler's Tesla BLE session");
-                    h.session.shutdown().await;
-                    tokio::time::sleep(c6_coord::RELEASE_GRACE).await;
-                }
-                if *held_radio {
-                    release_radio().await;
-                    *held_radio = false;
-                }
-                c6_coord::write_lease(c6_coord::Owner::C6);
+                c6_release(ble_session, held_radio, c6_link).await;
                 *parked_polls = 0;
                 *last_user_presence = None;
                 let sleep = c6_owned_tick(
@@ -699,13 +694,12 @@ async fn tick(
                 .await;
                 return (sleep, Some(cfg));
             }
-            // Lease first, so the supervisor holds before we connect.
-            c6_coord::Owner::Sampler => c6_coord::write_lease(c6_coord::Owner::Sampler),
+            c6_coord::Owner::Sampler => {}
         }
-    } else if !cfg.c6_primary && std::path::Path::new(c6_source::SNAPSHOT_PATH).exists() {
-        // C6 present but flag off: the sampler is the car's only client, so
-        // tell the supervisor to hold (never both on one key).
-        c6_coord::write_lease(c6_coord::Owner::Sampler);
+    }
+    // Lease first, so the supervisor holds before we connect; no lease, no car.
+    if !c6_claim_for_sampler(&cfg) {
+        return (Duration::from_secs(30), Some(cfg));
     }
 
     // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
@@ -1795,7 +1789,7 @@ async fn handle_action_request(
     }
 
     // C6 owns the car: route through it, never open our own session.
-    if c6_link.c6_owns(&cfg) {
+    if c6_link.c6_owns(&cfg) || c6_link.pending_close.is_some() {
         let result = c6_action(&cfg, &verb).await;
         match &result {
             Ok(_) => info!("action_socket: verb={} routed via C6", verb),
@@ -1829,6 +1823,15 @@ async fn handle_action_request(
             }
         },
     };
+
+    // Same lease claim as the tick (a flag flip since the last tick must not
+    // let this path connect while the supervisor still holds a grant).
+    if !c6_claim_for_sampler(&cfg) {
+        let _ = req.reply.send(Err(anyhow::anyhow!(
+            "UNREACHABLE: could not claim the car link from the C6"
+        )));
+        return;
+    }
 
     // Lazy-spawn or reuse the PersistentSession on the configured
     // VIN/adapter — exactly the same call the tick loop uses.
@@ -2322,6 +2325,45 @@ struct C6Link {
     coord: c6_coord::Coordinator,
     /// domain -> updated_at_ms of the value last persisted (dedupe key only).
     written: std::collections::HashMap<&'static str, u64>,
+    /// Our session after shutdown, until its task (and link) has really ended.
+    /// The C6 gets no grant while this is still open.
+    pending_close: Option<sentryusb_tesla_ble::manager::PersistentSession>,
+}
+
+/// Stand the sampler down and, once our car link is really closed, grant the
+/// car to the C6. Non-blocking: an unfinished close just defers the grant to
+/// a later tick (the old sampler lease keeps the supervisor holding).
+async fn c6_release(
+    ble_session: &mut Option<sample_ble::SessionHandle>,
+    held_radio: &mut bool,
+    link: &mut C6Link,
+) {
+    if let Some(h) = ble_session.take() {
+        info!("C6 owns the car link: closing the sampler's Tesla BLE session");
+        h.session.shutdown().await;
+        link.pending_close = Some(h.session);
+    }
+    if *held_radio {
+        release_radio().await;
+        *held_radio = false;
+    }
+    if link.pending_close.as_ref().is_some_and(|s| !s.is_closed()) {
+        info!("C6 coordination: waiting for the sampler session to close before granting");
+        return;
+    }
+    link.pending_close = None;
+    c6_coord::write_lease(c6_coord::Owner::C6);
+}
+
+/// Publish the sampler lease before any Pi session touches the car, whenever
+/// a C6 could be involved (flag on, or a supervisor snapshot exists). False =
+/// the lease could not be written, so the caller must not connect.
+fn c6_claim_for_sampler(cfg: &BleConfig) -> bool {
+    let c6_possible = cfg.c6_primary || std::path::Path::new(c6_source::SNAPSHOT_PATH).exists();
+    if !c6_possible || (cfg.c6_primary && cfg.c6_backfill) {
+        return true; // stock box, or bench backfill (both radios by design)
+    }
+    c6_coord::write_lease(c6_coord::Owner::Sampler)
 }
 
 impl C6Link {
@@ -2490,7 +2532,7 @@ async fn c6_owned_tick(
         let now = Instant::now();
         if next_nudge_due_at.map(|t| now >= t).unwrap_or(true) {
             let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
-            let cmd = serde_json::json!({"cmd": "nudge_charge_port_close"});
+            let cmd = serde_json::json!({"cmd": "nudge_charge_port_close", "await_result": true});
             match c6_coord::supervisor_command(&cfg.c6_supervisor_api, &cmd).await {
                 Ok(()) => {
                     info!("keep-awake: charge-port-close nudge sent via C6 (next in {}s)", interval.as_secs());

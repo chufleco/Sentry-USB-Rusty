@@ -695,31 +695,23 @@ fn load_config() -> Result<(String, Option<String>)> {
 
 /// True when `TELEMETRY_SOURCE=c6_primary` (and not the C6_BACKFILL bench
 /// mode): the ESP32-C6 shares this key, so no direct Pi session may open.
-/// Same active-then-commented lookup as the telemetry daemon's BleConfig.
+/// Parsed with the same config crate + lookup the telemetry daemon uses. An
+/// unreadable config fails closed only if it can't be read at all.
 fn c6_owns_link() -> bool {
-    let Ok(raw) = std::fs::read_to_string(CONFIG_FILE) else { return false };
-    c6_owns_link_in(&raw)
+    match sentryusb_config::parse_file(sentryusb_config::find_config_path()) {
+        Ok((active, commented)) => c6_owns_link_in(&active, &commented),
+        Err(_) => false,
+    }
 }
 
-fn c6_owns_link_in(raw: &str) -> bool {
-    let lookup = |key: &str| -> Option<String> {
-        let active = format!("export {key}=");
-        let commented = format!("#export {key}=");
-        let mut fallback = None;
-        for line in raw.lines() {
-            let t = line.trim_start();
-            if let Some(v) = t.strip_prefix(&active) {
-                return Some(unquote(v));
-            }
-            if let Some(v) = t.strip_prefix(&commented) {
-                fallback.get_or_insert_with(|| unquote(v));
-            }
-        }
-        fallback
-    };
-    let primary = lookup("TELEMETRY_SOURCE").is_some_and(|v| v.eq_ignore_ascii_case("c6_primary"));
-    let backfill = lookup("C6_BACKFILL")
-        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "yes" | "true"));
+fn c6_owns_link_in(
+    active: &sentryusb_config::SetupConfig,
+    commented: &sentryusb_config::SetupConfig,
+) -> bool {
+    let get = |k| sentryusb_config::get_config_value(active, commented, k);
+    let primary = get("TELEMETRY_SOURCE").is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"));
+    let backfill = get("C6_BACKFILL")
+        .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"));
     primary && !backfill
 }
 
@@ -741,12 +733,20 @@ fn unquote(s: &str) -> String {
 mod tests {
     use super::c6_owns_link_in;
 
+    fn owns(conf: &str) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("c.conf");
+        std::fs::write(&p, conf).unwrap();
+        let (a, c) = sentryusb_config::parse_file(p.to_str().unwrap()).unwrap();
+        c6_owns_link_in(&a, &c)
+    }
+
     #[test]
-    fn c6_guard_follows_the_config() {
-        assert!(!c6_owns_link_in("export TESLA_BLE_VIN=X\n"));
-        assert!(c6_owns_link_in("export TELEMETRY_SOURCE='c6_primary'\n"));
-        assert!(c6_owns_link_in("#export TELEMETRY_SOURCE=c6_primary\n"));
-        assert!(!c6_owns_link_in("export TELEMETRY_SOURCE=sampler\n#export TELEMETRY_SOURCE=c6_primary\n"));
-        assert!(!c6_owns_link_in("export TELEMETRY_SOURCE=c6_primary\nexport C6_BACKFILL=1\n"));
+    fn c6_guard_follows_the_daemon_parser() {
+        assert!(!owns("export TESLA_BLE_VIN=X\n"));
+        assert!(owns("export TELEMETRY_SOURCE='c6_primary'\n"));
+        assert!(owns("#export TELEMETRY_SOURCE=c6_primary\n"));
+        assert!(!owns("export TELEMETRY_SOURCE=sampler\n#export TELEMETRY_SOURCE=c6_primary\n"));
+        assert!(!owns("export TELEMETRY_SOURCE=c6_primary\nexport C6_BACKFILL=1\n"));
     }
 }

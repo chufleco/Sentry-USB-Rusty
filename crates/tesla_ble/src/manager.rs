@@ -430,6 +430,11 @@ impl PersistentSession {
         let _ = self.cmd_tx.send(Command::Shutdown).await;
     }
 
+    /// True once the session task has exited (its connection closed).
+    pub fn is_closed(&self) -> bool {
+        self.cmd_tx.is_closed()
+    }
+
     /// Issue a generic signed request with caller-supplied inner
     /// payload bytes. Used by keep-awake actions that need the AES-GCM
     /// signing pipeline but produce different inner protobufs than the
