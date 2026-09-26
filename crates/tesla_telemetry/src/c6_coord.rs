@@ -20,8 +20,15 @@ use std::time::Duration;
 
 use crate::c6_source::{C6Snapshot, HEARTBEAT_DEAD_MS};
 
-/// Sampler -> supervisor ownership lease (tmpfs, same box).
+/// Sampler -> supervisor ownership lease (tmpfs, same box). The supervisor
+/// unit's RuntimeDirectory= wipes it on every supervisor restart; a missing
+/// lease means "hold", so that is safe by design.
 pub const LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
+
+/// Who wrote a sampler lease: this daemon, or `sentryusb-ble-action` holding
+/// the car for a one-shot direct action while the daemon was down.
+pub const HOLDER_TELEMETRY: &str = "telemetry";
+pub const HOLDER_BLE_ACTION: &str = "ble-action";
 
 /// The C6 must look dead this long before the sampler takes the car. Several
 /// heartbeat windows wide so a supervisor restart or USB blip never fails back.
@@ -80,7 +87,15 @@ pub struct Health {
 }
 
 /// C6 device-alive but car link down this long => the sampler takes the car.
+/// Worst-case keep-awake gap before the Pi can nudge: car-link path ~6.6 min
+/// (60s stale + 5 min + 35s settle); device-death path ~2.4 min (16s heartbeat
+/// + 90s FAILBACK_AFTER_MS + 35s settle).
 pub const CAR_LINK_FAILBACK_MS: u64 = 5 * 60_000;
+
+/// A car last seen ASLEEP that stops answering is not an outage, but only for
+/// this long after that reading, and never while dashcam clips show the car
+/// awake: the reading can't refresh once the link itself is dead.
+pub const ASLEEP_EXEMPT_MS: u64 = 30 * 60_000;
 
 /// No car contact for this long counts as "car link down" (the C6's idle
 /// keepalive answers every ~8s while it holds a session).
@@ -162,6 +177,9 @@ impl Coordinator {
         if self.owner == Owner::C6 {
             self.take_car(Reason::DeviceDead);
         }
+        // Device rules from here, even mid car-link failback: a replugged C6
+        // is handed back on device-alive, not on a link it can't show parked.
+        self.reason = Some(Reason::DeviceDead);
         self.trial_at = None;
         self.recovered_since = None;
     }
@@ -231,14 +249,16 @@ impl Coordinator {
 }
 
 /// Is the C6 reaching the car? False (= not down) when the supervisor doesn't
-/// report car contact at all (older build) or the car was last seen ASLEEP:
-/// a sleeping car not answering is not a car-link outage.
-pub fn car_link_down(snap: Option<&C6Snapshot>) -> bool {
+/// report car contact at all (older build), or the car was seen ASLEEP within
+/// ASLEEP_EXEMPT_MS and dashcam clips don't show it awake (`car_recording`).
+pub fn car_link_down(snap: Option<&C6Snapshot>, car_recording: bool) -> bool {
     let Some(s) = snap else { return false };
     if !s.car_link_reported {
         return false;
     }
-    if s.car_sleep_status.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("ASLEEP")) {
+    let recently_asleep = s.car_sleep_status.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("ASLEEP"))
+        && s.car_sleep_age_ms().is_some_and(|a| a <= ASLEEP_EXEMPT_MS);
+    if recently_asleep && !car_recording {
         return false;
     }
     match s.car_ok_age_ms() {
@@ -290,6 +310,7 @@ pub fn boot_id() -> Option<String> {
 pub fn lease_json(owner: Owner, boot_id: &str, now_ms: u64, valid_for_ms: u64) -> String {
     serde_json::json!({
         "owner": owner.as_str(),
+        "holder": HOLDER_TELEMETRY,
         "boot_id": boot_id,
         "written_boottime_ms": now_ms,
         "valid_for_ms": valid_for_ms,
@@ -311,11 +332,34 @@ pub fn grant_live_in(lease: &str, boot_id: &str, now_ms: u64) -> bool {
         }
 }
 
-/// A C6 grant on disk is still live (e.g. written by a previous run of this
-/// daemon), so the C6 may be mid-command right now.
+/// A C6 grant on disk is live, or expired less than CLAIM_SETTLE_MS ago (e.g.
+/// written by a previous run of this daemon): the C6 may be mid-command.
 pub fn disk_grant_live() -> bool {
     let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
-    std::fs::read_to_string(LEASE_PATH).is_ok_and(|l| grant_live_in(&l, &boot, now))
+    std::fs::read_to_string(LEASE_PATH)
+        .is_ok_and(|l| grant_live_in(&l, &boot, now.saturating_sub(CLAIM_SETTLE_MS)))
+}
+
+/// Pure: is `lease` a live sampler lease held by `sentryusb-ble-action`?
+pub fn ble_action_lease_live_in(lease: &str, boot_id: &str, now_ms: u64) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(lease) else { return false };
+    v.get("owner").and_then(|x| x.as_str()) == Some("sampler")
+        && v.get("holder").and_then(|x| x.as_str()) == Some(HOLDER_BLE_ACTION)
+        && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+        && match (
+            v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+            v.get("valid_for_ms").and_then(|x| x.as_u64()),
+        ) {
+            (Some(w), Some(valid)) => now_ms < w.saturating_add(valid),
+            _ => true, // malformed: assume it still holds the car
+        }
+}
+
+/// `sentryusb-ble-action` is mid direct session (it claimed while this daemon
+/// was down): the C6 must not be granted until that lease lapses.
+pub fn ble_action_holds_car() -> bool {
+    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return true };
+    std::fs::read_to_string(LEASE_PATH).is_ok_and(|l| ble_action_lease_live_in(&l, &boot, now))
 }
 
 /// Publish the lease atomically (tmp + rename). Returns false if it could not
@@ -576,6 +620,7 @@ mod tests {
             car_link_reported: true,
             car_ok_age_at_write_ms: age,
             car_sleep_status: sleep.map(str::to_string),
+            car_sleep_age_at_write_ms: age,
             snapshot_age_ms: Some(500),
             ..alive_snap()
         }
@@ -583,27 +628,62 @@ mod tests {
 
     #[test]
     fn car_asleep_is_not_a_car_link_outage() {
-        assert!(!car_link_down(Some(&link_snap(Some(3_600_000), Some("ASLEEP")))));
-        assert!(!car_link_down(Some(&link_snap(None, Some("ASLEEP")))));
-        // And over time the coordinator never fails back on it.
+        let asleep_20m = link_snap(Some(20 * 60_000), Some("ASLEEP"));
+        assert!(!car_link_down(Some(&asleep_20m), false));
+        // And over the exemption window the coordinator never fails back on it.
         let mut c = Coordinator::new();
-        let h = Health {
-            device_alive: true,
-            car_link_down: car_link_down(Some(&link_snap(Some(3_600_000), Some("ASLEEP")))),
-        };
-        for t in (0..3_600_000).step_by(15_000) {
+        let h = Health { device_alive: true, car_link_down: car_link_down(Some(&asleep_20m), false) };
+        for t in (0..ASLEEP_EXEMPT_MS).step_by(15_000) {
             assert_eq!(c.step_health(h, t), Owner::C6);
         }
     }
 
     #[test]
+    fn asleep_exemption_is_bounded_and_void_while_recording() {
+        // Stale ASLEEP (link dead ever since): an outage after all.
+        let asleep_old = link_snap(Some(ASLEEP_EXEMPT_MS + 1), Some("ASLEEP"));
+        assert!(car_link_down(Some(&asleep_old), false));
+        // Recent ASLEEP but clips are being written: the car is awake, so an outage.
+        let asleep_recent = link_snap(Some(2 * 60_000), Some("ASLEEP"));
+        assert!(car_link_down(Some(&asleep_recent), true));
+        // ASLEEP with no age reported: no exemption.
+        let no_age = C6Snapshot { car_sleep_age_at_write_ms: None, ..asleep_recent };
+        assert!(car_link_down(Some(&no_age), false));
+    }
+
+    #[test]
+    fn replug_during_car_link_failback_uses_device_rules() {
+        let mut c = Coordinator::new();
+        c.step_health(LINK_DOWN, 0);
+        c.step_health(LINK_DOWN, CAR_LINK_FAILBACK_MS);
+        assert_eq!(c.reason(), Some(Reason::CarLink));
+        c.mark_absent();
+        assert_eq!(c.reason(), Some(Reason::DeviceDead));
+        // Replugged, alive but parked (link "down"): handed back on device-alive.
+        let t = CAR_LINK_FAILBACK_MS + 1;
+        assert_eq!(c.step_health(LINK_DOWN, t), Owner::Sampler);
+        assert_eq!(c.step_health(LINK_DOWN, t + RETURN_SETTLE_MS), Owner::C6);
+    }
+
+    #[test]
+    fn ble_action_lease_blocks_the_grant_only_while_live() {
+        let l = |holder: &str| {
+            format!(r#"{{"owner":"sampler","holder":"{holder}","boot_id":"b","written_boottime_ms":0,"valid_for_ms":120000}}"#)
+        };
+        assert!(ble_action_lease_live_in(&l("ble-action"), "b", 60_000));
+        assert!(!ble_action_lease_live_in(&l("ble-action"), "b", 120_000));
+        assert!(!ble_action_lease_live_in(&l("telemetry"), "b", 60_000));
+        assert!(!ble_action_lease_live_in(&l("ble-action"), "other", 60_000));
+    }
+
+    #[test]
     fn car_link_down_reads_the_snapshot() {
-        assert!(!car_link_down(Some(&link_snap(Some(5_000), Some("AWAKE")))));
-        assert!(car_link_down(Some(&link_snap(Some(CAR_LINK_STALE_MS + 1), Some("AWAKE")))));
-        assert!(car_link_down(Some(&link_snap(None, None))), "never reached the car");
+        assert!(!car_link_down(Some(&link_snap(Some(5_000), Some("AWAKE"))), false));
+        assert!(car_link_down(Some(&link_snap(Some(CAR_LINK_STALE_MS + 1), Some("AWAKE"))), false));
+        assert!(car_link_down(Some(&link_snap(None, None)), false), "never reached the car");
         // Older supervisor that doesn't report car contact: never "down".
         let legacy = C6Snapshot { car_link_reported: false, ..link_snap(None, None) };
-        assert!(!car_link_down(Some(&legacy)));
+        assert!(!car_link_down(Some(&legacy), false));
     }
 
     #[test]

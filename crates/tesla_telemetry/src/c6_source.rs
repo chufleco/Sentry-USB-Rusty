@@ -70,8 +70,9 @@ pub struct C6Snapshot {
     pub car_link_reported: bool,
     /// Age of the C6's last car contact at write time (None = never).
     pub car_ok_age_at_write_ms: Option<u64>,
-    /// Last vehicle_sleep_status the car reported.
+    /// Last vehicle_sleep_status the car reported, and its age at write.
     pub car_sleep_status: Option<String>,
+    pub car_sleep_age_at_write_ms: Option<u64>,
     /// How old the snapshot FILE is right now. Set by `read_snapshot`; None =
     /// unknown (treated as not-alive by the coordinator).
     pub snapshot_age_ms: Option<u64>,
@@ -120,6 +121,7 @@ impl C6Snapshot {
             car_link_reported: v.get("car_ok_age_ms").is_some(),
             car_ok_age_at_write_ms: v.get("car_ok_age_ms").and_then(|x| x.as_u64()),
             car_sleep_status: v.get("car_sleep_status").and_then(|x| x.as_str()).map(str::to_string),
+            car_sleep_age_at_write_ms: v.get("car_sleep_age_ms").and_then(|x| x.as_u64()),
             snapshot_age_ms: None,
             domains,
         })
@@ -136,6 +138,11 @@ impl C6Snapshot {
     /// Age of the C6's last car contact now (at-write + file age).
     pub fn car_ok_age_ms(&self) -> Option<u64> {
         Some(self.car_ok_age_at_write_ms?.saturating_add(self.snapshot_age_ms.unwrap_or(u64::MAX / 4)))
+    }
+
+    /// Age of the last sleep-status reading now.
+    pub fn car_sleep_age_ms(&self) -> Option<u64> {
+        Some(self.car_sleep_age_at_write_ms?.saturating_add(self.snapshot_age_ms.unwrap_or(u64::MAX / 4)))
     }
 
     /// A domain's age now. Monotonic when the supervisor stamps `age_ms`,
