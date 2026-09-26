@@ -627,13 +627,14 @@ async fn tick(
     last_nudge_notification_at: &mut Option<Instant>,
     c6_link: &mut C6Link,
 ) -> (Duration, Option<BleConfig>) {
-    let cfg = match BleConfig::load() {
+    let mut cfg = match BleConfig::load() {
         Ok(c) => c,
         Err(e) => {
             warn!("failed to load BLE config: {e}");
             return (DISABLED_POLL, None);
         }
     };
+    enforce_backfill_rule(&mut cfg);
 
     // Disabled / unconfigured checks BEFORE the session spawn. The old
     // order ensured the session first, which (a) kept a warm GATT
@@ -1797,7 +1798,7 @@ async fn handle_action_request(
 
     // Same enable/VIN gate as the rest of the daemon — refuse the action
     // if BLE is off so ble-action can fall back.
-    let cfg = match crate::config::BleConfig::load() {
+    let mut cfg = match crate::config::BleConfig::load() {
         Ok(c) => c,
         Err(e) => {
             let _ = req.reply.send(Err(anyhow::anyhow!(
@@ -1806,6 +1807,7 @@ async fn handle_action_request(
             return;
         }
     };
+    enforce_backfill_rule(&mut cfg);
     if !cfg.enabled {
         let _ = req.reply.send(Err(anyhow::anyhow!(
             "BLE is disabled in settings"
@@ -2372,6 +2374,23 @@ struct C6Link {
     /// Consecutive fresh C6 drive readings showing parked (keep-accessory
     /// input while the C6 owns the car; the sampler's own counter is idle).
     parked_obs: u32,
+}
+
+/// C6_BACKFILL (bench side-by-side) only on a proven separate key; on a shared
+/// or unknown key it's refused loudly and the box runs normal one-at-a-time
+/// coordination. Never user-facing: nothing sets it automatically.
+fn enforce_backfill_rule(cfg: &mut BleConfig) {
+    if cfg.c6_backfill && !sentryusb_tesla_ble::c6_backfill::backfill_allowed() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            error!(
+                "C6_BACKFILL=1 REFUSED: the C6 is not proven to hold a different key from this Pi \
+                 (shared or unknown). Two signers on one key desync the car. Running normal \
+                 one-at-a-time C6 coordination instead."
+            );
+        }
+        cfg.c6_backfill = false;
+    }
 }
 
 /// Keep-accessory sender for the current owner. None = nobody can send now

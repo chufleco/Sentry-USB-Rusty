@@ -697,7 +697,9 @@ fn load_config() -> Result<(String, Option<String>)> {
 /// mode). Parsed with the same config crate + lookup the telemetry daemon uses.
 fn c6_owns_link() -> bool {
     match sentryusb_config::parse_file(sentryusb_config::find_config_path()) {
-        Ok((active, commented)) => c6_owns_link_in(&active, &commented),
+        Ok((active, commented)) => {
+            c6_owns_link_in(&active, &commented, sentryusb_tesla_ble::c6_backfill::backfill_allowed())
+        }
         Err(_) => false,
     }
 }
@@ -811,15 +813,18 @@ fn c6_blocks_direct() -> bool {
     }
 }
 
+/// `backfill_ok`: C6_BACKFILL only counts on a proven separate key; on a
+/// shared or unknown key it's ignored (one-at-a-time coordination).
 fn c6_owns_link_in(
     active: &sentryusb_config::SetupConfig,
     commented: &sentryusb_config::SetupConfig,
+    backfill_ok: bool,
 ) -> bool {
     let get = |k| sentryusb_config::get_config_value(active, commented, k);
     let primary = get("TELEMETRY_SOURCE").is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"));
     let backfill = get("C6_BACKFILL")
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"));
-    primary && !backfill
+    primary && !(backfill && backfill_ok)
 }
 
 fn unquote(s: &str) -> String {
@@ -867,12 +872,23 @@ mod tests {
         assert_eq!(direct_ble_decision(true, true, Some("garbage"), "b", 1), DirectBle::Block);
     }
 
-    fn owns(conf: &str) -> bool {
+    fn owns_with(conf: &str, backfill_ok: bool) -> bool {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("c.conf");
         std::fs::write(&p, conf).unwrap();
         let (a, c) = sentryusb_config::parse_file(p.to_str().unwrap()).unwrap();
-        c6_owns_link_in(&a, &c)
+        c6_owns_link_in(&a, &c, backfill_ok)
+    }
+
+    fn owns(conf: &str) -> bool {
+        owns_with(conf, true)
+    }
+
+    #[test]
+    fn backfill_is_ignored_unless_the_key_is_proven_separate() {
+        let conf = "export TELEMETRY_SOURCE=c6_primary\nexport C6_BACKFILL=1\n";
+        assert!(owns_with(conf, false), "shared/unknown key: C6 still owns, no direct fallback");
+        assert!(!owns_with(conf, true), "separate key: bench side-by-side");
     }
 
     #[test]
