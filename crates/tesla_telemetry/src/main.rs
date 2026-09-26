@@ -687,7 +687,12 @@ async fn tick(
         let prev = c6_link.coord.owner();
         let health = c6_coord::Health {
             device_alive: c6_coord::c6_alive(snap.as_ref()),
-            car_link_down: c6_coord::car_link_down(snap.as_ref(), usb_watch::observe() == CarState::Awake),
+            // Known awake: recording clips, or a keep-awake/archive holds it up
+            // (an archive unplugs the gadget, so clips alone can't show that).
+            car_link_down: c6_coord::car_link_down(
+                snap.as_ref(),
+                usb_watch::observe() == CarState::Awake || lock::keep_awake_requested(),
+            ),
         };
         let owner = c6_link.coord.step_health(health, now);
         if owner != prev {
@@ -2557,6 +2562,17 @@ fn sentry_from_c6_str(s: &str) -> Option<sample::SentryMode> {
     })
 }
 
+/// Parked evidence from one C6 drive reading: P, or an explicit Unknown
+/// (HW3 parked) WITH a reported ~zero drive power. A missing shift or missing
+/// power is no evidence (keep-accessory OFF must not fire on a sparse frame).
+fn c6_drive_parked(shift: Option<sample::ShiftState>, power: Option<f64>) -> bool {
+    match shift {
+        Some(sample::ShiftState::Park) => true,
+        Some(sample::ShiftState::Unknown) => power.is_some_and(|p| p.abs() < 1.0),
+        _ => false,
+    }
+}
+
 /// Fresh C6 value for `domain` not yet written as a row, else None.
 fn c6_new_value<'a>(
     snap: Option<&'a c6_source::C6Snapshot>,
@@ -2600,13 +2616,7 @@ async fn c6_owned_tick(
             any = true;
         }
         shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
-        // Parked = P, or Unknown (HW3 parked) with ~zero drive power.
-        let power = d.fields.get("power").and_then(|v| v.as_f64()).unwrap_or(0.0);
-        let parked = match shift {
-            Some(sample::ShiftState::Park) => true,
-            Some(sample::ShiftState::Unknown) | None => power.abs() < 1.0,
-            _ => false,
-        };
+        let parked = c6_drive_parked(shift, d.fields.get("power").and_then(|v| v.as_f64()));
         link.parked_obs = if parked { link.parked_obs.saturating_add(1) } else { 0 };
         mark.push(("drive", d.updated_at_ms));
     } else if c6_source::decide_domain(snap, "drive", now_wall) != c6_source::Source::C6 {
@@ -2747,6 +2757,17 @@ mod c6_link_tests {
 #[cfg(test)]
 mod keep_accessory_route_tests {
     use super::*;
+
+    #[test]
+    fn c6_parked_evidence_needs_a_real_reading() {
+        use sample::ShiftState::*;
+        assert!(c6_drive_parked(Some(Park), None));
+        assert!(c6_drive_parked(Some(Unknown), Some(0.0)));
+        assert!(!c6_drive_parked(Some(Unknown), None), "no power field");
+        assert!(!c6_drive_parked(Some(Unknown), Some(12.0)), "moving");
+        assert!(!c6_drive_parked(None, Some(0.0)), "no shift field");
+        assert!(!c6_drive_parked(Some(Drive), Some(0.0)));
+    }
 
     #[test]
     fn owner_decides_who_sends_keep_accessory() {
