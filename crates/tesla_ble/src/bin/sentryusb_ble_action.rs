@@ -218,7 +218,7 @@ enum IpcError {
 fn c6_primary_configured() -> bool {
     sentryusb_config::parse_file(sentryusb_config::find_config_path())
         .ok()
-        .and_then(|(a, c)| sentryusb_config::get_config_value(&a, &c, "TELEMETRY_SOURCE"))
+        .and_then(|(a, _c)| a.get("TELEMETRY_SOURCE").cloned()) // active only
         .is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
 }
 
@@ -943,9 +943,11 @@ fn c6_owns_link_in(
     commented: &sentryusb_config::SetupConfig,
     backfill_ok: bool,
 ) -> bool {
-    let get = |k| sentryusb_config::get_config_value(active, commented, k);
-    let primary = get("TELEMETRY_SOURCE").is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"));
-    let backfill = get("C6_BACKFILL")
+    // ACTIVE lines only: commenting the selector out disables it (matches the
+    // telemetry daemon's BleConfig::load). `commented` is intentionally ignored.
+    let _ = commented;
+    let primary = active.get("TELEMETRY_SOURCE").is_some_and(|v| v.trim().eq_ignore_ascii_case("c6_primary"));
+    let backfill = active.get("C6_BACKFILL")
         .is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"));
     primary && !(backfill && backfill_ok)
 }
@@ -1040,7 +1042,9 @@ mod tests {
     fn c6_guard_follows_the_daemon_parser() {
         assert!(!owns("export TESLA_BLE_VIN=X\n"));
         assert!(owns("export TELEMETRY_SOURCE='c6_primary'\n"));
-        assert!(owns("#export TELEMETRY_SOURCE=c6_primary\n"));
+        // Commenting the selector out DISABLES it (active-line only) — a commented
+        // value must not keep C6 mode on.
+        assert!(!owns("#export TELEMETRY_SOURCE=c6_primary\n"));
         assert!(!owns("export TELEMETRY_SOURCE=sampler\n#export TELEMETRY_SOURCE=c6_primary\n"));
         assert!(!owns("export TELEMETRY_SOURCE=c6_primary\nexport C6_BACKFILL=1\n"));
     }

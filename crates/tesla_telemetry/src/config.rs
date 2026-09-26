@@ -180,12 +180,16 @@ impl BleConfig {
 
         // Telemetry source selector. Only "c6_primary" flips the sampler to
         // prefer the C6; anything else (incl. unset) keeps the BLE-only path.
-        let telemetry_source = sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE");
+        // ACTIVE lines only (not commented): commenting `TELEMETRY_SOURCE` /
+        // `C6_BACKFILL` is how a user disables them, so a commented value must
+        // NOT keep the mode on. (get_config_value's commented fallback is right
+        // for a defaulted key, wrong for an on/off selector.)
+        let telemetry_source = active.get("TELEMETRY_SOURCE").cloned();
         let telemetry_source_set = telemetry_source.is_some();
         let c6_primary = telemetry_source
             .map(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
             .unwrap_or(false);
-        let c6_backfill = sentryusb_config::get_config_value(&active, &commented, "C6_BACKFILL")
+        let c6_backfill = active.get("C6_BACKFILL")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"))
             .unwrap_or(false);
         // Loopback only: this carries signed car commands.

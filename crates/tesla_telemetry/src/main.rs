@@ -414,11 +414,13 @@ async fn main() -> Result<()> {
             _ = sigterm.recv() => {
                 info!("SIGTERM received, releasing radio and exiting");
                 if held_radio { release_radio().await; }
+                c6_clear_lease_on_exit();
                 return Ok(());
             }
             _ = sigint.recv() => {
                 info!("SIGINT received, releasing radio and exiting");
                 if held_radio { release_radio().await; }
+                c6_clear_lease_on_exit();
                 return Ok(());
             }
             _ = sigusr1.recv() => {
@@ -2432,6 +2434,19 @@ fn keep_accessory_via(c6_owns: bool, c6_granted: bool, have_session: bool) -> Op
     } else {
         None
     }
+}
+
+/// On shutdown, remove our C6 lease so the supervisor stops honouring any
+/// owner:c6 grant we wrote. Closes two shared-key hazards on restart/OTA:
+///   * OTA that swaps in a STOCK sampler (no coordination) while a grant is
+///     still live: the supervisor would keep polling the car for up to
+///     GRANT_VALID_MS while the stock Pi also signs — two signers. No lease =>
+///     supervisor parks the C6 => only the Pi signs.
+///   * A stale owner:sampler lease that would otherwise block ble-action's
+///     fallback nudge for LEASE_VALID_MS while the daemon is down.
+/// Only touches the file we own (best-effort); our binary re-grants on restart.
+fn c6_clear_lease_on_exit() {
+    let _ = std::fs::remove_file(c6_coord::LEASE_PATH);
 }
 
 /// Stand the sampler down and, once our car link is really closed, grant the
