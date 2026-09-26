@@ -213,7 +213,7 @@ enum IpcError {
 /// c6_primary = refuse (a slow daemon's session plus ours = two Pi signers,
 /// and the C6 may hold the same key).
 fn no_answer_policy<T>(r: Result<T, IpcError>) -> Result<T, IpcFail> {
-    no_answer_policy_with(r, c6_owns_link())
+    no_answer_policy_with(r, c6_owns_link() && std::path::Path::new(C6_DEVICE).exists())
 }
 
 fn no_answer_policy_with<T>(r: Result<T, IpcError>, c6_mode: bool) -> Result<T, IpcFail> {
@@ -267,7 +267,7 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
     // Send the verb as one line.
     let cmd = format!("{}\n", verb);
     if let Err(e) = write_half.write_all(cmd.as_bytes()).await {
-        return Err(IpcError::Unavailable(format!(
+        return Err(IpcError::NoAnswer(format!(
             "writing verb: {}",
             e
         )));
@@ -512,7 +512,7 @@ async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
 
     let (read_half, mut write_half) = stream.into_split();
     if let Err(e) = write_half.write_all(b"session-info\n").await {
-        return Err(IpcError::Unavailable(format!("writing verb: {}", e)));
+        return Err(IpcError::NoAnswer(format!("writing verb: {}", e)));
     }
 
     let mut reader = BufReader::new(read_half);
@@ -641,7 +641,7 @@ async fn state_query_via_ipc(verb: &str) -> Result<String, IpcError> {
 
     let (read_half, mut write_half) = stream.into_split();
     if let Err(e) = write_half.write_all(format!("{verb}\n").as_bytes()).await {
-        return Err(IpcError::Unavailable(format!("writing verb: {}", e)));
+        return Err(IpcError::NoAnswer(format!("writing verb: {}", e)));
     }
 
     let mut reader = BufReader::new(read_half);
@@ -763,15 +763,39 @@ enum DirectBle {
 
 /// Pure: may this process open its own session? `lease` = current lease file.
 fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, boot_id: &str, now_ms: u64) -> DirectBle {
-    if !c6_present {
-        return DirectBle::Stock;
-    }
     // A lease we can't parse at all: assume a live grant (refuse).
     let parsed = match lease.map(serde_json::from_str::<serde_json::Value>) {
         None => None,
         Some(Ok(v)) => Some(v),
-        Some(Err(_)) => return DirectBle::Block,
+        Some(Err(_)) if c6_present => return DirectBle::Block,
+        Some(Err(_)) => None,
     };
+    let live = |v: &serde_json::Value, owner: &str, extra_ms: u64| {
+        v.get("owner").and_then(|x| x.as_str()) == Some(owner)
+            && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+            && match (
+                v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+                v.get("valid_for_ms").and_then(|x| x.as_u64()),
+            ) {
+                (Some(w), Some(valid)) => now_ms < w.saturating_add(valid).saturating_add(extra_ms),
+                _ => true,
+            }
+    };
+    // The telemetry daemon itself holds the car (it just didn't answer us):
+    // a direct session here would be a second Pi signer.
+    if parsed.as_ref().is_some_and(|v| {
+        live(v, "sampler", 0) && v.get("holder").and_then(|x| x.as_str()) == Some("telemetry")
+    }) {
+        return DirectBle::Block;
+    }
+    if !c6_present {
+        // Symlink gone (unplug or re-enumeration): a grant live or just expired
+        // may still cover a powered chip mid-command, so wait it out.
+        if parsed.as_ref().is_some_and(|v| live(v, "c6", C6_CLAIM_SETTLE_MS)) {
+            return DirectBle::Block;
+        }
+        return DirectBle::Stock;
+    }
     let grant_now = parsed.as_ref().is_some_and(|v| {
         v.get("owner").and_then(|x| x.as_str()) == Some("c6")
             && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
@@ -822,14 +846,15 @@ fn boottime_ms() -> Option<u64> {
 /// lease (supervisor holds + parks) and go direct.
 fn c6_direct_path() -> DirectBle {
     let present = std::path::Path::new(C6_DEVICE).exists();
-    if !present {
+    // No C6 and no lease at all: stock, untouched.
+    if !present && !std::path::Path::new(C6_LEASE_PATH).exists() {
         return DirectBle::Stock;
     }
     let (Some(boot), Some(now)) = (
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()),
         boottime_ms(),
     ) else {
-        return DirectBle::Block; // can't evaluate a lease with a C6 present: refuse
+        return DirectBle::Block; // can't evaluate a lease: refuse
     };
     let owns = c6_owns_link();
     // Read-decide-write under the lease lock the daemon also takes, so its
@@ -948,7 +973,10 @@ mod tests {
 
     #[test]
     fn c6_absent_or_flag_off_is_stock_behaviour() {
-        assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
+        assert_eq!(direct_ble_decision(true, false, None, "b", 1), DirectBle::Stock);
+        assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Stock);
+        // Symlink gone but a grant is live / just expired: a powered chip may be mid-command.
+        assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Block);
         assert_eq!(direct_ble_decision(false, true, None, "b", 1), DirectBle::Stock);
         // Flag flipped off while a grant is still live: never direct.
         assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::RouteC6);
@@ -964,8 +992,12 @@ mod tests {
         // Grant long expired (daemon down), no lease, sampler lease, other boot: claim + go.
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Claim);
         assert_eq!(direct_ble_decision(true, true, None, "b", 1), DirectBle::Claim);
-        let sampler = r#"{"owner":"sampler","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
+        let sampler = r#"{"owner":"sampler","holder":"ble-action","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
         assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 1), DirectBle::Claim);
+        // The daemon's own live lease: it holds the car, so no second Pi session.
+        let daemon = r#"{"owner":"sampler","holder":"telemetry","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
+        assert_eq!(direct_ble_decision(true, true, Some(daemon), "b", 1), DirectBle::Block);
+        assert_eq!(direct_ble_decision(false, false, Some(daemon), "b", 1), DirectBle::Block);
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "old", 1), DirectBle::Claim);
         // Unparseable lease: assume a live grant.
         assert_eq!(direct_ble_decision(true, true, Some("garbage"), "b", 1), DirectBle::Block);

@@ -727,6 +727,12 @@ async fn tick(
             c6_coord::Owner::Sampler => {
                 c6_link.parked_obs = 0; // C6 evidence is stale now
                 c6_link.c6_nudge_failing = false; // the Pi nudges now
+                if prev == c6_coord::Owner::C6 {
+                    // A C6 nudge failure may have pushed the next nudge a full
+                    // interval out; the Pi should nudge as soon as it can.
+                    *next_nudge_due_at = None;
+                    *nudge_retry_count = 0;
+                }
             }
         }
     }
@@ -2501,11 +2507,6 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     if !link.grant_live && c6_coord::disk_grant_live() {
         link.grant_live = true;
     }
-    // C6 unplugged: nothing left on the other side to finish a command.
-    if !c6_coord::c6_present() {
-        link.grant_live = false;
-        link.grant_revoked_at = None;
-    }
     let now = c6_coord::boottime_ms().unwrap_or(0);
     if link.grant_live {
         link.grant_live = false;
@@ -2515,8 +2516,9 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     let settle_until = link
         .grant_revoked_at
         .map(|t| t.saturating_add(c6_coord::CLAIM_SETTLE_MS))
-        // Unplugged C6: nothing left to finish a command, no settle.
-        .max(c6_coord::disk_settle_until().filter(|_| c6_coord::c6_present()))
+        // Kept even if the C6 symlink is gone: a re-enumerating chip can still
+        // be powered and mid-command.
+        .max(c6_coord::disk_settle_until())
         .filter(|&t| now < t);
     if !c6_coord::write_lease_settling(c6_coord::Owner::Sampler, settle_until) {
         return false;
