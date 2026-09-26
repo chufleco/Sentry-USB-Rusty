@@ -363,6 +363,20 @@ pub fn disk_grant_live() -> bool {
         .is_ok_and(|l| grant_live_in(&l, &boot, now.saturating_sub(CLAIM_SETTLE_MS)))
 }
 
+/// Pure: the settle deadline recorded in a lease from this boot, if any.
+pub fn settle_until_in(lease: &str, boot_id: &str) -> Option<u64> {
+    let v = serde_json::from_str::<serde_json::Value>(lease).ok()?;
+    (v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id))
+        .then(|| v.get("settle_until_ms").and_then(|x| x.as_u64()))
+        .flatten()
+}
+
+/// The settle deadline on disk (e.g. from before a daemon restart).
+pub fn disk_settle_until() -> Option<u64> {
+    let boot = boot_id()?;
+    settle_until_in(&std::fs::read_to_string(LEASE_PATH).ok()?, &boot)
+}
+
 /// A live sampler lease (any holder) is on disk, e.g. from a previous run.
 pub fn disk_sampler_lease_live() -> bool {
     let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return true };
@@ -409,6 +423,12 @@ pub fn ble_action_holds_car() -> bool {
 /// be written: the caller must then NOT connect to the car (a stale grant may
 /// still be live for the supervisor).
 pub fn write_lease(owner: Owner) -> bool {
+    write_lease_settling(owner, None)
+}
+
+/// Sampler lease carrying the takeover settle deadline (boottime ms), so a
+/// daemon restart mid-settle still waits it out.
+pub fn write_lease_settling(owner: Owner, settle_until: Option<u64>) -> bool {
     let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
     let valid = match owner {
         Owner::Sampler => LEASE_VALID_MS,
@@ -419,7 +439,14 @@ pub fn write_lease(owner: Owner) -> bool {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = path.with_extension("json.tmp");
-    let ok = std::fs::write(&tmp, lease_json(owner, &boot, now, valid))
+    let mut body = lease_json(owner, &boot, now, valid);
+    if let Some(t) = settle_until {
+        if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) {
+            v["settle_until_ms"] = serde_json::json!(t);
+            body = v.to_string();
+        }
+    }
+    let ok = std::fs::write(&tmp, body)
         .and_then(|()| std::fs::rename(&tmp, path))
         .is_ok();
     if !ok {
@@ -721,6 +748,15 @@ mod tests {
             drop(a);
             assert_eq!(libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB), 0, "free after drop");
         }
+    }
+
+    #[test]
+    fn settle_deadline_round_trips_through_the_lease() {
+        let mut v: serde_json::Value = serde_json::from_str(&lease_json(Owner::Sampler, "b", 0, 1)).unwrap();
+        v["settle_until_ms"] = serde_json::json!(35_000);
+        assert_eq!(settle_until_in(&v.to_string(), "b"), Some(35_000));
+        assert_eq!(settle_until_in(&v.to_string(), "other"), None, "other boot");
+        assert_eq!(settle_until_in(&lease_json(Owner::Sampler, "b", 0, 1), "b"), None);
     }
 
     #[test]
