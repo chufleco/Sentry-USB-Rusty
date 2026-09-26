@@ -12,8 +12,6 @@
 //! C6's telemetry into the same `Sample` fields the BLE path produces. It does
 //! NOT touch the tick loop — the selector wiring lands in a second step.
 
-#![allow(dead_code)] // wired into the tick loop in the follow-up increment.
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,13 +42,34 @@ pub const HEARTBEAT_DEAD_MS: u64 = 16_000;
 /// C6-primary soak it *is* the C6's real production miss rate.
 pub static FALLBACK_COUNT: AtomicU64 = AtomicU64::new(0);
 
-/// Parsed supervisor snapshot: whole-device health plus per-domain snapshots.
+/// One domain's cached payload plus its freshness stamps.
 #[derive(Debug, Clone)]
+pub struct DomainEntry {
+    pub fields: Map<String, Value>,
+    /// Wall-clock unix ms the supervisor received it. Legacy freshness only:
+    /// the Pi has no RTC, so this steps when NTP corrects.
+    pub updated_at_ms: u64,
+    /// Monotonic age at snapshot-write time (newer supervisors). Preferred.
+    pub age_at_write_ms: Option<u64>,
+}
+
+/// Parsed supervisor snapshot: whole-device health plus per-domain snapshots.
+#[derive(Debug, Clone, Default)]
 pub struct C6Snapshot {
     pub healthy: bool,
+    /// Heartbeat age at write time; add `snapshot_age_ms` for age now.
     pub last_heartbeat_age_ms: Option<u64>,
-    /// domain → (fields, unix-ms the C6 last delivered it).
-    pub domains: HashMap<String, (Map<String, Value>, u64)>,
+    pub serial_connected: Option<bool>,
+    pub provisioned: Option<bool>,
+    /// False when the supervisor's poll loop is off (C6 not talking to the car).
+    pub polling_enabled: Option<bool>,
+    /// Kernel boot id + CLOCK_BOOTTIME ms at write (newer supervisors).
+    pub boot_id: Option<String>,
+    pub written_boottime_ms: Option<u64>,
+    /// How old the snapshot FILE is right now. Set by `read_snapshot`; None =
+    /// unknown (treated as not-alive by the coordinator).
+    pub snapshot_age_ms: Option<u64>,
+    pub domains: HashMap<String, DomainEntry>,
 }
 
 impl C6Snapshot {
@@ -80,20 +99,65 @@ impl C6Snapshot {
                     Some(f) => f.clone(),
                     None => continue, // no payload => unusable
                 };
-                domains.insert(name.clone(), (fields, updated_at_ms));
+                let age_at_write_ms = obj.get("age_ms").and_then(|x| x.as_u64());
+                domains.insert(name.clone(), DomainEntry { fields, updated_at_ms, age_at_write_ms });
             }
         }
-        Some(C6Snapshot { healthy, last_heartbeat_age_ms, domains })
+        Some(C6Snapshot {
+            healthy,
+            last_heartbeat_age_ms,
+            serial_connected: v.get("serial_connected").and_then(|x| x.as_bool()),
+            provisioned: v.get("provisioned").and_then(|x| x.as_bool()),
+            polling_enabled: v.get("polling_enabled").and_then(|x| x.as_bool()),
+            boot_id: v.get("boot_id").and_then(|x| x.as_str()).map(str::to_string),
+            written_boottime_ms: v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+            snapshot_age_ms: None,
+            domains,
+        })
+    }
+
+    /// Heartbeat age now: age at write plus how old the file is. A snapshot
+    /// that stopped being rewritten (supervisor dead) keeps ageing here
+    /// instead of freezing at its last small value.
+    pub fn heartbeat_age_ms(&self) -> Option<u64> {
+        let at_write = self.last_heartbeat_age_ms?;
+        Some(at_write.saturating_add(self.snapshot_age_ms.unwrap_or(0)))
+    }
+
+    /// A domain's age now. Monotonic when the supervisor stamps `age_ms`,
+    /// else the legacy wall-clock difference against `now_wall_ms`.
+    pub fn domain_age_ms(&self, domain: &str, now_wall_ms: u64) -> Option<u64> {
+        let d = self.domains.get(domain)?;
+        match (d.age_at_write_ms, self.snapshot_age_ms, self.written_boottime_ms) {
+            (Some(a), Some(s), Some(_)) => Some(a.saturating_add(s)),
+            _ => Some(now_wall_ms.saturating_sub(d.updated_at_ms)),
+        }
     }
 }
 
-/// Read + parse the current supervisor snapshot from tmpfs. Returns None if
-/// the file is missing or unparseable — the caller treats that as "C6
-/// unavailable" and polls BLE. Cheap (~4 KB tmpfs read); the tick calls it once
-/// per cycle and reuses the result across domains.
+/// Read + parse the current supervisor snapshot from tmpfs, stamping how old
+/// the file is. Returns None if missing or unparseable (= C6 unavailable).
+/// Cheap (~4 KB tmpfs read); the tick reads it once per cycle.
 pub fn read_snapshot() -> Option<C6Snapshot> {
     let json = std::fs::read_to_string(SNAPSHOT_PATH).ok()?;
-    C6Snapshot::parse(&json)
+    let mut snap = C6Snapshot::parse(&json)?;
+    snap.snapshot_age_ms = match (&snap.boot_id, snap.written_boottime_ms) {
+        // Same boot: CLOCK_BOOTTIME difference, immune to wall-clock steps.
+        (Some(b), Some(w)) => {
+            if crate::c6_coord::boot_id().as_deref() == Some(b.as_str()) {
+                crate::c6_coord::boottime_ms().and_then(|now| now.checked_sub(w))
+            } else {
+                None
+            }
+        }
+        // Legacy supervisor: file mtime. A backward clock step reads as age 0
+        // (C6 presumed alive), the direction that never double-drives the key.
+        _ => std::fs::metadata(SNAPSHOT_PATH)
+            .and_then(|m| m.modified())
+            .ok()
+            .map(|t| std::time::SystemTime::now().duration_since(t).map(|d| d.as_millis() as u64).unwrap_or(0)),
+    };
+    Some(snap)
 }
 
 /// Why the sampler is (or isn't) using the C6 for a domain this tick.
@@ -150,7 +214,7 @@ pub fn decide(
         None => return Source::FallbackBle(FailReason::NoSnapshot),
     };
     // Whole-device: dead heartbeats or an explicit unhealthy flag fails all.
-    if let Some(age) = snap.last_heartbeat_age_ms {
+    if let Some(age) = snap.heartbeat_age_ms() {
         if age > HEARTBEAT_DEAD_MS {
             return Source::FallbackBle(FailReason::HeartbeatDead);
         }
@@ -159,12 +223,11 @@ pub fn decide(
         return Source::FallbackBle(FailReason::Unhealthy);
     }
     // Per-domain freshness against a generous SLA.
-    let (_, updated_at_ms) = match snap.domains.get(domain) {
-        Some(d) => d,
+    let age_ms = match snap.domain_age_ms(domain, now_ms) {
+        Some(a) => a,
         None => return Source::FallbackBle(FailReason::DomainMissing),
     };
     let sla_ms = cadence_secs.saturating_mul(sla_multiplier).saturating_mul(1000);
-    let age_ms = now_ms.saturating_sub(*updated_at_ms);
     if age_ms > sla_ms {
         return Source::FallbackBle(FailReason::Stale);
     }
@@ -181,6 +244,7 @@ fn domain_policy(domain: &str) -> (u64, u64) {
         "charge" => (60, CHARGE_SLA_MULTIPLIER),
         "closures" => (60, SLA_MULTIPLIER),
         "tires" => (300, SLA_MULTIPLIER),
+        "location" => (30, SLA_MULTIPLIER),
         _ => (60, SLA_MULTIPLIER),
     }
 }
@@ -300,8 +364,11 @@ mod tests {
 
     fn snap(healthy: bool, hb_age: Option<u64>, domain: &str, updated_at_ms: u64) -> C6Snapshot {
         let mut domains = HashMap::new();
-        domains.insert(domain.to_string(), (Map::new(), updated_at_ms));
-        C6Snapshot { healthy, last_heartbeat_age_ms: hb_age, domains }
+        domains.insert(
+            domain.to_string(),
+            DomainEntry { fields: Map::new(), updated_at_ms, age_at_write_ms: None },
+        );
+        C6Snapshot { healthy, last_heartbeat_age_ms: hb_age, domains, ..Default::default() }
     }
 
     #[test]
@@ -361,10 +428,27 @@ mod tests {
         let s = C6Snapshot::parse(json).unwrap();
         assert!(s.healthy);
         assert_eq!(s.last_heartbeat_age_ms, Some(1200));
-        let (fields, ts) = s.domains.get("charge").unwrap();
-        assert_eq!(*ts, 170000);
-        assert!(fields.get("updated_at_ms").is_none()); // not part of fields payload
-        assert_eq!(fields.get("battery_level").unwrap().as_i64(), Some(59));
+        let d = s.domains.get("charge").unwrap();
+        assert_eq!(d.updated_at_ms, 170000);
+        assert!(d.fields.get("updated_at_ms").is_none()); // not part of fields payload
+        assert_eq!(d.fields.get("battery_level").unwrap().as_i64(), Some(59));
+    }
+
+    #[test]
+    fn stale_file_ages_heartbeat_and_domains_monotonically() {
+        // Supervisor died 60s ago: the file still says hb 1s old, but the file
+        // age must push the heartbeat past dead, and domain age uses age_ms.
+        let json = r#"{"healthy":true,"last_heartbeat_age_ms":1000,"boot_id":"b","written_boottime_ms":5,
+            "domains":{"charge":{"updated_at_ms":999999999,"age_ms":2000,"fields":{"charging_state":"Charging"}}}}"#;
+        let mut s = C6Snapshot::parse(json).unwrap();
+        s.snapshot_age_ms = Some(60_000);
+        assert_eq!(s.heartbeat_age_ms(), Some(61_000));
+        // wall clock far BEHIND updated_at (backward NTP step) is ignored.
+        assert_eq!(s.domain_age_ms("charge", 0), Some(62_000));
+        assert_eq!(
+            decide(Some(&s), "charge", 60, 3, 0),
+            Source::FallbackBle(FailReason::HeartbeatDead)
+        );
     }
 
     #[test]

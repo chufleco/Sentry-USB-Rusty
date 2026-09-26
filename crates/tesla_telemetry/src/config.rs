@@ -46,7 +46,16 @@ pub struct BleConfig {
     /// normal box polls BLE exactly as before; this only activates on a
     /// C6-equipped box that opts in for the C6-primary soak.
     pub c6_primary: bool,
+    /// Bench/soak only (`C6_BACKFILL=1`): per-domain BLE backfill beside the
+    /// C6. Both radios talk to the car, so never with a shared key.
+    pub c6_backfill: bool,
+    /// C6 supervisor REST address; car actions route here while the C6 owns
+    /// the link (`C6_SUPERVISOR_API`, loopback only).
+    pub c6_supervisor_api: String,
 }
+
+/// Default C6 supervisor API address (matches its `api_bind` default).
+pub const DEFAULT_C6_SUPERVISOR_API: &str = "127.0.0.1:8787";
 
 /// Default keep-awake nudge interval in seconds.
 pub const DEFAULT_KEEP_AWAKE_INTERVAL_SECS: u64 = 60;
@@ -62,6 +71,8 @@ impl Default for BleConfig {
             experimental: false,
             keep_awake_interval_secs: DEFAULT_KEEP_AWAKE_INTERVAL_SECS,
             c6_primary: false,
+            c6_backfill: false,
+            c6_supervisor_api: DEFAULT_C6_SUPERVISOR_API.to_string(),
         }
     }
 }
@@ -168,6 +179,14 @@ impl BleConfig {
         let c6_primary = sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE")
             .map(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
             .unwrap_or(false);
+        let c6_backfill = sentryusb_config::get_config_value(&active, &commented, "C6_BACKFILL")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"))
+            .unwrap_or(false);
+        // Loopback only: this carries signed car commands.
+        let c6_supervisor_api = sentryusb_config::get_config_value(&active, &commented, "C6_SUPERVISOR_API")
+            .map(|v| v.trim().to_string())
+            .filter(|v| v.starts_with("127.0.0.1:") || v.starts_with("localhost:"))
+            .unwrap_or_else(|| DEFAULT_C6_SUPERVISOR_API.to_string());
 
         Ok(Self {
             enabled,
@@ -178,6 +197,8 @@ impl BleConfig {
             experimental,
             keep_awake_interval_secs,
             c6_primary,
+            c6_backfill,
+            c6_supervisor_api,
         })
     }
 }

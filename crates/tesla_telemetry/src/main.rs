@@ -23,6 +23,7 @@ mod db;
 mod diag_log;
 mod keep_accessory;
 mod lock;
+mod c6_coord;
 mod c6_source;
 mod sample;
 mod sample_ble;
@@ -149,9 +150,10 @@ impl<T: Copy> TimedReading<T> {
     /// some time ago). Backdates `at` so the gate's freshness check ages it from
     /// when the reading was actually valid — NOT from now — so a stale C6 charge
     /// state can't masquerade as fresh and defeat the keep-awake gate.
-    fn at_age(value: T, age: Duration) -> Self {
-        let at = Instant::now().checked_sub(age).unwrap_or_else(Instant::now);
-        Self { value, at }
+    /// None when `age` predates the monotonic clock's origin: an age we can't
+    /// represent must not collapse to "now" and read as fresh.
+    fn at_age(value: T, age: Duration) -> Option<Self> {
+        Instant::now().checked_sub(age).map(|at| Self { value, at })
     }
 
     /// The value if read within `max_age`, else None (treat as unread).
@@ -378,6 +380,8 @@ async fn main() -> Result<()> {
     let mut next_nudge_due_at: Option<Instant> = None;
     let mut nudge_retry_count: u32 = 0;
     let mut last_nudge_notification_at: Option<Instant> = None;
+    // Shared-key handoff with the ESP32-C6 (TELEMETRY_SOURCE=c6_primary only).
+    let mut c6_link = C6Link::default();
 
     // SIGTERM handler — release the radio on shutdown so the iOS
     // GATT daemon can come back up cleanly.
@@ -448,6 +452,7 @@ async fn main() -> Result<()> {
                     req,
                     &mut held_radio,
                     &mut ble_session,
+                    &c6_link,
                 ).await;
             }
             _ = tokio::time::sleep_until(next_tick_at) => {
@@ -470,6 +475,7 @@ async fn main() -> Result<()> {
                     &mut next_nudge_due_at,
                     &mut nudge_retry_count,
                     &mut last_nudge_notification_at,
+                    &mut c6_link,
                 ).await;
                 // Keep-Accessory-Power automation runs after each tick
                 // with the freshly-updated signals. Best-effort; gated
@@ -477,7 +483,9 @@ async fn main() -> Result<()> {
                 // a no-op until both are configured. Reuses the config
                 // snapshot the tick already parsed (None = load failed).
                 if let Some(cfg) = cfg {
-                    if let Some(handle) = ble_session.as_ref() {
+                    // No session exists while the C6 owns the car, so this
+                    // is already skipped then; the owner check is belt-and-braces.
+                    if let (Some(handle), false) = (ble_session.as_ref(), c6_link.c6_owns(&cfg)) {
                         keep_accessory::evaluate(
                             &cfg.keep_accessory,
                             &handle.session,
@@ -608,6 +616,7 @@ async fn tick(
     next_nudge_due_at: &mut Option<Instant>,
     nudge_retry_count: &mut u32,
     last_nudge_notification_at: &mut Option<Instant>,
+    c6_link: &mut C6Link,
 ) -> (Duration, Option<BleConfig>) {
     let cfg = match BleConfig::load() {
         Ok(c) => c,
@@ -646,6 +655,57 @@ async fn tick(
         *parked_polls = 0;
         *last_user_presence = None;
         return (DISABLED_POLL, Some(cfg));
+    }
+
+    // Shared-key coordination: decide who may talk to the car BEFORE any
+    // session exists. C6-owned => no Tesla BLE from this process at all.
+    if cfg.c6_primary && !cfg.c6_backfill {
+        let snap = c6_source::read_snapshot();
+        // No boottime => time never advances => stays C6-owned (safe side).
+        let now = c6_coord::boottime_ms().unwrap_or(0);
+        let prev = c6_link.coord.owner();
+        let owner = c6_link.coord.step(c6_coord::c6_alive(snap.as_ref()), now);
+        if owner != prev {
+            info!("C6 coordination: car link owner {} -> {}", prev.as_str(), owner.as_str());
+        }
+        match owner {
+            c6_coord::Owner::C6 => {
+                if let Some(h) = ble_session.take() {
+                    info!("C6 owns the car link: closing the sampler's Tesla BLE session");
+                    h.session.shutdown().await;
+                    tokio::time::sleep(c6_coord::RELEASE_GRACE).await;
+                }
+                if *held_radio {
+                    release_radio().await;
+                    *held_radio = false;
+                }
+                c6_coord::write_lease(c6_coord::Owner::C6);
+                *parked_polls = 0;
+                *last_user_presence = None;
+                let sleep = c6_owned_tick(
+                    conn,
+                    &cfg,
+                    snap.as_ref(),
+                    c6_link,
+                    last_charging_state,
+                    last_sentry_mode,
+                    last_lat,
+                    last_lon,
+                    last_location_name,
+                    next_nudge_due_at,
+                    nudge_retry_count,
+                    last_nudge_notification_at,
+                )
+                .await;
+                return (sleep, Some(cfg));
+            }
+            // Lease first, so the supervisor holds before we connect.
+            c6_coord::Owner::Sampler => c6_coord::write_lease(c6_coord::Owner::Sampler),
+        }
+    } else if !cfg.c6_primary && std::path::Path::new(c6_source::SNAPSHOT_PATH).exists() {
+        // C6 present but flag off: the sampler is the car's only client, so
+        // tell the supervisor to hold (never both on one key).
+        c6_coord::write_lease(c6_coord::Owner::Sampler);
     }
 
     // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
@@ -1087,13 +1147,14 @@ async fn tick(
         };
         let mut shift_state_observed: Option<sample::ShiftState> = None;
         let mut any_call_ran = false;
-        // C6-primary: read the co-processor snapshot once; reused across all
-        // domains this tick. None (flag off, or missing/garbage file) => the
-        // per-domain helpers all short-circuit to false and we poll BLE as
-        // before. Cheap ~4KB tmpfs read.
-        let c6_snap = if cfg.c6_primary { c6_source::read_snapshot() } else { None };
-        // Only stamped when C6-primary; the flag-off path never reads it.
-        let now_ms = if cfg.c6_primary {
+        // Bench/soak backfill only (C6_BACKFILL=1): read the co-processor
+        // snapshot once and let fresh C6 domains skip their BLE poll. Never in
+        // shared-key production, where this tick only runs once the sampler
+        // owns the car (see c6_coord) and polls everything itself.
+        let c6_backfill = cfg.c6_primary && cfg.c6_backfill;
+        let c6_snap = if c6_backfill { c6_source::read_snapshot() } else { None };
+        // Only stamped in backfill mode; every other path never reads it.
+        let now_ms = if c6_backfill {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
@@ -1110,7 +1171,7 @@ async fn tick(
 
         // ── 1. DRIVE (priority) ── shiftState, locationName, odometer.
         if schedule.drive_due(tick_now) {
-            let success = if cfg.c6_primary
+            let success = if c6_backfill
                 && c6_took_drive(&c6_snap, now_ms, &mut sample, &mut shift_state_observed)
             {
                 true
@@ -1205,8 +1266,8 @@ async fn tick(
         }
 
         // ── 2. CLIMATE (every 60s) ──
-        if (cfg.c6_primary || !connect_failed) && schedule.climate_due(tick_now) {
-            let success = if cfg.c6_primary && c6_took_climate(&c6_snap, now_ms, &mut sample) {
+        if (c6_backfill || !connect_failed) && schedule.climate_due(tick_now) {
+            let success = if c6_backfill && c6_took_climate(&c6_snap, now_ms, &mut sample) {
                 true
             } else if connect_failed {
                 false // BLE unreachable this tick (flag-off only; C6 tried above)
@@ -1234,11 +1295,11 @@ async fn tick(
         }
 
         // ── 3. CHARGE (every 60s, or 15s while DC fast charging) ──
-        if (cfg.c6_primary || !connect_failed) && schedule.charge_due(tick_now) {
+        if (c6_backfill || !connect_failed) && schedule.charge_due(tick_now) {
             // Set in the Ok arm when this poll sees DC fast charging; picks
             // the 15s vs 60s next-charge cadence in `mark_charge` below.
             let mut fast_charging = false;
-            let success = if cfg.c6_primary
+            let success = if c6_backfill
                 && c6_took_charge(&c6_snap, now_ms, &mut sample, last_charging_state, &mut fast_charging)
             {
                 true
@@ -1330,8 +1391,8 @@ async fn tick(
         }
 
         // ── 5. TIRES (every 5 min) ──
-        if (cfg.c6_primary || !connect_failed) && schedule.tires_due(tick_now) {
-            let success = if cfg.c6_primary && c6_took_tires(&c6_snap, now_ms, &mut sample) {
+        if (c6_backfill || !connect_failed) && schedule.tires_due(tick_now) {
+            let success = if c6_backfill && c6_took_tires(&c6_snap, now_ms, &mut sample) {
                 true
             } else if connect_failed {
                 false // BLE unreachable this tick (flag-off only; C6 tried above)
@@ -1704,6 +1765,7 @@ async fn handle_action_request(
     req: action_socket::ActionRequest,
     held_radio: &mut bool,
     ble_session: &mut Option<sample_ble::SessionHandle>,
+    c6_link: &C6Link,
 ) {
     let verb = req.verb.clone();
     info!("action_socket: IPC request received — verb={}", verb);
@@ -1729,6 +1791,17 @@ async fn handle_action_request(
         let _ = req.reply.send(Err(anyhow::anyhow!(
             "TESLA_BLE_VIN not configured"
         )));
+        return;
+    }
+
+    // C6 owns the car: route through it, never open our own session.
+    if c6_link.c6_owns(&cfg) {
+        let result = c6_action(&cfg, &verb).await;
+        match &result {
+            Ok(_) => info!("action_socket: verb={} routed via C6", verb),
+            Err(e) => warn!("action_socket: verb={} via C6 failed: {:#}", verb, e),
+        }
+        let _ = req.reply.send(result);
         return;
     }
 
@@ -2127,7 +2200,7 @@ fn c6_took_drive(
 ) -> bool {
     match c6_source::decide_domain(snap.as_ref(), "drive", now_ms) {
         c6_source::Source::C6 => {
-            let (fields, _) = snap.as_ref().unwrap().domains.get("drive").unwrap();
+            let fields = &snap.as_ref().unwrap().domains.get("drive").unwrap().fields;
             let shift = fields
                 .get("shift_state")
                 .and_then(|v| v.as_str())
@@ -2159,7 +2232,7 @@ fn c6_took_drive(
 fn c6_took_climate(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut Sample) -> bool {
     match c6_source::decide_domain(snap.as_ref(), "climate", now_ms) {
         c6_source::Source::C6 => {
-            let (fields, _) = snap.as_ref().unwrap().domains.get("climate").unwrap();
+            let fields = &snap.as_ref().unwrap().domains.get("climate").unwrap().fields;
             if c6_source::apply_climate(fields, sample) {
                 true
             } else {
@@ -2179,7 +2252,8 @@ fn c6_took_charge(
 ) -> bool {
     match c6_source::decide_domain(snap.as_ref(), "charge", now_ms) {
         c6_source::Source::C6 => {
-            let (fields, updated_at) = snap.as_ref().unwrap().domains.get("charge").unwrap();
+            let snap = snap.as_ref().unwrap();
+            let fields = &snap.domains.get("charge").unwrap().fields;
             // charging_state gates keep-awake — if the C6 payload lacks it, fall
             // back to BLE so the gate always gets a fresh authoritative value.
             let cs = match fields.get("charging_state").and_then(|v| v.as_str()) {
@@ -2193,8 +2267,12 @@ fn c6_took_charge(
             // Stamp the keep-awake gate input with the snapshot's REAL age, not
             // now — a C6 value delivered N ms ago must age from then, so a stale
             // "Stopped" can't hold the gate open (or let the car sleep) falsely.
-            let age = std::time::Duration::from_millis(now_ms.saturating_sub(*updated_at));
-            *last_charging_state = Some(TimedReading::at_age(parsed, age));
+            let age = std::time::Duration::from_millis(
+                snap.domain_age_ms("charge", now_ms).unwrap_or(u64::MAX / 2),
+            );
+            if let Some(tr) = TimedReading::at_age(parsed, age) {
+                *last_charging_state = Some(tr);
+            }
             let power = fields.get("charger_power").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
             *fast_charging = parsed.is_active_charging() && power > FAST_CHARGE_THRESHOLD_KW;
             true
@@ -2206,7 +2284,7 @@ fn c6_took_charge(
 fn c6_took_tires(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut Sample) -> bool {
     match c6_source::decide_domain(snap.as_ref(), "tires", now_ms) {
         c6_source::Source::C6 => {
-            let (fields, _) = snap.as_ref().unwrap().domains.get("tires").unwrap();
+            let fields = &snap.as_ref().unwrap().domains.get("tires").unwrap().fields;
             if c6_source::apply_tires(fields, sample) {
                 true
             } else {
@@ -2225,10 +2303,258 @@ mod timed_reading_tests {
     fn at_age_ages_from_delivery_not_now() {
         // A value delivered 5s ago, checked against a 3s window, must read stale
         // (the C6-stale-charge keep-awake bug: now() would wrongly read fresh).
-        let tr = TimedReading::at_age(42u8, Duration::from_secs(5));
+        let tr = TimedReading::at_age(42u8, Duration::from_secs(5)).unwrap();
         assert_eq!(tr.fresh(Duration::from_secs(3)), None, "5s-old value must be stale at 3s window");
         assert_eq!(tr.fresh(Duration::from_secs(10)), Some(42), "fresh within a 10s window");
         // now() by contrast is fresh at 3s.
         assert_eq!(TimedReading::now(42u8).fresh(Duration::from_secs(3)), Some(42));
+        // A very old age must never read fresh (None or a stale stamp).
+        let old = TimedReading::at_age(1u8, Duration::from_secs(10_000_000));
+        assert!(old.map_or(true, |t| t.fresh(Duration::from_secs(600)).is_none()));
+    }
+}
+
+// ── Shared-key C6 ownership (TELEMETRY_SOURCE=c6_primary) ─────────────────
+
+/// Handoff state plus which C6 values were already written as rows.
+#[derive(Default)]
+struct C6Link {
+    coord: c6_coord::Coordinator,
+    /// domain -> updated_at_ms of the value last persisted (dedupe key only).
+    written: std::collections::HashMap<&'static str, u64>,
+}
+
+impl C6Link {
+    /// True when this process must not talk to the car itself.
+    fn c6_owns(&self, cfg: &BleConfig) -> bool {
+        cfg.c6_primary && !cfg.c6_backfill && self.coord.owner() == c6_coord::Owner::C6
+    }
+}
+
+/// Service an action-socket verb while the C6 owns the car. Queries answer
+/// from the snapshot or report UNREACHABLE (never NOT_PAIRED, which would
+/// clear the paired marker); commands go to the supervisor.
+async fn c6_action(cfg: &BleConfig, verb: &str) -> Result<String> {
+    match verb {
+        "session-info" => Err(anyhow::anyhow!("UNREACHABLE: C6 owns the car link")),
+        "drive-state" => {
+            let snap = c6_source::read_snapshot();
+            let now = sample::now_secs().max(0) as u64 * 1000;
+            let fresh = matches!(
+                c6_source::decide_domain(snap.as_ref(), "drive", now),
+                c6_source::Source::C6
+            );
+            let tok = snap
+                .as_ref()
+                .filter(|_| fresh)
+                .and_then(|s| s.domains.get("drive"))
+                .and_then(|d| d.fields.get("shift_state"))
+                .and_then(|v| v.as_str())
+                .map(sample::ShiftState::from_c6_str)
+                .and_then(|s| match s {
+                    sample::ShiftState::Park => Some("P"),
+                    sample::ShiftState::Reverse => Some("R"),
+                    sample::ShiftState::Neutral => Some("N"),
+                    sample::ShiftState::Drive => Some("D"),
+                    sample::ShiftState::Unknown => None,
+                });
+            tok.map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("UNREACHABLE: no fresh gear from C6"))
+        }
+        "pair" => Err(anyhow::anyhow!("C6 owns the car link; pair the C6 instead")),
+        _ => {
+            // Same validation (ranges, typos) as the BLE path, then map.
+            action_socket::parse_verb(verb)?;
+            let cmd = c6_coord::verb_to_c6_command(verb)
+                .ok_or_else(|| anyhow::anyhow!("'{verb}' has no C6 equivalent"))?;
+            c6_coord::supervisor_command(&cfg.c6_supervisor_api, &cmd).await?;
+            Ok(String::new())
+        }
+    }
+}
+
+fn sentry_from_c6_str(s: &str) -> Option<sample::SentryMode> {
+    Some(match s.trim() {
+        "Off" => sample::SentryMode::Off,
+        "Idle" => sample::SentryMode::Idle,
+        "Armed" => sample::SentryMode::Armed,
+        "Aware" => sample::SentryMode::Aware,
+        "Panic" => sample::SentryMode::Panic,
+        "Quiet" => sample::SentryMode::Quiet,
+        _ => return None,
+    })
+}
+
+/// Fresh C6 value for `domain` not yet written as a row, else None.
+fn c6_new_value<'a>(
+    snap: Option<&'a c6_source::C6Snapshot>,
+    link: &C6Link,
+    domain: &'static str,
+    now_wall_ms: u64,
+) -> Option<&'a c6_source::DomainEntry> {
+    if c6_source::decide_domain(snap, domain, now_wall_ms) != c6_source::Source::C6 {
+        return None;
+    }
+    let d = snap?.domains.get(domain)?;
+    (link.written.get(domain) != Some(&d.updated_at_ms)).then_some(d)
+}
+
+/// One tick while the C6 owns the car: persist its fresh values as normal
+/// `state` rows (downstream readers key on that source), refresh the gate
+/// inputs, and route the keep-awake nudge through the C6. No BLE here.
+#[allow(clippy::too_many_arguments)]
+async fn c6_owned_tick(
+    conn: &Connection,
+    cfg: &BleConfig,
+    snap: Option<&c6_source::C6Snapshot>,
+    link: &mut C6Link,
+    last_charging_state: &mut Option<TimedReading<sample::ChargingState>>,
+    last_sentry_mode: &mut Option<TimedReading<sample::SentryMode>>,
+    last_lat: &mut Option<f64>,
+    last_lon: &mut Option<f64>,
+    last_location_name: &mut Option<String>,
+    next_nudge_due_at: &mut Option<Instant>,
+    nudge_retry_count: &mut u32,
+    last_nudge_notification_at: &mut Option<Instant>,
+) -> Duration {
+    let now_wall = sample::now_secs().max(0) as u64 * 1000;
+    let mut row = Sample { ts: sample::now_secs(), source: "state".into(), ..Sample::default() };
+    let mut any = false;
+    let mut shift = None;
+    let mut mark: Vec<(&'static str, u64)> = Vec::new();
+
+    if let Some(d) = c6_new_value(snap, link, "drive", now_wall) {
+        if c6_source::apply_drive(&d.fields, &mut row) {
+            any = true;
+        }
+        shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
+        mark.push(("drive", d.updated_at_ms));
+    }
+    if let Some(d) = c6_new_value(snap, link, "location", now_wall) {
+        let lat = d.fields.get("latitude").and_then(|v| v.as_f64());
+        let lon = d.fields.get("longitude").and_then(|v| v.as_f64());
+        if let (Some(la), Some(lo)) = (lat, lon) {
+            *last_lat = Some(la);
+            *last_lon = Some(lo);
+            any = true;
+        }
+        if let Some(n) = d.fields.get("location_name").and_then(|v| v.as_str()) {
+            *last_location_name = Some(n.to_string());
+            row.location_name = Some(n.to_string());
+        }
+        mark.push(("location", d.updated_at_ms));
+    }
+    if let Some(d) = c6_new_value(snap, link, "climate", now_wall) {
+        any |= c6_source::apply_climate(&d.fields, &mut row);
+        mark.push(("climate", d.updated_at_ms));
+    }
+    if let Some(d) = c6_new_value(snap, link, "charge", now_wall) {
+        any |= c6_source::apply_charge(&d.fields, &mut row);
+        if let Some(cs) = d.fields.get("charging_state").and_then(|v| v.as_str()) {
+            let age = snap.and_then(|s| s.domain_age_ms("charge", now_wall)).unwrap_or(u64::MAX / 2);
+            if let Some(tr) = TimedReading::at_age(sample::ChargingState::from_c6_str(cs), Duration::from_millis(age)) {
+                *last_charging_state = Some(tr);
+            }
+        }
+        mark.push(("charge", d.updated_at_ms));
+    }
+    if let Some(d) = c6_new_value(snap, link, "tires", now_wall) {
+        any |= c6_source::apply_tires(&d.fields, &mut row);
+        mark.push(("tires", d.updated_at_ms));
+    }
+    if let Some(d) = c6_new_value(snap, link, "closures", now_wall) {
+        if let Some(sm) = d.fields.get("sentry_mode_state").and_then(|v| v.as_str()).and_then(sentry_from_c6_str) {
+            let age = snap.and_then(|s| s.domain_age_ms("closures", now_wall)).unwrap_or(u64::MAX / 2);
+            if let Some(tr) = TimedReading::at_age(sm, Duration::from_millis(age)) {
+                *last_sentry_mode = Some(tr);
+            }
+        }
+        mark.push(("closures", d.updated_at_ms));
+    }
+    for (d, t) in mark {
+        link.written.insert(d, t);
+    }
+    if any {
+        row.latitude = *last_lat;
+        row.longitude = *last_lon;
+        if row.location_name.is_none() {
+            row.location_name = last_location_name.clone();
+        }
+        persist(conn, row);
+    }
+    write_gate_status_file(last_sentry_mode.as_ref(), last_charging_state.as_ref(), shift);
+
+    // Keep-awake: same cadence/retry/notify budget as the BLE path, sent by
+    // the C6 (the only device allowed to sign on this key right now).
+    if lock::keep_awake_requested() {
+        let now = Instant::now();
+        if next_nudge_due_at.map(|t| now >= t).unwrap_or(true) {
+            let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
+            let cmd = serde_json::json!({"cmd": "nudge_charge_port_close"});
+            match c6_coord::supervisor_command(&cfg.c6_supervisor_api, &cmd).await {
+                Ok(()) => {
+                    info!("keep-awake: charge-port-close nudge sent via C6 (next in {}s)", interval.as_secs());
+                    *next_nudge_due_at = Some(now + interval);
+                    *nudge_retry_count = 0;
+                }
+                Err(e) => {
+                    *nudge_retry_count += 1;
+                    warn!("keep-awake: C6 nudge failed (attempt {}/3): {:#}", *nudge_retry_count, e);
+                    if *nudge_retry_count >= 3 {
+                        let notify_due = last_nudge_notification_at
+                            .map(|t| now.duration_since(t) >= Duration::from_secs(600))
+                            .unwrap_or(true);
+                        if notify_due {
+                            emit_keep_awake_failure_notification(&format!("{:#}", e));
+                            *last_nudge_notification_at = Some(now);
+                        }
+                        *nudge_retry_count = 0;
+                        *next_nudge_due_at = Some(now + interval);
+                    } else {
+                        *next_nudge_due_at = Some(now + Duration::from_secs(30));
+                    }
+                }
+            }
+        }
+    } else {
+        *next_nudge_due_at = None;
+        *nudge_retry_count = 0;
+    }
+
+    // Snapshot refreshes every second; 15s matches the Active drive cadence.
+    C6_OWNED_POLL
+}
+
+/// Tick cadence while the C6 owns the car.
+const C6_OWNED_POLL: Duration = Duration::from_secs(15);
+
+#[cfg(test)]
+mod c6_link_tests {
+    use super::*;
+
+    #[test]
+    fn flag_unset_never_hands_the_car_to_the_c6() {
+        // Stock config: the sampler always owns, whatever the coordinator says.
+        let link = C6Link::default();
+        assert_eq!(link.coord.owner(), c6_coord::Owner::C6);
+        assert!(!link.c6_owns(&BleConfig::default()));
+    }
+
+    #[test]
+    fn c6_primary_owns_but_backfill_does_not() {
+        let link = C6Link::default();
+        let mut cfg = BleConfig { c6_primary: true, ..BleConfig::default() };
+        assert!(link.c6_owns(&cfg));
+        cfg.c6_backfill = true; // bench soak: both radios by design
+        assert!(!link.c6_owns(&cfg));
+    }
+
+    #[test]
+    fn failback_releases_ownership_to_the_sampler() {
+        let mut link = C6Link::default();
+        let cfg = BleConfig { c6_primary: true, ..BleConfig::default() };
+        link.coord.step(false, 0);
+        link.coord.step(false, c6_coord::FAILBACK_AFTER_MS);
+        assert!(!link.c6_owns(&cfg));
     }
 }
