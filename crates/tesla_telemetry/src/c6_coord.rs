@@ -5,8 +5,10 @@
 //! so exactly one of them may talk to the car at a time:
 //!
 //!   * C6 owns (default): the sampler holds NO Tesla BLE session at all.
-//!   * Sampler owns: only after the C6 has been dead for `FAILBACK_AFTER_MS`.
-//!     It hands back once the C6 has been alive again for `RETURN_SETTLE_MS`.
+//!   * Sampler owns: after the C6 has been dead for `FAILBACK_AFTER_MS`, or
+//!     alive but unable to reach the car for `CAR_LINK_FAILBACK_MS`. It hands
+//!     back once the C6 has recovered for `RETURN_SETTLE_MS` (or, after a
+//!     car-link failback, on a backed-off trial grant).
 //!
 //! The sampler publishes ownership in a lease file the C6 supervisor checks
 //! before every car command. The supervisor may only talk to the car under a
@@ -60,12 +62,51 @@ impl Owner {
     }
 }
 
+/// Why the sampler currently owns the car.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// The C6 device itself is gone (serial / heartbeat / supervisor).
+    DeviceDead,
+    /// The C6 is alive but has not reached the car for CAR_LINK_FAILBACK_MS.
+    CarLink,
+}
+
+/// One liveness observation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Health {
+    pub device_alive: bool,
+    /// The C6 is not reaching the car (and the car isn't known to be asleep).
+    pub car_link_down: bool,
+}
+
+/// C6 device-alive but car link down this long => the sampler takes the car.
+pub const CAR_LINK_FAILBACK_MS: u64 = 5 * 60_000;
+
+/// No car contact for this long counts as "car link down" (the C6's idle
+/// keepalive answers every ~8s while it holds a session).
+pub const CAR_LINK_STALE_MS: u64 = 60_000;
+
+/// After a car-link failback the C6 is parked, so its link can't be observed
+/// recovering; it gets a trial grant after this, doubling per repeat failure.
+pub const CAR_LINK_TRIAL_BASE_MS: u64 = 15 * 60_000;
+pub const CAR_LINK_TRIAL_MAX_MS: u64 = 60 * 60_000;
+
+/// C6 fully healthy this long resets the trial backoff.
+pub const BACKOFF_RESET_MS: u64 = 30 * 60_000;
+
 /// Handoff state machine. Pure: time is passed in (CLOCK_BOOTTIME ms).
 #[derive(Debug, Clone)]
 pub struct Coordinator {
     owner: Owner,
+    reason: Option<Reason>,
     dead_since: Option<u64>,
-    alive_since: Option<u64>,
+    link_down_since: Option<u64>,
+    /// Sampler-owned: when the recovery signal (device alive / link ok) began.
+    recovered_since: Option<u64>,
+    /// C6-owned: when it last became fully healthy (backoff reset).
+    healthy_since: Option<u64>,
+    trial_at: Option<u64>,
+    backoff_ms: u64,
 }
 
 impl Default for Coordinator {
@@ -78,35 +119,129 @@ impl Coordinator {
     /// Start as C6-owned: on daemon start the sampler must prove the C6 dead
     /// for the full window before touching the car, closing the startup race.
     pub fn new() -> Self {
-        Self { owner: Owner::C6, dead_since: None, alive_since: None }
+        Self {
+            owner: Owner::C6,
+            reason: None,
+            dead_since: None,
+            link_down_since: None,
+            recovered_since: None,
+            healthy_since: None,
+            trial_at: None,
+            backoff_ms: CAR_LINK_TRIAL_BASE_MS,
+        }
     }
 
     pub fn owner(&self) -> Owner {
         self.owner
     }
 
-    /// Feed one liveness observation; returns the owner to act on now.
+    pub fn reason(&self) -> Option<Reason> {
+        self.reason
+    }
+
+    fn take_car(&mut self, reason: Reason) {
+        self.owner = Owner::Sampler;
+        self.reason = Some(reason);
+        self.dead_since = None;
+        self.link_down_since = None;
+        self.recovered_since = None;
+        self.healthy_since = None;
+    }
+
+    fn hand_back(&mut self) {
+        self.owner = Owner::C6;
+        self.reason = None;
+        self.recovered_since = None;
+        self.trial_at = None;
+    }
+
+    /// The C6 is unplugged: the sampler owns now (stock behaviour). A replug
+    /// then needs the normal RETURN_SETTLE_MS of device-alive to hand back.
+    pub fn mark_absent(&mut self) {
+        if self.owner == Owner::C6 {
+            self.take_car(Reason::DeviceDead);
+        }
+        self.trial_at = None;
+        self.recovered_since = None;
+    }
+
+    /// Device-only observation (car link assumed fine). Test convenience.
+    #[cfg(test)]
     pub fn step(&mut self, c6_alive: bool, now_ms: u64) -> Owner {
-        if c6_alive {
-            self.dead_since = None;
-            if self.owner == Owner::Sampler {
-                let since = *self.alive_since.get_or_insert(now_ms);
-                if now_ms.saturating_sub(since) >= RETURN_SETTLE_MS {
-                    self.owner = Owner::C6;
-                    self.alive_since = None;
+        self.step_health(Health { device_alive: c6_alive, car_link_down: false }, now_ms)
+    }
+
+    /// Feed one observation; returns the owner to act on now.
+    pub fn step_health(&mut self, h: Health, now_ms: u64) -> Owner {
+        match self.owner {
+            Owner::C6 => {
+                if !h.device_alive {
+                    self.link_down_since = None;
+                    self.healthy_since = None;
+                    let since = *self.dead_since.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= FAILBACK_AFTER_MS {
+                        self.take_car(Reason::DeviceDead);
+                    }
+                } else if h.car_link_down {
+                    self.dead_since = None;
+                    self.healthy_since = None;
+                    let since = *self.link_down_since.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= CAR_LINK_FAILBACK_MS {
+                        self.take_car(Reason::CarLink);
+                        self.trial_at = Some(now_ms.saturating_add(self.backoff_ms));
+                        self.backoff_ms = (self.backoff_ms * 2).min(CAR_LINK_TRIAL_MAX_MS);
+                    }
+                } else {
+                    self.dead_since = None;
+                    self.link_down_since = None;
+                    let since = *self.healthy_since.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= BACKOFF_RESET_MS {
+                        self.backoff_ms = CAR_LINK_TRIAL_BASE_MS;
+                    }
                 }
             }
-        } else {
-            self.alive_since = None;
-            if self.owner == Owner::C6 {
-                let since = *self.dead_since.get_or_insert(now_ms);
-                if now_ms.saturating_sub(since) >= FAILBACK_AFTER_MS {
-                    self.owner = Owner::Sampler;
-                    self.dead_since = None;
+            Owner::Sampler => {
+                if self.reason == Some(Reason::CarLink) && !h.device_alive {
+                    // The C6 died outright meanwhile: device rules from here.
+                    self.reason = Some(Reason::DeviceDead);
+                    self.recovered_since = None;
+                    self.trial_at = None;
+                }
+                let recovered = match self.reason {
+                    Some(Reason::CarLink) => !h.car_link_down,
+                    _ => h.device_alive,
+                };
+                if recovered {
+                    let since = *self.recovered_since.get_or_insert(now_ms);
+                    if now_ms.saturating_sub(since) >= RETURN_SETTLE_MS {
+                        self.hand_back();
+                    }
+                } else {
+                    self.recovered_since = None;
+                    if self.trial_at.is_some_and(|t| now_ms >= t) {
+                        self.hand_back(); // trial grant; a dead link fails back again
+                    }
                 }
             }
         }
         self.owner
+    }
+}
+
+/// Is the C6 reaching the car? False (= not down) when the supervisor doesn't
+/// report car contact at all (older build) or the car was last seen ASLEEP:
+/// a sleeping car not answering is not a car-link outage.
+pub fn car_link_down(snap: Option<&C6Snapshot>) -> bool {
+    let Some(s) = snap else { return false };
+    if !s.car_link_reported {
+        return false;
+    }
+    if s.car_sleep_status.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("ASLEEP")) {
+        return false;
+    }
+    match s.car_ok_age_ms() {
+        Some(age) => age > CAR_LINK_STALE_MS,
+        None => true, // never reached the car since the supervisor started
     }
 }
 
@@ -124,6 +259,14 @@ pub fn c6_alive(snap: Option<&C6Snapshot>) -> bool {
         && s.serial_connected != Some(false)
         && s.provisioned != Some(false)
         && s.polling_enabled != Some(false)
+}
+
+/// udev symlink for the C6's USB serial (99-sentryusb-c6.rules).
+pub const C6_DEVICE: &str = "/dev/sentryusb-c6";
+
+/// Is a C6 plugged in at all? Absent = stock sampler behaviour, no waiting.
+pub fn c6_present() -> bool {
+    std::path::Path::new(C6_DEVICE).exists()
 }
 
 /// CLOCK_BOOTTIME in ms: monotonic, counts suspend, never steps with NTP.
@@ -342,6 +485,116 @@ mod tests {
         let mut c = Coordinator::new();
         assert_eq!(c.owner(), Owner::C6);
         assert_eq!(c.step(false, 5_000), Owner::C6);
+    }
+
+    const UP: Health = Health { device_alive: true, car_link_down: false };
+    const LINK_DOWN: Health = Health { device_alive: true, car_link_down: true };
+
+    #[test]
+    fn five_minute_car_link_outage_fails_back() {
+        let mut c = Coordinator::new();
+        assert_eq!(c.step_health(LINK_DOWN, 0), Owner::C6);
+        assert_eq!(c.step_health(LINK_DOWN, CAR_LINK_FAILBACK_MS - 1), Owner::C6);
+        assert_eq!(c.step_health(LINK_DOWN, CAR_LINK_FAILBACK_MS), Owner::Sampler);
+        assert_eq!(c.reason(), Some(Reason::CarLink));
+    }
+
+    #[test]
+    fn short_car_link_outage_does_not_flip() {
+        let mut c = Coordinator::new();
+        c.step_health(LINK_DOWN, 0);
+        assert_eq!(c.step_health(LINK_DOWN, 240_000), Owner::C6);
+        assert_eq!(c.step_health(UP, 250_000), Owner::C6);
+        // Timer restarted: another 4 min outage still doesn't flip.
+        assert_eq!(c.step_health(LINK_DOWN, 260_000), Owner::C6);
+        assert_eq!(c.step_health(LINK_DOWN, 500_000), Owner::C6);
+    }
+
+    #[test]
+    fn car_link_recovery_hands_back_after_settle() {
+        let mut c = Coordinator::new();
+        c.step_health(LINK_DOWN, 0);
+        c.step_health(LINK_DOWN, CAR_LINK_FAILBACK_MS);
+        let t = CAR_LINK_FAILBACK_MS + 10_000;
+        assert_eq!(c.step_health(UP, t), Owner::Sampler);
+        assert_eq!(c.step_health(UP, t + RETURN_SETTLE_MS - 1), Owner::Sampler);
+        assert_eq!(c.step_health(UP, t + RETURN_SETTLE_MS), Owner::C6);
+    }
+
+    #[test]
+    fn parked_c6_gets_a_backed_off_trial_grant() {
+        // After a car-link failback the C6 is parked, so the link stays "down":
+        // it gets a trial grant after the backoff, which doubles on repeat.
+        let mut c = Coordinator::new();
+        c.step_health(LINK_DOWN, 0);
+        let f1 = CAR_LINK_FAILBACK_MS;
+        c.step_health(LINK_DOWN, f1);
+        assert_eq!(c.step_health(LINK_DOWN, f1 + CAR_LINK_TRIAL_BASE_MS - 1), Owner::Sampler);
+        let t1 = f1 + CAR_LINK_TRIAL_BASE_MS;
+        assert_eq!(c.step_health(LINK_DOWN, t1), Owner::C6);
+        // Trial fails: 5 more minutes down => back to sampler, next trial 2x later.
+        c.step_health(LINK_DOWN, t1 + 1);
+        let f2 = t1 + 1 + CAR_LINK_FAILBACK_MS;
+        assert_eq!(c.step_health(LINK_DOWN, f2), Owner::Sampler);
+        assert_eq!(c.step_health(LINK_DOWN, f2 + 2 * CAR_LINK_TRIAL_BASE_MS - 1), Owner::Sampler);
+        assert_eq!(c.step_health(LINK_DOWN, f2 + 2 * CAR_LINK_TRIAL_BASE_MS), Owner::C6);
+    }
+
+    #[test]
+    fn device_death_during_car_link_failback_switches_to_device_rules() {
+        let mut c = Coordinator::new();
+        c.step_health(LINK_DOWN, 0);
+        c.step_health(LINK_DOWN, CAR_LINK_FAILBACK_MS);
+        let dead = Health { device_alive: false, car_link_down: true };
+        c.step_health(dead, CAR_LINK_FAILBACK_MS + 1);
+        assert_eq!(c.reason(), Some(Reason::DeviceDead));
+        // No trial grant to a dead device, however long we wait.
+        assert_eq!(c.step_health(dead, 10 * CAR_LINK_TRIAL_MAX_MS), Owner::Sampler);
+    }
+
+    fn link_snap(age: Option<u64>, sleep: Option<&str>) -> C6Snapshot {
+        C6Snapshot {
+            car_link_reported: true,
+            car_ok_age_at_write_ms: age,
+            car_sleep_status: sleep.map(str::to_string),
+            snapshot_age_ms: Some(500),
+            ..alive_snap()
+        }
+    }
+
+    #[test]
+    fn car_asleep_is_not_a_car_link_outage() {
+        assert!(!car_link_down(Some(&link_snap(Some(3_600_000), Some("ASLEEP")))));
+        assert!(!car_link_down(Some(&link_snap(None, Some("ASLEEP")))));
+        // And over time the coordinator never fails back on it.
+        let mut c = Coordinator::new();
+        let h = Health {
+            device_alive: true,
+            car_link_down: car_link_down(Some(&link_snap(Some(3_600_000), Some("ASLEEP")))),
+        };
+        for t in (0..3_600_000).step_by(15_000) {
+            assert_eq!(c.step_health(h, t), Owner::C6);
+        }
+    }
+
+    #[test]
+    fn car_link_down_reads_the_snapshot() {
+        assert!(!car_link_down(Some(&link_snap(Some(5_000), Some("AWAKE")))));
+        assert!(car_link_down(Some(&link_snap(Some(CAR_LINK_STALE_MS + 1), Some("AWAKE")))));
+        assert!(car_link_down(Some(&link_snap(None, None))), "never reached the car");
+        // Older supervisor that doesn't report car contact: never "down".
+        let legacy = C6Snapshot { car_link_reported: false, ..link_snap(None, None) };
+        assert!(!car_link_down(Some(&legacy)));
+    }
+
+    #[test]
+    fn unplugged_c6_hands_the_car_to_the_sampler_at_once() {
+        let mut c = Coordinator::new();
+        c.mark_absent();
+        assert_eq!(c.owner(), Owner::Sampler);
+        // Replugged: needs the normal alive settle before handing back.
+        assert_eq!(c.step_health(UP, 0), Owner::Sampler);
+        assert_eq!(c.step_health(UP, RETURN_SETTLE_MS), Owner::C6);
     }
 
     #[test]

@@ -483,12 +483,18 @@ async fn main() -> Result<()> {
                 // a no-op until both are configured. Reuses the config
                 // snapshot the tick already parsed (None = load failed).
                 if let Some(cfg) = cfg {
-                    // No session exists while the C6 owns the car, so this
-                    // is already skipped then; the owner check is belt-and-braces.
-                    if let (Some(handle), false) = (ble_session.as_ref(), c6_link.c6_owns(&cfg)) {
+                    // Whoever owns the car sends it: the C6 (via its
+                    // supervisor) while c6_primary owns, else our session.
+                    let c6_owns = c6_link.c6_owns(&cfg);
+                    let route = keep_accessory_route(
+                        c6_owns,
+                        ble_session.as_ref().map(|h| &h.session),
+                        &cfg.c6_supervisor_api,
+                    );
+                    if let Some(route) = route {
                         keep_accessory::evaluate(
                             &cfg.keep_accessory,
-                            &handle.session,
+                            route,
                             &mut keep_accessory_state,
                             last_lat,
                             last_lon,
@@ -498,9 +504,11 @@ async fn main() -> Result<()> {
                             // car_truly_asleep (the daemon's own quiet
                             // signal) so home→OFF works on HW3 too.
                             parked_polls >= PARK_CONFIRMATIONS_BEFORE_QUIET
+                                || (c6_owns && c6_link.parked_obs >= PARK_CONFIRMATIONS_BEFORE_QUIET)
                                 || usb_watch::observe() == CarState::Asleep,
                             lock::is_archive_active(),
-                            held_radio,
+                            // The C6 holds its own link; "radio held" gates the Pi's.
+                            held_radio || c6_owns,
                             // Deliberately RAW (not freshness-filtered):
                             // evaluate() reads this as "cable state", and a
                             // 10-min expiry to None mid-BLE-outage is
@@ -668,14 +676,26 @@ async fn tick(
 
     // Shared-key coordination: decide who may talk to the car BEFORE any
     // session exists. C6-owned => no Tesla BLE from this process at all.
-    if cfg.c6_primary && !cfg.c6_backfill {
+    if cfg.c6_primary && !cfg.c6_backfill && !c6_coord::c6_present() {
+        // No C6 plugged in: stock behaviour, no failback wait.
+        c6_link.coord.mark_absent();
+    } else if cfg.c6_primary && !cfg.c6_backfill {
         let snap = c6_source::read_snapshot();
         // No boottime => time never advances => stays C6-owned (safe side).
         let now = c6_coord::boottime_ms().unwrap_or(0);
         let prev = c6_link.coord.owner();
-        let owner = c6_link.coord.step(c6_coord::c6_alive(snap.as_ref()), now);
+        let health = c6_coord::Health {
+            device_alive: c6_coord::c6_alive(snap.as_ref()),
+            car_link_down: c6_coord::car_link_down(snap.as_ref()),
+        };
+        let owner = c6_link.coord.step_health(health, now);
         if owner != prev {
-            info!("C6 coordination: car link owner {} -> {}", prev.as_str(), owner.as_str());
+            info!(
+                "C6 coordination: car link owner {} -> {} ({:?})",
+                prev.as_str(),
+                owner.as_str(),
+                c6_link.coord.reason()
+            );
         }
         match owner {
             c6_coord::Owner::C6 => {
@@ -2339,6 +2359,39 @@ struct C6Link {
     grant_revoked_at: Option<u64>,
     /// The one-shot TELEMETRY_SOURCE onboarding write was attempted.
     onboarding_tried: bool,
+    /// Consecutive fresh C6 drive readings showing parked (keep-accessory
+    /// input while the C6 owns the car; the sampler's own counter is idle).
+    parked_obs: u32,
+}
+
+/// Keep-accessory sender for the current owner. None = nobody can send now
+/// (Pi owns but has no session yet); evaluate() then retries next tick.
+fn keep_accessory_route<'a>(
+    c6_owns: bool,
+    session: Option<&'a sentryusb_tesla_ble::manager::PersistentSession>,
+    c6_api: &'a str,
+) -> Option<keep_accessory::Route<'a>> {
+    match keep_accessory_via(c6_owns, session.is_some())? {
+        KaVia::C6 => Some(keep_accessory::Route::C6 { api: c6_api }),
+        KaVia::Ble => session.map(keep_accessory::Route::Ble),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KaVia {
+    C6,
+    Ble,
+}
+
+/// Pure routing decision: the owner of the car sends; never both.
+fn keep_accessory_via(c6_owns: bool, have_session: bool) -> Option<KaVia> {
+    if c6_owns {
+        Some(KaVia::C6)
+    } else if have_session {
+        Some(KaVia::Ble)
+    } else {
+        None
+    }
 }
 
 /// Stand the sampler down and, once our car link is really closed, grant the
@@ -2436,7 +2489,11 @@ fn c6_onboarding(cfg: &BleConfig, link: &mut C6Link) {
 impl C6Link {
     /// True when this process must not talk to the car itself.
     fn c6_owns(&self, cfg: &BleConfig) -> bool {
-        cfg.c6_primary && !cfg.c6_backfill && self.coord.owner() == c6_coord::Owner::C6
+        self.c6_owns_with(cfg, c6_coord::c6_present())
+    }
+
+    fn c6_owns_with(&self, cfg: &BleConfig, c6_present: bool) -> bool {
+        cfg.c6_primary && !cfg.c6_backfill && c6_present && self.coord.owner() == c6_coord::Owner::C6
     }
 }
 
@@ -2537,7 +2594,17 @@ async fn c6_owned_tick(
             any = true;
         }
         shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
+        // Parked = P, or Unknown (HW3 parked) with ~zero drive power.
+        let power = d.fields.get("power").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let parked = match shift {
+            Some(sample::ShiftState::Park) => true,
+            Some(sample::ShiftState::Unknown) | None => power.abs() < 1.0,
+            _ => false,
+        };
+        link.parked_obs = if parked { link.parked_obs.saturating_add(1) } else { 0 };
         mark.push(("drive", d.updated_at_ms));
+    } else if c6_source::decide_domain(snap, "drive", now_wall) != c6_source::Source::C6 {
+        link.parked_obs = 0; // no fresh drive data: no parked evidence
     }
     if let Some(d) = c6_new_value(snap, link, "location", now_wall) {
         let lat = d.fields.get("latitude").and_then(|v| v.as_f64());
@@ -2646,16 +2713,17 @@ mod c6_link_tests {
         // Stock config: the sampler always owns, whatever the coordinator says.
         let link = C6Link::default();
         assert_eq!(link.coord.owner(), c6_coord::Owner::C6);
-        assert!(!link.c6_owns(&BleConfig::default()));
+        assert!(!link.c6_owns_with(&BleConfig::default(), true));
     }
 
     #[test]
     fn c6_primary_owns_but_backfill_does_not() {
         let link = C6Link::default();
         let mut cfg = BleConfig { c6_primary: true, ..BleConfig::default() };
-        assert!(link.c6_owns(&cfg));
+        assert!(link.c6_owns_with(&cfg, true));
+        assert!(!link.c6_owns_with(&cfg, false), "C6 unplugged = stock");
         cfg.c6_backfill = true; // bench soak: both radios by design
-        assert!(!link.c6_owns(&cfg));
+        assert!(!link.c6_owns_with(&cfg, true));
     }
 
     #[test]
@@ -2664,6 +2732,52 @@ mod c6_link_tests {
         let cfg = BleConfig { c6_primary: true, ..BleConfig::default() };
         link.coord.step(false, 0);
         link.coord.step(false, c6_coord::FAILBACK_AFTER_MS);
-        assert!(!link.c6_owns(&cfg));
+        assert!(!link.c6_owns_with(&cfg, true));
+    }
+}
+
+#[cfg(test)]
+mod keep_accessory_route_tests {
+    use super::*;
+
+    #[test]
+    fn owner_decides_who_sends_keep_accessory() {
+        // C6 owns: the C6 sends, even if a stale session handle lingers.
+        assert_eq!(keep_accessory_via(true, false), Some(KaVia::C6));
+        assert_eq!(keep_accessory_via(true, true), Some(KaVia::C6));
+        // Pi holds the grant: its own session sends; no session yet = retry later.
+        assert_eq!(keep_accessory_via(false, true), Some(KaVia::Ble));
+        assert_eq!(keep_accessory_via(false, false), None);
+        assert!(matches!(
+            keep_accessory_route(true, None, "127.0.0.1:1"),
+            Some(keep_accessory::Route::C6 { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn c6_route_sends_keep_accessory_and_waits_for_the_car() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for status in ["200 OK", "502 Bad Gateway"] {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 4096];
+                let n = s.read(&mut buf).await.unwrap();
+                bodies.push(String::from_utf8_lossy(&buf[..n]).to_string());
+                let body = r#"{"result":"x"}"#;
+                let resp = format!("HTTP/1.1 {status}\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+                s.write_all(resp.as_bytes()).await.unwrap();
+            }
+            bodies
+        });
+        let route = keep_accessory::Route::C6 { api: &addr };
+        assert!(route.set_power(true).await.is_ok(), "car said ok");
+        assert!(route.set_power(false).await.is_err(), "car rejected => failure, not success");
+        let bodies = server.await.unwrap();
+        assert!(bodies[0].contains(r#""cmd":"keep_accessory""#) && bodies[0].contains(r#""on":true"#));
+        assert!(bodies[0].contains(r#""await_result":true"#));
+        assert!(bodies[1].contains(r#""on":false"#));
     }
 }

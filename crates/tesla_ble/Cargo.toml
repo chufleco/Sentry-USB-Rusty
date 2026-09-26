@@ -47,6 +47,8 @@ path = "examples/typed_query.rs"
 
 [dependencies]
 sentryusb-config = { path = "../config", package = "sentryusb-config" }
+serde_json = { workspace = true }
+libc = "0.2"
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

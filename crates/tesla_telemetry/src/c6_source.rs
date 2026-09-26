@@ -66,6 +66,12 @@ pub struct C6Snapshot {
     /// Kernel boot id + CLOCK_BOOTTIME ms at write (newer supervisors).
     pub boot_id: Option<String>,
     pub written_boottime_ms: Option<u64>,
+    /// The supervisor reports car contact (`car_ok_age_ms` key present).
+    pub car_link_reported: bool,
+    /// Age of the C6's last car contact at write time (None = never).
+    pub car_ok_age_at_write_ms: Option<u64>,
+    /// Last vehicle_sleep_status the car reported.
+    pub car_sleep_status: Option<String>,
     /// How old the snapshot FILE is right now. Set by `read_snapshot`; None =
     /// unknown (treated as not-alive by the coordinator).
     pub snapshot_age_ms: Option<u64>,
@@ -111,6 +117,9 @@ impl C6Snapshot {
             polling_enabled: v.get("polling_enabled").and_then(|x| x.as_bool()),
             boot_id: v.get("boot_id").and_then(|x| x.as_str()).map(str::to_string),
             written_boottime_ms: v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+            car_link_reported: v.get("car_ok_age_ms").is_some(),
+            car_ok_age_at_write_ms: v.get("car_ok_age_ms").and_then(|x| x.as_u64()),
+            car_sleep_status: v.get("car_sleep_status").and_then(|x| x.as_str()).map(str::to_string),
             snapshot_age_ms: None,
             domains,
         })
@@ -122,6 +131,11 @@ impl C6Snapshot {
     pub fn heartbeat_age_ms(&self) -> Option<u64> {
         let at_write = self.last_heartbeat_age_ms?;
         Some(at_write.saturating_add(self.snapshot_age_ms.unwrap_or(0)))
+    }
+
+    /// Age of the C6's last car contact now (at-write + file age).
+    pub fn car_ok_age_ms(&self) -> Option<u64> {
+        Some(self.car_ok_age_at_write_ms?.saturating_add(self.snapshot_age_ms.unwrap_or(u64::MAX / 4)))
     }
 
     /// A domain's age now. Monotonic when the supervisor stamps `age_ms`,

@@ -146,7 +146,7 @@ async fn main() -> ExitCode {
                 "telemetry IPC unavailable ({}), falling back to direct BLE",
                 reason
             );
-            if c6_owns_link() {
+            if c6_blocks_direct() {
                 eprintln!("C6 owns the car link and the telemetry daemon is down; not opening direct BLE");
                 return ExitCode::from(3);
             }
@@ -327,7 +327,7 @@ async fn run_session_info() -> ExitCode {
                 reason
             );
             // Unknown, never NOT_PAIRED: the API leaves the paired marker alone.
-            if c6_owns_link() {
+            if c6_blocks_direct() {
                 println!("UNREACHABLE");
                 return ExitCode::SUCCESS;
             }
@@ -400,7 +400,7 @@ async fn run_pair() -> ExitCode {
                 "telemetry IPC unavailable ({}), sending add-key-request via direct BLE",
                 reason
             );
-            if c6_owns_link() {
+            if c6_blocks_direct() {
                 eprintln!("C6 owns the car link; pair the C6 instead");
                 return ExitCode::from(3);
             }
@@ -522,7 +522,7 @@ async fn run_state_query(verb: &str) -> ExitCode {
                 "telemetry IPC unavailable ({}), reading vehicle state via direct BLE",
                 reason
             );
-            if c6_owns_link() {
+            if c6_blocks_direct() {
                 eprintln!("C6 owns the car link and the telemetry daemon is down");
                 return ExitCode::from(3);
             }
@@ -694,13 +694,86 @@ fn load_config() -> Result<(String, Option<String>)> {
 }
 
 /// True when `TELEMETRY_SOURCE=c6_primary` (and not the C6_BACKFILL bench
-/// mode): the ESP32-C6 shares this key, so no direct Pi session may open.
-/// Parsed with the same config crate + lookup the telemetry daemon uses. An
-/// unreadable config fails closed only if it can't be read at all.
+/// mode). Parsed with the same config crate + lookup the telemetry daemon uses.
 fn c6_owns_link() -> bool {
     match sentryusb_config::parse_file(sentryusb_config::find_config_path()) {
         Ok((active, commented)) => c6_owns_link_in(&active, &commented),
         Err(_) => false,
+    }
+}
+
+// Must match the telemetry daemon's c6_coord / the supervisor's coord.rs.
+const C6_DEVICE: &str = "/dev/sentryusb-c6";
+const C6_LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
+const C6_CLAIM_SETTLE_MS: u64 = 35_000;
+const C6_SAMPLER_LEASE_MS: u64 = 10 * 60_000;
+
+#[derive(Debug, PartialEq, Eq)]
+enum DirectBle {
+    /// No C6 in the picture: stock behaviour.
+    Stock,
+    /// C6 present but not driving: claim the car (lease), then go direct.
+    Claim,
+    /// The C6 holds (or only just held) the car: refuse.
+    Block,
+}
+
+/// Pure: may this process open its own session? `lease` = current lease file.
+fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, boot_id: &str, now_ms: u64) -> DirectBle {
+    if !c6_primary || !c6_present {
+        return DirectBle::Stock;
+    }
+    let grant_recent = lease
+        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .is_some_and(|v| {
+            v.get("owner").and_then(|x| x.as_str()) == Some("c6")
+                && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+                && match (
+                    v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+                    v.get("valid_for_ms").and_then(|x| x.as_u64()),
+                ) {
+                    // Live, or expired too recently for an in-flight C6 command to have ended.
+                    (Some(w), Some(valid)) => now_ms < w.saturating_add(valid).saturating_add(C6_CLAIM_SETTLE_MS),
+                    _ => true, // unreadable grant: assume live
+                }
+        });
+    if grant_recent { DirectBle::Block } else { DirectBle::Claim }
+}
+
+fn boottime_ms() -> Option<u64> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: valid out-pointer to a stack timespec.
+    let rc = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
+    (rc == 0).then(|| ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000)
+}
+
+/// Called when the telemetry daemon is unreachable. C6 absent (unplugged) or
+/// flag off = stock direct BLE. C6 present: refuse while it holds the car;
+/// otherwise publish our own sampler lease (supervisor holds + parks) first.
+fn c6_blocks_direct() -> bool {
+    let present = std::path::Path::new(C6_DEVICE).exists();
+    let (Some(boot), Some(now)) = (
+        std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()),
+        boottime_ms(),
+    ) else {
+        return c6_owns_link() && present; // can't evaluate a lease: refuse only with a C6
+    };
+    let lease = std::fs::read_to_string(C6_LEASE_PATH).ok();
+    match direct_ble_decision(c6_owns_link(), present, lease.as_deref(), &boot, now) {
+        DirectBle::Stock => false,
+        DirectBle::Block => true,
+        DirectBle::Claim => {
+            let body = serde_json::json!({
+                "owner": "sampler", "boot_id": boot,
+                "written_boottime_ms": now, "valid_for_ms": C6_SAMPLER_LEASE_MS,
+            })
+            .to_string();
+            let path = std::path::Path::new(C6_LEASE_PATH);
+            let tmp = path.with_extension("json.tmp");
+            let ok = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+                && std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)).is_ok();
+            !ok // can't publish our claim: don't risk two signers
+        }
     }
 }
 
@@ -731,7 +804,30 @@ fn unquote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::c6_owns_link_in;
+    use super::{c6_owns_link_in, direct_ble_decision, DirectBle};
+
+    fn grant(w: u64, valid: u64) -> String {
+        format!(r#"{{"owner":"c6","boot_id":"b","written_boottime_ms":{w},"valid_for_ms":{valid}}}"#)
+    }
+
+    #[test]
+    fn c6_absent_or_flag_off_is_stock_behaviour() {
+        assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
+        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
+    }
+
+    #[test]
+    fn c6_present_blocks_only_while_it_holds_the_car() {
+        // Live grant, or expired < settle ago: refuse.
+        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 60_000), DirectBle::Block);
+        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 150_000), DirectBle::Block);
+        // Grant long expired (daemon down), no lease, sampler lease, other boot: claim + go.
+        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Claim);
+        assert_eq!(direct_ble_decision(true, true, None, "b", 1), DirectBle::Claim);
+        let sampler = r#"{"owner":"sampler","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
+        assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 1), DirectBle::Claim);
+        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "old", 1), DirectBle::Claim);
+    }
 
     fn owns(conf: &str) -> bool {
         let dir = tempfile::tempdir().unwrap();
