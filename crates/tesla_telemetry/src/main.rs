@@ -2501,21 +2501,26 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
         link.grant_live = false;
         link.grant_revoked_at = None;
     }
-    if !c6_coord::write_lease(c6_coord::Owner::Sampler) {
-        return false;
-    }
     let now = c6_coord::boottime_ms().unwrap_or(0);
     if link.grant_live {
         link.grant_live = false;
         link.grant_revoked_at = Some(now);
     }
-    match link.grant_revoked_at {
-        Some(t) if now.saturating_sub(t) < c6_coord::CLAIM_SETTLE_MS => false,
-        _ => {
-            link.grant_revoked_at = None;
-            true
-        }
+    // Settle deadline: ours, or one persisted by a previous run of this daemon.
+    let settle_until = link
+        .grant_revoked_at
+        .map(|t| t.saturating_add(c6_coord::CLAIM_SETTLE_MS))
+        // Unplugged C6: nothing left to finish a command, no settle.
+        .max(c6_coord::disk_settle_until().filter(|_| c6_coord::c6_present()))
+        .filter(|&t| now < t);
+    if !c6_coord::write_lease_settling(c6_coord::Owner::Sampler, settle_until) {
+        return false;
     }
+    if settle_until.is_some() {
+        return false;
+    }
+    link.grant_revoked_at = None;
+    true
 }
 
 /// C6 onboarding: once a provisioned C6 is live and TELEMETRY_SOURCE is unset,

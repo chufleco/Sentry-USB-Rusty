@@ -26,8 +26,9 @@ pub fn allowed_in(marker_json: Option<&str>, pi_pubkey_sha256: Option<&str>) -> 
     let c6 = marker_json
         .and_then(|m| serde_json::from_str::<serde_json::Value>(m).ok())
         .and_then(|v| v.get("pubkey_sha256").and_then(|x| x.as_str()).map(str::to_ascii_lowercase));
+    let is_sha256 = |h: &str| h.len() == 64 && h.bytes().all(|b| b.is_ascii_hexdigit());
     match (c6, pi_pubkey_sha256) {
-        (Some(c6), Some(pi)) => !c6.is_empty() && c6 != pi.to_ascii_lowercase(),
+        (Some(c6), Some(pi)) => is_sha256(&c6) && is_sha256(pi) && c6 != pi.to_ascii_lowercase(),
         _ => false,
     }
 }
@@ -45,24 +46,27 @@ mod tests {
     fn marker(h: &str) -> String {
         format!(r#"{{"pubkey_sha256":"{h}"}}"#)
     }
+    const A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
     #[test]
     fn shared_key_marker_refuses_backfill() {
-        assert!(!allowed_in(Some(&marker("abc")), Some("abc")));
-        assert!(!allowed_in(Some(&marker("ABC")), Some("abc")), "case-insensitive");
+        assert!(!allowed_in(Some(&marker(A)), Some(A)));
+        assert!(!allowed_in(Some(&marker(&A.to_uppercase())), Some(A)), "case-insensitive");
     }
 
     #[test]
     fn separate_key_marker_allows_backfill() {
-        assert!(allowed_in(Some(&marker("abc")), Some("def")));
+        assert!(allowed_in(Some(&marker(A)), Some(B)));
     }
 
     #[test]
     fn unknown_is_treated_as_shared() {
-        assert!(!allowed_in(None, Some("def")), "no marker");
-        assert!(!allowed_in(Some("garbage"), Some("def")), "unreadable marker");
-        assert!(!allowed_in(Some(r#"{"other":1}"#), Some("def")), "marker without a key");
-        assert!(!allowed_in(Some(&marker("")), Some("def")), "empty key");
-        assert!(!allowed_in(Some(&marker("abc")), None), "Pi key unreadable");
+        assert!(!allowed_in(None, Some(B)), "no marker");
+        assert!(!allowed_in(Some("garbage"), Some(B)), "unreadable marker");
+        assert!(!allowed_in(Some(r#"{"other":1}"#), Some(B)), "marker without a key");
+        assert!(!allowed_in(Some(&marker("")), Some(B)), "empty key");
+        assert!(!allowed_in(Some(&marker("abc")), Some(B)), "not a sha256");
+        assert!(!allowed_in(Some(&marker(A)), None), "Pi key unreadable");
     }
 }
