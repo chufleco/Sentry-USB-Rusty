@@ -25,6 +25,27 @@ use crate::c6_source::{C6Snapshot, HEARTBEAT_DEAD_MS};
 /// stays visible; a missing lease (fresh boot) means "hold" to the supervisor.
 pub const LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
 
+/// Serializes every lease read-decide-write across processes (this daemon and
+/// sentryusb-ble-action). Must match sentryusb_ble_action.rs.
+pub const LEASE_LOCK_PATH: &str = "/run/sentryusb-c6/lease.lock";
+
+/// Held exclusive flock on LEASE_LOCK_PATH; released on drop.
+pub struct LeaseLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the lease lock (blocking; holders only do tmpfs I/O). None = couldn't
+/// open or lock: callers must then neither grant nor connect.
+pub fn lease_lock() -> Option<LeaseLock> {
+    use std::os::fd::AsRawFd;
+    let path = std::path::Path::new(LEASE_LOCK_PATH);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    // SAFETY: valid fd owned by `f` for the duration of the call.
+    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
+    (rc == 0).then_some(LeaseLock(f))
+}
+
 /// Who wrote a sampler lease: this daemon, or `sentryusb-ble-action` holding
 /// the car for a one-shot direct action while the daemon was down.
 pub const HOLDER_TELEMETRY: &str = "telemetry";
@@ -665,6 +686,21 @@ mod tests {
         let t = CAR_LINK_FAILBACK_MS + 1;
         assert_eq!(c.step_health(LINK_DOWN, t), Owner::Sampler);
         assert_eq!(c.step_health(LINK_DOWN, t + RETURN_SETTLE_MS), Owner::C6);
+    }
+
+    #[test]
+    fn lease_lock_is_exclusive_across_handles() {
+        use std::os::fd::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("l");
+        let a = std::fs::File::create(&p).unwrap();
+        let b = std::fs::File::create(&p).unwrap();
+        unsafe {
+            assert_eq!(libc::flock(a.as_raw_fd(), libc::LOCK_EX), 0);
+            assert_ne!(libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB), 0, "second holder must wait");
+            drop(a);
+            assert_eq!(libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB), 0, "free after drop");
+        }
     }
 
     #[test]
