@@ -705,6 +705,7 @@ fn c6_owns_link() -> bool {
 // Must match the telemetry daemon's c6_coord / the supervisor's coord.rs.
 const C6_DEVICE: &str = "/dev/sentryusb-c6";
 const C6_LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
+const C6_LEASE_LOCK_PATH: &str = "/run/sentryusb-c6/lease.lock";
 const C6_CLAIM_SETTLE_MS: u64 = 35_000;
 /// Covers one direct action (each path times out within ~90s). The daemon
 /// won't grant the C6 over this lease until it lapses.
@@ -764,8 +765,27 @@ fn c6_blocks_direct() -> bool {
     ) else {
         return c6_owns_link() && present; // can't evaluate a lease: refuse only with a C6
     };
+    let owns = c6_owns_link();
+    if !owns || !present {
+        return false; // stock
+    }
+    // Read-decide-write under the lease lock the daemon also takes, so its
+    // grant and our claim can never interleave. Can't lock = refuse.
+    let _lock = {
+        use std::os::fd::AsRawFd;
+        let path = std::path::Path::new(C6_LEASE_LOCK_PATH);
+        let _ = path.parent().map(std::fs::create_dir_all);
+        let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path) else {
+            return true;
+        };
+        // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return true;
+        }
+        f
+    };
     let lease = std::fs::read_to_string(C6_LEASE_PATH).ok();
-    match direct_ble_decision(c6_owns_link(), present, lease.as_deref(), &boot, now) {
+    match direct_ble_decision(owns, present, lease.as_deref(), &boot, now) {
         DirectBle::Stock => false,
         DirectBle::Block => true,
         DirectBle::Claim => {

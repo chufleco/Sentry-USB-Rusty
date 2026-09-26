@@ -2424,6 +2424,12 @@ async fn c6_release(
         return;
     }
     link.pending_close = None;
+    // Check-then-grant under the lease lock, so a ble-action claim can't land
+    // between the check and our grant (and then be overwritten by it).
+    let Some(_lock) = c6_coord::lease_lock() else {
+        link.grant_live = false;
+        return;
+    };
     if c6_coord::ble_action_holds_car() {
         info!("C6 coordination: sentryusb-ble-action holds the car; granting once it lapses");
         link.grant_live = false;
@@ -2447,6 +2453,7 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     if !c6_possible {
         return true; // stock box
     }
+    let Some(_lock) = c6_coord::lease_lock() else { return false };
     // A grant still live on disk (e.g. from before a daemon restart) counts as
     // just-withdrawn too: the C6 may be mid-command.
     if !link.grant_live && c6_coord::disk_grant_live() {
