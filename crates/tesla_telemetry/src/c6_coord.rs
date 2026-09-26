@@ -87,9 +87,9 @@ pub const CAR_LINK_FAILBACK_MS: u64 = 5 * 60_000;
 pub const CAR_LINK_STALE_MS: u64 = 60_000;
 
 /// After a car-link failback the C6 is parked, so its link can't be observed
-/// recovering; it gets a trial grant after this, doubling per repeat failure.
-pub const CAR_LINK_TRIAL_BASE_MS: u64 = 15 * 60_000;
-pub const CAR_LINK_TRIAL_MAX_MS: u64 = 60 * 60_000;
+/// recovering; it gets a trial grant after the next step of this ladder
+/// (one step per repeat failure, then stays at the last).
+pub const CAR_LINK_TRIAL_LADDER_MS: [u64; 4] = [5 * 60_000, 15 * 60_000, 30 * 60_000, 60 * 60_000];
 
 /// C6 fully healthy this long resets the trial backoff.
 pub const BACKOFF_RESET_MS: u64 = 30 * 60_000;
@@ -106,7 +106,8 @@ pub struct Coordinator {
     /// C6-owned: when it last became fully healthy (backoff reset).
     healthy_since: Option<u64>,
     trial_at: Option<u64>,
-    backoff_ms: u64,
+    /// Index into CAR_LINK_TRIAL_LADDER_MS for the next car-link failback.
+    trial_step: usize,
 }
 
 impl Default for Coordinator {
@@ -127,7 +128,7 @@ impl Coordinator {
             recovered_since: None,
             healthy_since: None,
             trial_at: None,
-            backoff_ms: CAR_LINK_TRIAL_BASE_MS,
+            trial_step: 0,
         }
     }
 
@@ -188,15 +189,16 @@ impl Coordinator {
                     let since = *self.link_down_since.get_or_insert(now_ms);
                     if now_ms.saturating_sub(since) >= CAR_LINK_FAILBACK_MS {
                         self.take_car(Reason::CarLink);
-                        self.trial_at = Some(now_ms.saturating_add(self.backoff_ms));
-                        self.backoff_ms = (self.backoff_ms * 2).min(CAR_LINK_TRIAL_MAX_MS);
+                        let wait = CAR_LINK_TRIAL_LADDER_MS[self.trial_step];
+                        self.trial_at = Some(now_ms.saturating_add(wait));
+                        self.trial_step = (self.trial_step + 1).min(CAR_LINK_TRIAL_LADDER_MS.len() - 1);
                     }
                 } else {
                     self.dead_since = None;
                     self.link_down_since = None;
                     let since = *self.healthy_since.get_or_insert(now_ms);
                     if now_ms.saturating_sub(since) >= BACKOFF_RESET_MS {
-                        self.backoff_ms = CAR_LINK_TRIAL_BASE_MS;
+                        self.trial_step = 0;
                     }
                 }
             }
@@ -521,23 +523,40 @@ mod tests {
         assert_eq!(c.step_health(UP, t + RETURN_SETTLE_MS), Owner::C6);
     }
 
+    /// Fail back on a dead link starting at `t`; returns when the trial grant lands.
+    fn fail_and_trial(c: &mut Coordinator, t: u64, expect_wait: u64) -> u64 {
+        c.step_health(LINK_DOWN, t);
+        let f = t + CAR_LINK_FAILBACK_MS;
+        assert_eq!(c.step_health(LINK_DOWN, f), Owner::Sampler);
+        assert_eq!(c.step_health(LINK_DOWN, f + expect_wait - 1), Owner::Sampler);
+        assert_eq!(c.step_health(LINK_DOWN, f + expect_wait), Owner::C6, "trial after {expect_wait}ms");
+        f + expect_wait
+    }
+
     #[test]
-    fn parked_c6_gets_a_backed_off_trial_grant() {
+    fn parked_c6_trial_ladder_is_5_15_30_60_then_60() {
         // After a car-link failback the C6 is parked, so the link stays "down":
-        // it gets a trial grant after the backoff, which doubles on repeat.
+        // each repeat failure waits the next ladder step before a trial grant.
         let mut c = Coordinator::new();
-        c.step_health(LINK_DOWN, 0);
-        let f1 = CAR_LINK_FAILBACK_MS;
-        c.step_health(LINK_DOWN, f1);
-        assert_eq!(c.step_health(LINK_DOWN, f1 + CAR_LINK_TRIAL_BASE_MS - 1), Owner::Sampler);
-        let t1 = f1 + CAR_LINK_TRIAL_BASE_MS;
-        assert_eq!(c.step_health(LINK_DOWN, t1), Owner::C6);
-        // Trial fails: 5 more minutes down => back to sampler, next trial 2x later.
-        c.step_health(LINK_DOWN, t1 + 1);
-        let f2 = t1 + 1 + CAR_LINK_FAILBACK_MS;
-        assert_eq!(c.step_health(LINK_DOWN, f2), Owner::Sampler);
-        assert_eq!(c.step_health(LINK_DOWN, f2 + 2 * CAR_LINK_TRIAL_BASE_MS - 1), Owner::Sampler);
-        assert_eq!(c.step_health(LINK_DOWN, f2 + 2 * CAR_LINK_TRIAL_BASE_MS), Owner::C6);
+        let mut t = 0;
+        for m in [5, 15, 30, 60, 60, 60] {
+            t = fail_and_trial(&mut c, t + 1, m * 60_000);
+        }
+    }
+
+    #[test]
+    fn thirty_healthy_minutes_reset_the_ladder_to_5m() {
+        let mut c = Coordinator::new();
+        let mut t = fail_and_trial(&mut c, 0, 5 * 60_000);
+        t = fail_and_trial(&mut c, t + 1, 15 * 60_000);
+        // Trial works: healthy just under 30 min does NOT reset...
+        c.step_health(UP, t + 1);
+        c.step_health(UP, t + BACKOFF_RESET_MS);
+        t = fail_and_trial(&mut c, t + BACKOFF_RESET_MS + 1, 30 * 60_000);
+        // ...a full 30 healthy minutes does.
+        c.step_health(UP, t + 1);
+        c.step_health(UP, t + 1 + BACKOFF_RESET_MS);
+        fail_and_trial(&mut c, t + 2 + BACKOFF_RESET_MS, 5 * 60_000);
     }
 
     #[test]
@@ -549,7 +568,7 @@ mod tests {
         c.step_health(dead, CAR_LINK_FAILBACK_MS + 1);
         assert_eq!(c.reason(), Some(Reason::DeviceDead));
         // No trial grant to a dead device, however long we wait.
-        assert_eq!(c.step_health(dead, 10 * CAR_LINK_TRIAL_MAX_MS), Owner::Sampler);
+        assert_eq!(c.step_health(dead, 10 * 60 * 60_000), Owner::Sampler);
     }
 
     fn link_snap(age: Option<u64>, sleep: Option<&str>) -> C6Snapshot {
