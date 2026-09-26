@@ -4,6 +4,7 @@ pub mod actions;
 pub mod auth;
 pub mod body_controller;
 pub mod c6_backfill;
+pub mod c6_route;
 pub mod correlate;
 pub mod crypto;
 pub mod gatt;

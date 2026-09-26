@@ -16,8 +16,6 @@
 //! hold. `sentryusb-ble` (the phone-app peripheral) is a separate role and is
 //! never touched here.
 
-use std::time::Duration;
-
 use crate::c6_source::{C6Snapshot, HEARTBEAT_DEAD_MS};
 
 /// Sampler -> supervisor ownership lease (tmpfs, same box). Preserved across
@@ -270,6 +268,15 @@ impl Coordinator {
     }
 }
 
+/// One liveness observation. A failing C6 keep-awake nudge counts as a
+/// car-link outage: the signed path isn't delivering what the car needs.
+pub fn health(snap: Option<&C6Snapshot>, car_known_awake: bool, nudge_failing: bool) -> Health {
+    Health {
+        device_alive: c6_alive(snap),
+        car_link_down: car_link_down(snap, car_known_awake) || nudge_failing,
+    }
+}
+
 /// Is the C6 reaching the car? False (= not down) when the supervisor doesn't
 /// report car contact at all (older build), or the car was seen ASLEEP within
 /// ASLEEP_EXEMPT_MS and nothing shows it awake now (`car_known_awake`: clips
@@ -426,9 +433,19 @@ pub fn write_lease(owner: Owner) -> bool {
     write_lease_settling(owner, None)
 }
 
+/// Bench backfill grant (`mode:"backfill"`): the supervisor honours it only
+/// when the C6 provably holds a different key from the Pi.
+pub fn write_backfill_grant() -> bool {
+    write_lease_with(Owner::C6, None, Some("backfill"))
+}
+
 /// Sampler lease carrying the takeover settle deadline (boottime ms), so a
 /// daemon restart mid-settle still waits it out.
 pub fn write_lease_settling(owner: Owner, settle_until: Option<u64>) -> bool {
+    write_lease_with(owner, settle_until, None)
+}
+
+fn write_lease_with(owner: Owner, settle_until: Option<u64>, mode: Option<&str>) -> bool {
     let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
     let valid = match owner {
         Owner::Sampler => LEASE_VALID_MS,
@@ -440,9 +457,14 @@ pub fn write_lease_settling(owner: Owner, settle_until: Option<u64>) -> bool {
     }
     let tmp = path.with_extension("json.tmp");
     let mut body = lease_json(owner, &boot, now, valid);
-    if let Some(t) = settle_until {
+    if settle_until.is_some() || mode.is_some() {
         if let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) {
-            v["settle_until_ms"] = serde_json::json!(t);
+            if let Some(t) = settle_until {
+                v["settle_until_ms"] = serde_json::json!(t);
+            }
+            if let Some(m) = mode {
+                v["mode"] = serde_json::json!(m);
+            }
             body = v.to_string();
         }
     }
@@ -457,71 +479,9 @@ pub fn write_lease_settling(owner: Owner, settle_until: Option<u64>) -> bool {
 }
 
 
-/// Map an action-socket verb to the C6 firmware command that performs it.
-/// None = no C6 equivalent (refused while the C6 owns the link).
-pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
-    use serde_json::json;
-    // `await_result`: the firmware tracks these and reports the car's answer
-    // (cmd_result); the rest only ack receipt.
-    let v = match verb {
-        "wake" => json!({"cmd": "wake", "await_result": true}),
-        "charge-port-close" => json!({"cmd": "nudge_charge_port_close", "await_result": true}),
-        "charge-port-open" => json!({"cmd": "charge_port_open"}),
-        "keep-accessory-on" => json!({"cmd": "keep_accessory", "on": true, "await_result": true}),
-        "keep-accessory-off" => json!({"cmd": "keep_accessory", "on": false, "await_result": true}),
-        "sentry-on" => json!({"cmd": "set_sentry_mode", "on": true}),
-        "sentry-off" => json!({"cmd": "set_sentry_mode", "on": false}),
-        "charge-start" => json!({"cmd": "charging_start_stop", "start": true}),
-        "charge-stop" => json!({"cmd": "charging_start_stop", "start": false}),
-        other => {
-            if let Some(n) = other.strip_prefix("set-charging-amps:") {
-                json!({"cmd": "set_charging_amps", "amps": n.trim().parse::<i64>().ok()?})
-            } else if let Some(n) = other.strip_prefix("set-charge-limit:") {
-                json!({"cmd": "set_charge_limit", "percent": n.trim().parse::<i64>().ok()?})
-            } else {
-                return None;
-            }
-        }
-    };
-    Some(v)
-}
-
-/// POST one command to the supervisor (`/api/coprocessor/command`). Ok only on
-/// HTTP 200: the car's own result for `await_result` commands, else the C6's
-/// receipt ack. Plain HTTP/1.1 over loopback, bounded.
-pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let payload = body.to_string();
-    let req = format!(
-        "POST /api/coprocessor/command HTTP/1.1\r\nHost: {addr}\r\n\
-         Content-Type: application/json\r\nContent-Length: {}\r\n\
-         Connection: close\r\n\r\n{payload}",
-        payload.len()
-    );
-    let io = async {
-        let mut s = tokio::net::TcpStream::connect(addr).await?;
-        s.write_all(req.as_bytes()).await?;
-        let mut resp = Vec::with_capacity(512);
-        s.take(64 * 1024).read_to_end(&mut resp).await?;
-        anyhow::Ok(resp)
-    };
-    // Supervisor: 5s for the ack, up to 30s more for an awaited car result.
-    let limit = if body.get("await_result").and_then(|v| v.as_bool()) == Some(true) { 40 } else { 8 };
-    let resp = tokio::time::timeout(Duration::from_secs(limit), io)
-        .await
-        .map_err(|_| anyhow::anyhow!("C6 supervisor timed out"))??;
-    let text = String::from_utf8_lossy(&resp);
-    let status_ok = text
-        .lines()
-        .next()
-        .is_some_and(|l| l.split_whitespace().nth(1) == Some("200"));
-    if status_ok {
-        Ok(())
-    } else {
-        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
-        anyhow::bail!("C6 command failed: {}", if body.is_empty() { "no response" } else { body })
-    }
-}
+// Verb mapping + supervisor client live in tesla_ble so sentryusb-ble-action
+// uses the exact same routing when this daemon is down.
+pub use sentryusb_tesla_ble::c6_route::{supervisor_command, verb_to_c6_command};
 
 #[cfg(test)]
 mod tests {
@@ -781,6 +741,19 @@ mod tests {
     }
 
     #[test]
+    fn failing_c6_nudges_count_as_a_car_link_outage() {
+        // Signed path looks fine by contact age, but keep-awake nudges fail.
+        let snap = link_snap(Some(5_000), Some("AWAKE"));
+        assert!(!health(Some(&snap), true, false).car_link_down);
+        let h = health(Some(&snap), true, true);
+        assert!(h.car_link_down && h.device_alive);
+        // Sustained 5 min of failing nudges => the Pi takes the car.
+        let mut c = Coordinator::new();
+        assert_eq!(c.step_health(h, 0), Owner::C6);
+        assert_eq!(c.step_health(h, CAR_LINK_FAILBACK_MS), Owner::Sampler);
+    }
+
+    #[test]
     fn car_link_down_reads_the_snapshot() {
         assert!(!car_link_down(Some(&link_snap(Some(5_000), Some("AWAKE"))), false));
         assert!(car_link_down(Some(&link_snap(Some(CAR_LINK_STALE_MS + 1), Some("AWAKE"))), false));
@@ -834,17 +807,6 @@ mod tests {
         assert!(!grant_live_in(&lease_json(Owner::Sampler, "b", 1_000, LEASE_VALID_MS), "b", 5_000));
         assert!(!grant_live_in(&lease_json(Owner::C6, "other", 1_000, GRANT_VALID_MS), "b", 5_000));
         assert!(!grant_live_in("garbage", "b", 5_000));
-    }
-
-    #[test]
-    fn verbs_map_to_c6_commands() {
-        assert_eq!(verb_to_c6_command("charge-port-close").unwrap()["cmd"], "nudge_charge_port_close");
-        assert_eq!(verb_to_c6_command("keep-accessory-off").unwrap()["on"], false);
-        assert_eq!(verb_to_c6_command("set-charge-limit:80").unwrap()["percent"], 80);
-        assert_eq!(verb_to_c6_command("set-charging-amps:16").unwrap()["amps"], 16);
-        assert!(verb_to_c6_command("set-charging-amps:x").is_none());
-        assert!(verb_to_c6_command("pair").is_none());
-        assert!(verb_to_c6_command("unlock").is_none());
     }
 
     #[test]

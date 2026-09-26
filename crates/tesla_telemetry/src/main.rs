@@ -686,15 +686,13 @@ async fn tick(
         // No boottime => time never advances => stays C6-owned (safe side).
         let now = c6_coord::boottime_ms().unwrap_or(0);
         let prev = c6_link.coord.owner();
-        let health = c6_coord::Health {
-            device_alive: c6_coord::c6_alive(snap.as_ref()),
-            // Known awake: recording clips, or a keep-awake/archive holds it up
-            // (an archive unplugs the gadget, so clips alone can't show that).
-            car_link_down: c6_coord::car_link_down(
-                snap.as_ref(),
-                usb_watch::observe() == CarState::Awake || lock::keep_awake_requested(),
-            ),
-        };
+        // Known awake: recording clips, or a keep-awake/archive holds it up
+        // (an archive unplugs the gadget, so clips alone can't show that).
+        let health = c6_coord::health(
+            snap.as_ref(),
+            usb_watch::observe() == CarState::Awake || lock::keep_awake_requested(),
+            c6_link.c6_nudge_failing,
+        );
         let owner = c6_link.coord.step_health(health, now);
         if owner != prev {
             info!(
@@ -726,7 +724,10 @@ async fn tick(
                 .await;
                 return (sleep, Some(cfg));
             }
-            c6_coord::Owner::Sampler => c6_link.parked_obs = 0, // C6 evidence is stale now
+            c6_coord::Owner::Sampler => {
+                c6_link.parked_obs = 0; // C6 evidence is stale now
+                c6_link.c6_nudge_failing = false; // the Pi nudges now
+            }
         }
     }
     // Lease first, so the supervisor holds before we connect; no lease, no car.
@@ -2371,6 +2372,8 @@ struct C6Link {
     startup_checked: bool,
     /// Don't grant the C6 before this (boottime ms): leftover lease settle.
     first_grant_after: Option<u64>,
+    /// The last C6 keep-awake nudge failed (cleared on success / no keep-awake).
+    c6_nudge_failing: bool,
     /// Consecutive fresh C6 drive readings showing parked (keep-accessory
     /// input while the C6 owns the car; the sampler's own counter is idle).
     parked_obs: u32,
@@ -2482,8 +2485,10 @@ async fn c6_release(
 /// just withdrawn and a C6 command may still be in flight.
 fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     if cfg.c6_primary && cfg.c6_backfill {
-        // Bench backfill: both radios by design, so the C6 is granted too.
-        link.grant_live = c6_coord::write_lease(c6_coord::Owner::C6);
+        // Bench backfill: both radios by design, so the C6 is granted too. The
+        // grant is marked backfill: the supervisor honours it only on a proven
+        // separate key (it re-checks every time, so no window on a re-key).
+        link.grant_live = c6_coord::write_backfill_grant();
         return true;
     }
     let c6_possible = cfg.c6_primary || std::path::Path::new(c6_source::SNAPSHOT_PATH).exists();
@@ -2741,12 +2746,14 @@ async fn c6_owned_tick(
             let cmd = serde_json::json!({"cmd": "nudge_charge_port_close", "await_result": true});
             match c6_coord::supervisor_command(&cfg.c6_supervisor_api, &cmd).await {
                 Ok(()) => {
+                    link.c6_nudge_failing = false;
                     info!("keep-awake: charge-port-close nudge sent via C6 (next in {}s)", interval.as_secs());
                     *next_nudge_due_at = Some(now + interval);
                     *nudge_retry_count = 0;
                 }
                 Err(e) => {
                     *nudge_retry_count += 1;
+                    link.c6_nudge_failing = true;
                     warn!("keep-awake: C6 nudge failed (attempt {}/3): {:#}", *nudge_retry_count, e);
                     if *nudge_retry_count >= 3 {
                         let notify_due = last_nudge_notification_at
@@ -2767,6 +2774,7 @@ async fn c6_owned_tick(
     } else if !lock::keep_awake_requested() {
         *next_nudge_due_at = None;
         *nudge_retry_count = 0;
+        link.c6_nudge_failing = false;
     }
 
     // Snapshot refreshes every second; 15s matches the Active drive cadence.

@@ -134,24 +134,30 @@ async fn main() -> ExitCode {
     // socket isn't there (telemetry disabled) or the connect fails
     // (daemon crashed), fall back to direct BLE so users without
     // the telemetry daemon keep working.
-    match try_via_ipc(verb.as_str()).await {
+    match no_answer_policy(try_via_ipc(verb.as_str()).await) {
         Ok(()) => {
             info!("action via daemon IPC: {} OK", verb);
             return ExitCode::SUCCESS;
         }
-        Err(IpcError::Unavailable(reason)) => {
+        Err(IpcFail::Unavailable(reason)) => {
             // Expected on systems where telemetry isn't running.
             // Not a warning — this is the design's intended fallback.
             info!(
                 "telemetry IPC unavailable ({}), falling back to direct BLE",
                 reason
             );
-            if c6_blocks_direct() {
-                eprintln!("C6 owns the car link and the telemetry daemon is down; not opening direct BLE");
-                return ExitCode::from(3);
+            match c6_direct_path() {
+                DirectBle::Stock | DirectBle::Claim => {}
+                DirectBle::Block => {
+                    eprintln!("C6 just held the car link and the telemetry daemon is down; not opening direct BLE");
+                    return ExitCode::from(3);
+                }
+                // The C6 holds a live grant: it's the only side allowed to sign,
+                // so send the action through its supervisor (car's real answer).
+                DirectBle::RouteC6 => return run_via_c6(verb.as_str()).await,
             }
         }
-        Err(IpcError::DaemonRejected(msg)) => {
+        Err(IpcFail::DaemonRejected(msg)) => {
             // Daemon is up but refused the action (e.g. BLE disabled
             // in settings, VIN missing, radio held by something
             // else). These would also fail on the direct path, so
@@ -195,6 +201,35 @@ async fn main() -> ExitCode {
 ///                       (same failure mode would just repeat)
 #[derive(Debug)]
 enum IpcError {
+    Unavailable(String),
+    DaemonRejected(String),
+    /// Connected and sent, but no answer (timeout / read error / closed). The
+    /// daemon may still be signing: C6 mode refuses to go direct (see
+    /// `no_answer_policy`); stock treats it as Unavailable, as before.
+    NoAnswer(String),
+}
+
+/// Map `NoAnswer` per mode: flag off = stock (fall back to direct BLE);
+/// c6_primary = refuse (a slow daemon's session plus ours = two Pi signers,
+/// and the C6 may hold the same key).
+fn no_answer_policy<T>(r: Result<T, IpcError>) -> Result<T, IpcFail> {
+    no_answer_policy_with(r, c6_owns_link())
+}
+
+fn no_answer_policy_with<T>(r: Result<T, IpcError>, c6_mode: bool) -> Result<T, IpcFail> {
+    match r {
+        Ok(v) => Ok(v),
+        Err(IpcError::NoAnswer(m)) if c6_mode => Err(IpcFail::DaemonRejected(format!(
+            "telemetry daemon did not answer ({m}); C6 mode: not opening direct BLE"
+        ))),
+        Err(IpcError::NoAnswer(m) | IpcError::Unavailable(m)) => Err(IpcFail::Unavailable(m)),
+        Err(IpcError::DaemonRejected(m)) => Err(IpcFail::DaemonRejected(m)),
+    }
+}
+
+/// IPC outcome after `no_answer_policy`: fall back to direct, or surface.
+#[derive(Debug, PartialEq, Eq)]
+enum IpcFail {
     Unavailable(String),
     DaemonRejected(String),
 }
@@ -250,7 +285,7 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
     )
     .await;
     match read_result {
-        Ok(Ok(0)) => Err(IpcError::Unavailable(
+        Ok(Ok(0)) => Err(IpcError::NoAnswer(
             "daemon closed connection without response".into(),
         )),
         Ok(Ok(_)) => {
@@ -266,11 +301,11 @@ async fn try_via_ipc(verb: &str) -> Result<(), IpcError> {
                 )))
             }
         }
-        Ok(Err(e)) => Err(IpcError::Unavailable(format!(
+        Ok(Err(e)) => Err(IpcError::NoAnswer(format!(
             "read response: {}",
             e
         ))),
-        Err(_) => Err(IpcError::Unavailable(
+        Err(_) => Err(IpcError::NoAnswer(
             "daemon response timed out after 90s".into(),
         )),
     }
@@ -316,23 +351,23 @@ fn run_keygen() -> ExitCode {
 /// the telemetry daemon's warm connection; direct fallback covers a
 /// disabled/crashed daemon.
 async fn run_session_info() -> ExitCode {
-    match session_info_via_ipc().await {
+    match no_answer_policy(session_info_via_ipc().await) {
         Ok(token) => {
             println!("{token}");
             return ExitCode::SUCCESS;
         }
-        Err(IpcError::Unavailable(reason)) => {
+        Err(IpcFail::Unavailable(reason)) => {
             info!(
                 "telemetry IPC unavailable ({}), checking pairing via direct BLE",
                 reason
             );
             // Unknown, never NOT_PAIRED: the API leaves the paired marker alone.
-            if c6_blocks_direct() {
+            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
                 println!("UNREACHABLE");
                 return ExitCode::SUCCESS;
             }
         }
-        Err(IpcError::DaemonRejected(msg)) => {
+        Err(IpcFail::DaemonRejected(msg)) => {
             // Daemon answered with something we don't recognise. Don't
             // fall through to a direct attempt (it would just wake the
             // car again and likely repeat) — report unknown as
@@ -389,23 +424,23 @@ async fn run_session_info() -> ExitCode {
 ///
 /// Exit codes: 0 request delivered, 2 config/key error, 3 BLE/slot error.
 async fn run_pair() -> ExitCode {
-    match try_via_ipc("pair").await {
+    match no_answer_policy(try_via_ipc("pair").await) {
         Ok(()) => {
             println!("OK");
             info!("add-key-request delivered via daemon IPC — tap your card on the console");
             return ExitCode::SUCCESS;
         }
-        Err(IpcError::Unavailable(reason)) => {
+        Err(IpcFail::Unavailable(reason)) => {
             info!(
                 "telemetry IPC unavailable ({}), sending add-key-request via direct BLE",
                 reason
             );
-            if c6_blocks_direct() {
+            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
                 eprintln!("C6 owns the car link; pair the C6 instead");
                 return ExitCode::from(3);
             }
         }
-        Err(IpcError::DaemonRejected(msg)) => {
+        Err(IpcFail::DaemonRejected(msg)) => {
             // Daemon is up but the add-key write failed (slot full, car
             // out of range/asleep). A direct attempt would open a *new*
             // connection — exactly what hits the car's slot limit — so
@@ -483,7 +518,7 @@ async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     match tokio::time::timeout(Duration::from_secs(90), reader.read_line(&mut line)).await {
-        Ok(Ok(0)) => Err(IpcError::Unavailable(
+        Ok(Ok(0)) => Err(IpcError::NoAnswer(
             "daemon closed connection without response".into(),
         )),
         Ok(Ok(_)) => {
@@ -499,8 +534,8 @@ async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
                 Err(IpcError::DaemonRejected(line.to_string()))
             }
         }
-        Ok(Err(e)) => Err(IpcError::Unavailable(format!("read response: {}", e))),
-        Err(_) => Err(IpcError::Unavailable(
+        Ok(Err(e)) => Err(IpcError::NoAnswer(format!("read response: {}", e))),
+        Err(_) => Err(IpcError::NoAnswer(
             "daemon response timed out after 90s".into(),
         )),
     }
@@ -512,22 +547,22 @@ async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
 /// query reuses the telemetry daemon's warm connection; direct fallback
 /// covers a disabled/crashed daemon.
 async fn run_state_query(verb: &str) -> ExitCode {
-    match state_query_via_ipc(verb).await {
+    match no_answer_policy(state_query_via_ipc(verb).await) {
         Ok(token) => {
             println!("{token}");
             return ExitCode::SUCCESS;
         }
-        Err(IpcError::Unavailable(reason)) => {
+        Err(IpcFail::Unavailable(reason)) => {
             info!(
                 "telemetry IPC unavailable ({}), reading vehicle state via direct BLE",
                 reason
             );
-            if c6_blocks_direct() {
+            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
                 eprintln!("C6 owns the car link and the telemetry daemon is down");
                 return ExitCode::from(3);
             }
         }
-        Err(IpcError::DaemonRejected(msg)) => {
+        Err(IpcFail::DaemonRejected(msg)) => {
             // Daemon is up but couldn't read the state (car asleep /
             // unreachable / no concrete reading). A direct attempt would
             // just repeat against the same car, so surface the failure
@@ -612,7 +647,7 @@ async fn state_query_via_ipc(verb: &str) -> Result<String, IpcError> {
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
     match tokio::time::timeout(Duration::from_secs(90), reader.read_line(&mut line)).await {
-        Ok(Ok(0)) => Err(IpcError::Unavailable(
+        Ok(Ok(0)) => Err(IpcError::NoAnswer(
             "daemon closed connection without response".into(),
         )),
         Ok(Ok(_)) => {
@@ -630,8 +665,8 @@ async fn state_query_via_ipc(verb: &str) -> Result<String, IpcError> {
                 )))
             }
         }
-        Ok(Err(e)) => Err(IpcError::Unavailable(format!("read response: {}", e))),
-        Err(_) => Err(IpcError::Unavailable(
+        Ok(Err(e)) => Err(IpcError::NoAnswer(format!("read response: {}", e))),
+        Err(_) => Err(IpcError::NoAnswer(
             "daemon response timed out after 90s".into(),
         )),
     }
@@ -719,8 +754,11 @@ enum DirectBle {
     Stock,
     /// C6 present but not driving: claim the car (lease), then go direct.
     Claim,
-    /// The C6 holds (or only just held) the car: refuse.
+    /// The C6 only just held the car (grant expired < settle ago) or the lease
+    /// is unreadable: refuse.
     Block,
+    /// The C6 holds a live grant: route the action through its supervisor.
+    RouteC6,
 }
 
 /// Pure: may this process open its own session? `lease` = current lease file.
@@ -734,6 +772,20 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
         Some(Ok(v)) => Some(v),
         Some(Err(_)) => return DirectBle::Block,
     };
+    let grant_now = parsed.as_ref().is_some_and(|v| {
+        v.get("owner").and_then(|x| x.as_str()) == Some("c6")
+            && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+            && match (
+                v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+                v.get("valid_for_ms").and_then(|x| x.as_u64()),
+            ) {
+                (Some(w), Some(valid)) => now_ms < w.saturating_add(valid),
+                _ => false,
+            }
+    });
+    if grant_now {
+        return DirectBle::RouteC6;
+    }
     let grant_recent = parsed.is_some_and(|v| {
             v.get("owner").and_then(|x| x.as_str()) == Some("c6")
                 && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
@@ -765,20 +817,21 @@ fn boottime_ms() -> Option<u64> {
 }
 
 /// Called when the telemetry daemon is unreachable. C6 absent (unplugged) or
-/// flag off = stock direct BLE. C6 present: refuse while it holds the car;
-/// otherwise publish our own sampler lease (supervisor holds + parks) first.
-fn c6_blocks_direct() -> bool {
+/// flag off = stock direct BLE. C6 present: route through it while it holds
+/// a live grant, refuse right after one; otherwise publish our own sampler
+/// lease (supervisor holds + parks) and go direct.
+fn c6_direct_path() -> DirectBle {
     let present = std::path::Path::new(C6_DEVICE).exists();
+    if !present {
+        return DirectBle::Stock;
+    }
     let (Some(boot), Some(now)) = (
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()),
         boottime_ms(),
     ) else {
-        return c6_owns_link() && present; // can't evaluate a lease: refuse only with a C6
+        return DirectBle::Block; // can't evaluate a lease with a C6 present: refuse
     };
     let owns = c6_owns_link();
-    if !present {
-        return false; // stock
-    }
     // Read-decide-write under the lease lock the daemon also takes, so its
     // grant and our claim can never interleave. Can't lock = refuse.
     let _lock = {
@@ -786,18 +839,16 @@ fn c6_blocks_direct() -> bool {
         let path = std::path::Path::new(C6_LEASE_LOCK_PATH);
         let _ = path.parent().map(std::fs::create_dir_all);
         let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path) else {
-            return true;
+            return DirectBle::Block;
         };
         // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
         if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return true;
+            return DirectBle::Block;
         }
         f
     };
     let lease = std::fs::read_to_string(C6_LEASE_PATH).ok();
     match direct_ble_decision(owns, present, lease.as_deref(), &boot, now) {
-        DirectBle::Stock => false,
-        DirectBle::Block => true,
         DirectBle::Claim => {
             let body = serde_json::json!({
                 "owner": "sampler", "holder": "ble-action", "boot_id": boot,
@@ -808,9 +859,42 @@ fn c6_blocks_direct() -> bool {
             let tmp = path.with_extension("json.tmp");
             let ok = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
                 && std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)).is_ok();
-            !ok // can't publish our claim: don't risk two signers
+            // Can't publish our claim: don't risk two signers.
+            if ok { DirectBle::Claim } else { DirectBle::Block }
+        }
+        other => other,
+    }
+}
+
+/// Send `verb` through the C6 supervisor, waiting for the car's own answer
+/// where the firmware tracks one. Exit codes as the direct path.
+async fn run_via_c6(verb: &str) -> ExitCode {
+    let Some(cmd) = sentryusb_tesla_ble::c6_route::verb_to_c6_command(verb) else {
+        eprintln!("C6 owns the car link; '{verb}' has no C6 equivalent");
+        return ExitCode::from(3);
+    };
+    let api = supervisor_api();
+    match sentryusb_tesla_ble::c6_route::supervisor_command(&api, &cmd).await {
+        Ok(()) => {
+            info!("action via C6 supervisor: {} OK", verb);
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            error!("action via C6 supervisor failed: {e:#}");
+            ExitCode::from(3)
         }
     }
+}
+
+/// C6 supervisor address from `C6_SUPERVISOR_API` (loopback only, as in the
+/// daemon's BleConfig), else the default.
+fn supervisor_api() -> String {
+    sentryusb_config::parse_file(sentryusb_config::find_config_path())
+        .ok()
+        .and_then(|(a, c)| sentryusb_config::get_config_value(&a, &c, "C6_SUPERVISOR_API"))
+        .map(|v| v.trim().to_string())
+        .filter(|v| v.starts_with("127.0.0.1:") || v.starts_with("localhost:"))
+        .unwrap_or_else(|| sentryusb_tesla_ble::c6_route::DEFAULT_SUPERVISOR_API.to_string())
 }
 
 /// `backfill_ok`: C6_BACKFILL only counts on a proven separate key; on a
@@ -850,17 +934,32 @@ mod tests {
     }
 
     #[test]
+    fn no_answer_is_stock_fallback_only_with_the_flag_off() {
+        use super::{no_answer_policy_with, IpcError, IpcFail};
+        let slow = || Err::<(), _>(IpcError::NoAnswer("daemon response timed out after 90s".into()));
+        // Stock (flag off): unchanged, falls back to direct BLE.
+        assert_eq!(no_answer_policy_with(slow(), false), Err(IpcFail::Unavailable("daemon response timed out after 90s".into())));
+        // C6 mode: a slow daemon may still be signing; never go direct.
+        assert!(matches!(no_answer_policy_with(slow(), true), Err(IpcFail::DaemonRejected(_))));
+        // A daemon that isn't there at all still falls back in both modes.
+        let down = || Err::<(), _>(IpcError::Unavailable("connect: refused".into()));
+        assert!(matches!(no_answer_policy_with(down(), true), Err(IpcFail::Unavailable(_))));
+    }
+
+    #[test]
     fn c6_absent_or_flag_off_is_stock_behaviour() {
         assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
         assert_eq!(direct_ble_decision(false, true, None, "b", 1), DirectBle::Stock);
-        // Flag flipped off while a grant is still live: still refuse.
-        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::Block);
+        // Flag flipped off while a grant is still live: never direct.
+        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::RouteC6);
     }
 
     #[test]
     fn c6_present_blocks_only_while_it_holds_the_car() {
-        // Live grant, or expired < settle ago: refuse.
-        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 60_000), DirectBle::Block);
+        // Live grant: route through the C6 (even with the flag flipped off).
+        assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 60_000), DirectBle::RouteC6);
+        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 60_000), DirectBle::RouteC6);
+        // Expired < settle ago: refuse (a C6 command may still be in flight).
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 150_000), DirectBle::Block);
         // Grant long expired (daemon down), no lease, sampler lease, other boot: claim + go.
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Claim);
