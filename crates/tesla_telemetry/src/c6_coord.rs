@@ -363,6 +363,26 @@ pub fn disk_grant_live() -> bool {
         .is_ok_and(|l| grant_live_in(&l, &boot, now.saturating_sub(CLAIM_SETTLE_MS)))
 }
 
+/// A live sampler lease (any holder) is on disk, e.g. from a previous run.
+pub fn disk_sampler_lease_live() -> bool {
+    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return true };
+    std::fs::read_to_string(LEASE_PATH).is_ok_and(|l| sampler_lease_live_in(&l, &boot, now))
+}
+
+/// Pure: a live `owner:sampler` lease from this boot, any holder.
+pub fn sampler_lease_live_in(lease: &str, boot_id: &str, now_ms: u64) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(lease) else { return true };
+    v.get("owner").and_then(|x| x.as_str()) == Some("sampler")
+        && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+        && match (
+            v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+            v.get("valid_for_ms").and_then(|x| x.as_u64()),
+        ) {
+            (Some(w), Some(valid)) => now_ms < w.saturating_add(valid),
+            _ => true,
+        }
+}
+
 /// Pure: is `lease` a live sampler lease held by `sentryusb-ble-action`?
 pub fn ble_action_lease_live_in(lease: &str, boot_id: &str, now_ms: u64) -> bool {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(lease) else { return false };
@@ -701,6 +721,16 @@ mod tests {
             drop(a);
             assert_eq!(libc::flock(b.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB), 0, "free after drop");
         }
+    }
+
+    #[test]
+    fn leftover_sampler_lease_is_detected_for_the_startup_settle() {
+        let l = lease_json(Owner::Sampler, "b", 0, LEASE_VALID_MS);
+        assert!(sampler_lease_live_in(&l, "b", 1_000));
+        assert!(!sampler_lease_live_in(&l, "b", LEASE_VALID_MS));
+        assert!(!sampler_lease_live_in(&lease_json(Owner::C6, "b", 0, GRANT_VALID_MS), "b", 1_000));
+        assert!(!sampler_lease_live_in(&l, "other", 1_000));
+        assert!(sampler_lease_live_in("garbage", "b", 1_000), "unreadable = assume live");
     }
 
     #[test]
