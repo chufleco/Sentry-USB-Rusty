@@ -706,7 +706,9 @@ fn c6_owns_link() -> bool {
 const C6_DEVICE: &str = "/dev/sentryusb-c6";
 const C6_LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
 const C6_CLAIM_SETTLE_MS: u64 = 35_000;
-const C6_SAMPLER_LEASE_MS: u64 = 10 * 60_000;
+/// Covers one direct action (each path times out within ~90s). The daemon
+/// won't grant the C6 over this lease until it lapses.
+const C6_SAMPLER_LEASE_MS: u64 = 120_000;
 
 #[derive(Debug, PartialEq, Eq)]
 enum DirectBle {
@@ -723,9 +725,13 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
     if !c6_primary || !c6_present {
         return DirectBle::Stock;
     }
-    let grant_recent = lease
-        .and_then(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .is_some_and(|v| {
+    // A lease we can't parse at all: assume a live grant (refuse).
+    let parsed = match lease.map(serde_json::from_str::<serde_json::Value>) {
+        None => None,
+        Some(Ok(v)) => Some(v),
+        Some(Err(_)) => return DirectBle::Block,
+    };
+    let grant_recent = parsed.is_some_and(|v| {
             v.get("owner").and_then(|x| x.as_str()) == Some("c6")
                 && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
                 && match (
@@ -764,7 +770,7 @@ fn c6_blocks_direct() -> bool {
         DirectBle::Block => true,
         DirectBle::Claim => {
             let body = serde_json::json!({
-                "owner": "sampler", "boot_id": boot,
+                "owner": "sampler", "holder": "ble-action", "boot_id": boot,
                 "written_boottime_ms": now, "valid_for_ms": C6_SAMPLER_LEASE_MS,
             })
             .to_string();
@@ -827,6 +833,8 @@ mod tests {
         let sampler = r#"{"owner":"sampler","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
         assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 1), DirectBle::Claim);
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "old", 1), DirectBle::Claim);
+        // Unparseable lease: assume a live grant.
+        assert_eq!(direct_ble_decision(true, true, Some("garbage"), "b", 1), DirectBle::Block);
     }
 
     fn owns(conf: &str) -> bool {

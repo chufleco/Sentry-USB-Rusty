@@ -488,6 +488,7 @@ async fn main() -> Result<()> {
                     let c6_owns = c6_link.c6_owns(&cfg);
                     let route = keep_accessory_route(
                         c6_owns,
+                        c6_link.grant_live,
                         ble_session.as_ref().map(|h| &h.session),
                         &cfg.c6_supervisor_api,
                     );
@@ -686,7 +687,7 @@ async fn tick(
         let prev = c6_link.coord.owner();
         let health = c6_coord::Health {
             device_alive: c6_coord::c6_alive(snap.as_ref()),
-            car_link_down: c6_coord::car_link_down(snap.as_ref()),
+            car_link_down: c6_coord::car_link_down(snap.as_ref(), usb_watch::observe() == CarState::Awake),
         };
         let owner = c6_link.coord.step_health(health, now);
         if owner != prev {
@@ -719,7 +720,7 @@ async fn tick(
                 .await;
                 return (sleep, Some(cfg));
             }
-            c6_coord::Owner::Sampler => {}
+            c6_coord::Owner::Sampler => c6_link.parked_obs = 0, // C6 evidence is stale now
         }
     }
     // Lease first, so the supervisor holds before we connect; no lease, no car.
@@ -2368,10 +2369,11 @@ struct C6Link {
 /// (Pi owns but has no session yet); evaluate() then retries next tick.
 fn keep_accessory_route<'a>(
     c6_owns: bool,
+    c6_granted: bool,
     session: Option<&'a sentryusb_tesla_ble::manager::PersistentSession>,
     c6_api: &'a str,
 ) -> Option<keep_accessory::Route<'a>> {
-    match keep_accessory_via(c6_owns, session.is_some())? {
+    match keep_accessory_via(c6_owns, c6_granted, session.is_some())? {
         KaVia::C6 => Some(keep_accessory::Route::C6 { api: c6_api }),
         KaVia::Ble => session.map(keep_accessory::Route::Ble),
     }
@@ -2383,10 +2385,11 @@ enum KaVia {
     Ble,
 }
 
-/// Pure routing decision: the owner of the car sends; never both.
-fn keep_accessory_via(c6_owns: bool, have_session: bool) -> Option<KaVia> {
+/// Pure routing decision: the owner of the car sends; never both. C6-owned but
+/// not yet granted on disk = nobody sends (evaluate() retries next tick).
+fn keep_accessory_via(c6_owns: bool, c6_granted: bool, have_session: bool) -> Option<KaVia> {
     if c6_owns {
-        Some(KaVia::C6)
+        c6_granted.then_some(KaVia::C6)
     } else if have_session {
         Some(KaVia::Ble)
     } else {
@@ -2416,10 +2419,13 @@ async fn c6_release(
         return;
     }
     link.pending_close = None;
-    link.grant_revoked_at = None;
-    if c6_coord::write_lease(c6_coord::Owner::C6) {
-        link.grant_live = true;
+    if c6_coord::ble_action_holds_car() {
+        info!("C6 coordination: sentryusb-ble-action holds the car; granting once it lapses");
+        link.grant_live = false;
+        return;
     }
+    link.grant_revoked_at = None;
+    link.grant_live = c6_coord::write_lease(c6_coord::Owner::C6);
 }
 
 /// Publish the sampler lease before any Pi session touches the car, whenever
@@ -2662,7 +2668,9 @@ async fn c6_owned_tick(
 
     // Keep-awake: same cadence/retry/notify budget as the BLE path, sent by
     // the C6 (the only device allowed to sign on this key right now).
-    if lock::keep_awake_requested() {
+    // No grant on disk yet (our session still closing, or ble-action holds the
+    // car): the supervisor would refuse, so don't burn the retry budget.
+    if lock::keep_awake_requested() && link.grant_live {
         let now = Instant::now();
         if next_nudge_due_at.map(|t| now >= t).unwrap_or(true) {
             let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
@@ -2692,7 +2700,7 @@ async fn c6_owned_tick(
                 }
             }
         }
-    } else {
+    } else if !lock::keep_awake_requested() {
         *next_nudge_due_at = None;
         *nudge_retry_count = 0;
     }
@@ -2743,13 +2751,15 @@ mod keep_accessory_route_tests {
     #[test]
     fn owner_decides_who_sends_keep_accessory() {
         // C6 owns: the C6 sends, even if a stale session handle lingers.
-        assert_eq!(keep_accessory_via(true, false), Some(KaVia::C6));
-        assert_eq!(keep_accessory_via(true, true), Some(KaVia::C6));
+        assert_eq!(keep_accessory_via(true, true, false), Some(KaVia::C6));
+        assert_eq!(keep_accessory_via(true, true, true), Some(KaVia::C6));
+        // C6 owns but the grant isn't on disk yet: nobody sends this tick.
+        assert_eq!(keep_accessory_via(true, false, true), None);
         // Pi holds the grant: its own session sends; no session yet = retry later.
-        assert_eq!(keep_accessory_via(false, true), Some(KaVia::Ble));
-        assert_eq!(keep_accessory_via(false, false), None);
+        assert_eq!(keep_accessory_via(false, false, true), Some(KaVia::Ble));
+        assert_eq!(keep_accessory_via(false, false, false), None);
         assert!(matches!(
-            keep_accessory_route(true, None, "127.0.0.1:1"),
+            keep_accessory_route(true, true, None, "127.0.0.1:1"),
             Some(keep_accessory::Route::C6 { .. })
         ));
     }
