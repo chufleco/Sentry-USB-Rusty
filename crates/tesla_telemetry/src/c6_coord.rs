@@ -20,9 +20,9 @@ use std::time::Duration;
 
 use crate::c6_source::{C6Snapshot, HEARTBEAT_DEAD_MS};
 
-/// Sampler -> supervisor ownership lease (tmpfs, same box). The supervisor
-/// unit's RuntimeDirectory= wipes it on every supervisor restart; a missing
-/// lease means "hold", so that is safe by design.
+/// Sampler -> supervisor ownership lease (tmpfs, same box). Preserved across
+/// supervisor restarts (RuntimeDirectoryPreserve=yes) so a just-expired grant
+/// stays visible; a missing lease (fresh boot) means "hold" to the supervisor.
 pub const LEASE_PATH: &str = "/run/sentryusb-c6/sampler_lease.json";
 
 /// Who wrote a sampler lease: this daemon, or `sentryusb-ble-action` holding
@@ -93,8 +93,9 @@ pub struct Health {
 pub const CAR_LINK_FAILBACK_MS: u64 = 5 * 60_000;
 
 /// A car last seen ASLEEP that stops answering is not an outage, but only for
-/// this long after that reading, and never while dashcam clips show the car
-/// awake: the reading can't refresh once the link itself is dead.
+/// this long after that reading, and never while the car is known awake
+/// (clips being written, or a keep-awake/archive in effect): the reading can't
+/// refresh once the link itself is dead.
 pub const ASLEEP_EXEMPT_MS: u64 = 30 * 60_000;
 
 /// No car contact for this long counts as "car link down" (the C6's idle
@@ -250,15 +251,16 @@ impl Coordinator {
 
 /// Is the C6 reaching the car? False (= not down) when the supervisor doesn't
 /// report car contact at all (older build), or the car was seen ASLEEP within
-/// ASLEEP_EXEMPT_MS and dashcam clips don't show it awake (`car_recording`).
-pub fn car_link_down(snap: Option<&C6Snapshot>, car_recording: bool) -> bool {
+/// ASLEEP_EXEMPT_MS and nothing shows it awake now (`car_known_awake`: clips
+/// being written, or a keep-awake/archive in effect).
+pub fn car_link_down(snap: Option<&C6Snapshot>, car_known_awake: bool) -> bool {
     let Some(s) = snap else { return false };
     if !s.car_link_reported {
         return false;
     }
     let recently_asleep = s.car_sleep_status.as_deref().is_some_and(|v| v.eq_ignore_ascii_case("ASLEEP"))
         && s.car_sleep_age_ms().is_some_and(|a| a <= ASLEEP_EXEMPT_MS);
-    if recently_asleep && !car_recording {
+    if recently_asleep && !car_known_awake {
         return false;
     }
     match s.car_ok_age_ms() {
