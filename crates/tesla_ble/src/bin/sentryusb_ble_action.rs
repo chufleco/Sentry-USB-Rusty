@@ -146,6 +146,10 @@ async fn main() -> ExitCode {
                 "telemetry IPC unavailable ({}), falling back to direct BLE",
                 reason
             );
+            if c6_owns_link() {
+                eprintln!("C6 owns the car link and the telemetry daemon is down; not opening direct BLE");
+                return ExitCode::from(3);
+            }
         }
         Err(IpcError::DaemonRejected(msg)) => {
             // Daemon is up but refused the action (e.g. BLE disabled
@@ -322,6 +326,11 @@ async fn run_session_info() -> ExitCode {
                 "telemetry IPC unavailable ({}), checking pairing via direct BLE",
                 reason
             );
+            // Unknown, never NOT_PAIRED: the API leaves the paired marker alone.
+            if c6_owns_link() {
+                println!("UNREACHABLE");
+                return ExitCode::SUCCESS;
+            }
         }
         Err(IpcError::DaemonRejected(msg)) => {
             // Daemon answered with something we don't recognise. Don't
@@ -391,6 +400,10 @@ async fn run_pair() -> ExitCode {
                 "telemetry IPC unavailable ({}), sending add-key-request via direct BLE",
                 reason
             );
+            if c6_owns_link() {
+                eprintln!("C6 owns the car link; pair the C6 instead");
+                return ExitCode::from(3);
+            }
         }
         Err(IpcError::DaemonRejected(msg)) => {
             // Daemon is up but the add-key write failed (slot full, car
@@ -509,6 +522,10 @@ async fn run_state_query(verb: &str) -> ExitCode {
                 "telemetry IPC unavailable ({}), reading vehicle state via direct BLE",
                 reason
             );
+            if c6_owns_link() {
+                eprintln!("C6 owns the car link and the telemetry daemon is down");
+                return ExitCode::from(3);
+            }
         }
         Err(IpcError::DaemonRejected(msg)) => {
             // Daemon is up but couldn't read the state (car asleep /
@@ -676,6 +693,36 @@ fn load_config() -> Result<(String, Option<String>)> {
     Ok((vin, adapter))
 }
 
+/// True when `TELEMETRY_SOURCE=c6_primary` (and not the C6_BACKFILL bench
+/// mode): the ESP32-C6 shares this key, so no direct Pi session may open.
+/// Same active-then-commented lookup as the telemetry daemon's BleConfig.
+fn c6_owns_link() -> bool {
+    let Ok(raw) = std::fs::read_to_string(CONFIG_FILE) else { return false };
+    c6_owns_link_in(&raw)
+}
+
+fn c6_owns_link_in(raw: &str) -> bool {
+    let lookup = |key: &str| -> Option<String> {
+        let active = format!("export {key}=");
+        let commented = format!("#export {key}=");
+        let mut fallback = None;
+        for line in raw.lines() {
+            let t = line.trim_start();
+            if let Some(v) = t.strip_prefix(&active) {
+                return Some(unquote(v));
+            }
+            if let Some(v) = t.strip_prefix(&commented) {
+                fallback.get_or_insert_with(|| unquote(v));
+            }
+        }
+        fallback
+    };
+    let primary = lookup("TELEMETRY_SOURCE").is_some_and(|v| v.eq_ignore_ascii_case("c6_primary"));
+    let backfill = lookup("C6_BACKFILL")
+        .is_some_and(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "yes" | "true"));
+    primary && !backfill
+}
+
 fn unquote(s: &str) -> String {
     let t = s.trim();
     // len >= 2 so a value that is a single quote character can't
@@ -687,5 +734,19 @@ fn unquote(s: &str) -> String {
         t[1..t.len() - 1].to_string()
     } else {
         t.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::c6_owns_link_in;
+
+    #[test]
+    fn c6_guard_follows_the_config() {
+        assert!(!c6_owns_link_in("export TESLA_BLE_VIN=X\n"));
+        assert!(c6_owns_link_in("export TELEMETRY_SOURCE='c6_primary'\n"));
+        assert!(c6_owns_link_in("#export TELEMETRY_SOURCE=c6_primary\n"));
+        assert!(!c6_owns_link_in("export TELEMETRY_SOURCE=sampler\n#export TELEMETRY_SOURCE=c6_primary\n"));
+        assert!(!c6_owns_link_in("export TELEMETRY_SOURCE=c6_primary\nexport C6_BACKFILL=1\n"));
     }
 }
