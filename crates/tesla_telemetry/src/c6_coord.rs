@@ -8,10 +8,11 @@
 //!   * Sampler owns: only after the C6 has been dead for `FAILBACK_AFTER_MS`.
 //!     It hands back once the C6 has been alive again for `RETURN_SETTLE_MS`.
 //!
-//! The sampler publishes its ownership in a lease file the C6 supervisor
-//! checks before every car command, so the supervisor never polls while the
-//! sampler holds the car. `sentryusb-ble` (the phone-app peripheral) is a
-//! separate role and is never touched here.
+//! The sampler publishes ownership in a lease file the C6 supervisor checks
+//! before every car command. The supervisor may only talk to the car under a
+//! live `owner:c6` grant; a missing, expired or `owner:sampler` lease means
+//! hold. `sentryusb-ble` (the phone-app peripheral) is a separate role and is
+//! never touched here.
 
 use std::time::Duration;
 
@@ -33,9 +34,12 @@ pub const RETURN_SETTLE_MS: u64 = 30_000;
 pub const SNAPSHOT_MAX_AGE_MS: u64 = 10_000;
 
 /// How long a sampler-owned lease stays valid without a refresh. Longer than
-/// any single tick (scan + polls) so it can't lapse mid-tick; a crashed daemon
-/// frees the supervisor after this.
+/// any single tick (scan + polls) so it can't lapse mid-tick.
 pub const LEASE_VALID_MS: u64 = 10 * 60_000;
+
+/// How long a C6 grant stays valid without a refresh (C6-owned ticks refresh
+/// it every 15s). If this daemon dies, the C6 stops within this window.
+pub const GRANT_VALID_MS: u64 = 2 * 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Owner {
@@ -144,38 +148,43 @@ pub fn lease_json(owner: Owner, boot_id: &str, now_ms: u64, valid_for_ms: u64) -
     .to_string()
 }
 
-/// Publish the lease atomically (tmp + rename). Best-effort: a failed write
-/// leaves the previous lease, which only errs toward the supervisor holding.
-pub fn write_lease(owner: Owner) {
-    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return };
+/// Publish the lease atomically (tmp + rename). Returns false if it could not
+/// be written: the caller must then NOT connect to the car (a stale grant may
+/// still be live for the supervisor).
+pub fn write_lease(owner: Owner) -> bool {
+    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
     let valid = match owner {
         Owner::Sampler => LEASE_VALID_MS,
-        Owner::C6 => 0,
+        Owner::C6 => GRANT_VALID_MS,
     };
     let path = std::path::Path::new(LEASE_PATH);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let tmp = path.with_extension("json.tmp");
-    if std::fs::write(&tmp, lease_json(owner, &boot, now, valid)).is_ok() {
-        let _ = std::fs::rename(&tmp, path);
+    let ok = std::fs::write(&tmp, lease_json(owner, &boot, now, valid))
+        .and_then(|()| std::fs::rename(&tmp, path))
+        .is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("C6 coordination: could not write {} lease", owner.as_str());
     }
+    ok
 }
 
-/// Short pause after dropping our session before telling the supervisor it may
-/// poll, so our link is closed first.
-pub const RELEASE_GRACE: Duration = Duration::from_secs(2);
 
 /// Map an action-socket verb to the C6 firmware command that performs it.
 /// None = no C6 equivalent (refused while the C6 owns the link).
 pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
     use serde_json::json;
+    // `await_result`: the firmware tracks these and reports the car's answer
+    // (cmd_result); the rest only ack receipt.
     let v = match verb {
-        "wake" => json!({"cmd": "wake"}),
-        "charge-port-close" => json!({"cmd": "nudge_charge_port_close"}),
+        "wake" => json!({"cmd": "wake", "await_result": true}),
+        "charge-port-close" => json!({"cmd": "nudge_charge_port_close", "await_result": true}),
         "charge-port-open" => json!({"cmd": "charge_port_open"}),
-        "keep-accessory-on" => json!({"cmd": "keep_accessory", "on": true}),
-        "keep-accessory-off" => json!({"cmd": "keep_accessory", "on": false}),
+        "keep-accessory-on" => json!({"cmd": "keep_accessory", "on": true, "await_result": true}),
+        "keep-accessory-off" => json!({"cmd": "keep_accessory", "on": false, "await_result": true}),
         "sentry-on" => json!({"cmd": "set_sentry_mode", "on": true}),
         "sentry-off" => json!({"cmd": "set_sentry_mode", "on": false}),
         "charge-start" => json!({"cmd": "charging_start_stop", "start": true}),
@@ -194,8 +203,8 @@ pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
 }
 
 /// POST one command to the supervisor (`/api/coprocessor/command`). Ok only on
-/// an HTTP 200 ack. Plain HTTP/1.1 over loopback; bounded so a hung supervisor
-/// can't stall the tick loop.
+/// HTTP 200: the car's own result for `await_result` commands, else the C6's
+/// receipt ack. Plain HTTP/1.1 over loopback, bounded.
 pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let payload = body.to_string();
@@ -212,8 +221,9 @@ pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow:
         s.take(64 * 1024).read_to_end(&mut resp).await?;
         anyhow::Ok(resp)
     };
-    // Supervisor waits up to 5s for the C6 ack; allow for that plus slack.
-    let resp = tokio::time::timeout(Duration::from_secs(8), io)
+    // Supervisor: 5s for the ack, up to 30s more for an awaited car result.
+    let limit = if body.get("await_result").and_then(|v| v.as_bool()) == Some(true) { 40 } else { 8 };
+    let resp = tokio::time::timeout(Duration::from_secs(limit), io)
         .await
         .map_err(|_| anyhow::anyhow!("C6 supervisor timed out"))??;
     let text = String::from_utf8_lossy(&resp);

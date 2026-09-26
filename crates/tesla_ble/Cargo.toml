@@ -46,6 +46,7 @@ name = "typed_query"
 path = "examples/typed_query.rs"
 
 [dependencies]
+sentryusb-config = { path = "../config", package = "sentryusb-config" }
 tokio = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
