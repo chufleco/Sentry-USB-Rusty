@@ -452,7 +452,7 @@ async fn main() -> Result<()> {
                     req,
                     &mut held_radio,
                     &mut ble_session,
-                    &c6_link,
+                    &mut c6_link,
                 ).await;
             }
             _ = tokio::time::sleep_until(next_tick_at) => {
@@ -661,6 +661,11 @@ async fn tick(
         return (DISABLED_POLL, Some(cfg));
     }
 
+    // C6 plugged in and provisioned, source unset: opt this box in (next tick).
+    if !cfg.c6_primary {
+        c6_onboarding(&cfg, c6_link);
+    }
+
     // Shared-key coordination: decide who may talk to the car BEFORE any
     // session exists. C6-owned => no Tesla BLE from this process at all.
     if cfg.c6_primary && !cfg.c6_backfill {
@@ -698,8 +703,8 @@ async fn tick(
         }
     }
     // Lease first, so the supervisor holds before we connect; no lease, no car.
-    if !c6_claim_for_sampler(&cfg) {
-        return (Duration::from_secs(30), Some(cfg));
+    if !c6_claim_for_sampler(&cfg, c6_link) {
+        return (Duration::from_secs(5), Some(cfg));
     }
 
     // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
@@ -1759,7 +1764,7 @@ async fn handle_action_request(
     req: action_socket::ActionRequest,
     held_radio: &mut bool,
     ble_session: &mut Option<sample_ble::SessionHandle>,
-    c6_link: &C6Link,
+    c6_link: &mut C6Link,
 ) {
     let verb = req.verb.clone();
     info!("action_socket: IPC request received — verb={}", verb);
@@ -1826,7 +1831,7 @@ async fn handle_action_request(
 
     // Same lease claim as the tick (a flag flip since the last tick must not
     // let this path connect while the supervisor still holds a grant).
-    if !c6_claim_for_sampler(&cfg) {
+    if !c6_claim_for_sampler(&cfg, c6_link) {
         let _ = req.reply.send(Err(anyhow::anyhow!(
             "UNREACHABLE: could not claim the car link from the C6"
         )));
@@ -2328,6 +2333,12 @@ struct C6Link {
     /// Our session after shutdown, until its task (and link) has really ended.
     /// The C6 gets no grant while this is still open.
     pending_close: Option<sentryusb_tesla_ble::manager::PersistentSession>,
+    /// A C6 grant is (or may still be) live on disk.
+    grant_live: bool,
+    /// When we last withdrew a C6 grant (boottime ms): no signing until settled.
+    grant_revoked_at: Option<u64>,
+    /// The one-shot TELEMETRY_SOURCE onboarding write was attempted.
+    onboarding_tried: bool,
 }
 
 /// Stand the sampler down and, once our car link is really closed, grant the
@@ -2352,18 +2363,69 @@ async fn c6_release(
         return;
     }
     link.pending_close = None;
-    c6_coord::write_lease(c6_coord::Owner::C6);
+    link.grant_revoked_at = None;
+    if c6_coord::write_lease(c6_coord::Owner::C6) {
+        link.grant_live = true;
+    }
 }
 
 /// Publish the sampler lease before any Pi session touches the car, whenever
 /// a C6 could be involved (flag on, or a supervisor snapshot exists). False =
-/// the lease could not be written, so the caller must not connect.
-fn c6_claim_for_sampler(cfg: &BleConfig) -> bool {
-    let c6_possible = cfg.c6_primary || std::path::Path::new(c6_source::SNAPSHOT_PATH).exists();
-    if !c6_possible || (cfg.c6_primary && cfg.c6_backfill) {
-        return true; // stock box, or bench backfill (both radios by design)
+/// not yet safe to connect: the lease write failed, or a C6 grant was only
+/// just withdrawn and a C6 command may still be in flight.
+fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
+    if cfg.c6_primary && cfg.c6_backfill {
+        // Bench backfill: both radios by design, so the C6 is granted too.
+        link.grant_live = c6_coord::write_lease(c6_coord::Owner::C6);
+        return true;
     }
-    c6_coord::write_lease(c6_coord::Owner::Sampler)
+    let c6_possible = cfg.c6_primary || std::path::Path::new(c6_source::SNAPSHOT_PATH).exists();
+    if !c6_possible {
+        return true; // stock box
+    }
+    if !c6_coord::write_lease(c6_coord::Owner::Sampler) {
+        return false;
+    }
+    let now = c6_coord::boottime_ms().unwrap_or(0);
+    if link.grant_live {
+        link.grant_live = false;
+        link.grant_revoked_at = Some(now);
+    }
+    match link.grant_revoked_at {
+        Some(t) if now.saturating_sub(t) < c6_coord::CLAIM_SETTLE_MS => false,
+        _ => {
+            link.grant_revoked_at = None;
+            true
+        }
+    }
+}
+
+/// C6 onboarding: once a provisioned C6 is live and TELEMETRY_SOURCE is unset,
+/// write `TELEMETRY_SOURCE=c6_primary` so the sampler stands down. Never over an
+/// explicit choice, never with a C6_BACKFILL bench config; tried once per run.
+fn c6_onboarding(cfg: &BleConfig, link: &mut C6Link) {
+    if cfg.telemetry_source_set || cfg.c6_backfill || link.onboarding_tried {
+        return;
+    }
+    let snap = c6_source::read_snapshot();
+    if !(c6_coord::c6_alive(snap.as_ref()) && snap.as_ref().and_then(|s| s.provisioned) == Some(true)) {
+        return;
+    }
+    link.onboarding_tried = true;
+    let path = sentryusb_config::find_config_path();
+    let result = (|| -> anyhow::Result<()> {
+        let (mut active, commented) = sentryusb_config::parse_file(path)?;
+        if sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE").is_some() {
+            return Ok(()); // raced with a user edit
+        }
+        active.insert("TELEMETRY_SOURCE".into(), "c6_primary".into());
+        let _ = std::process::Command::new("bash").args(["-c", "/root/bin/remountfs_rw"]).status();
+        sentryusb_config::write_file(path, &active)
+    })();
+    match result {
+        Ok(()) => info!("C6 onboarding: provisioned C6 found, set TELEMETRY_SOURCE=c6_primary"),
+        Err(e) => warn!("C6 onboarding: could not set TELEMETRY_SOURCE: {e:#}"),
+    }
 }
 
 impl C6Link {

@@ -46,6 +46,9 @@ pub struct BleConfig {
     /// normal box polls BLE exactly as before; this only activates on a
     /// C6-equipped box that opts in for the C6-primary soak.
     pub c6_primary: bool,
+    /// TELEMETRY_SOURCE present in any form (active or commented): an explicit
+    /// choice the C6 onboarding must not override.
+    pub telemetry_source_set: bool,
     /// Bench/soak only (`C6_BACKFILL=1`): per-domain BLE backfill beside the
     /// C6. Both radios talk to the car, so never with a shared key.
     pub c6_backfill: bool,
@@ -71,6 +74,7 @@ impl Default for BleConfig {
             experimental: false,
             keep_awake_interval_secs: DEFAULT_KEEP_AWAKE_INTERVAL_SECS,
             c6_primary: false,
+            telemetry_source_set: false,
             c6_backfill: false,
             c6_supervisor_api: DEFAULT_C6_SUPERVISOR_API.to_string(),
         }
@@ -176,7 +180,9 @@ impl BleConfig {
 
         // Telemetry source selector. Only "c6_primary" flips the sampler to
         // prefer the C6; anything else (incl. unset) keeps the BLE-only path.
-        let c6_primary = sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE")
+        let telemetry_source = sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE");
+        let telemetry_source_set = telemetry_source.is_some();
+        let c6_primary = telemetry_source
             .map(|v| v.trim().eq_ignore_ascii_case("c6_primary"))
             .unwrap_or(false);
         let c6_backfill = sentryusb_config::get_config_value(&active, &commented, "C6_BACKFILL")
@@ -197,6 +203,7 @@ impl BleConfig {
             experimental,
             keep_awake_interval_secs,
             c6_primary,
+            telemetry_source_set,
             c6_backfill,
             c6_supervisor_api,
         })
