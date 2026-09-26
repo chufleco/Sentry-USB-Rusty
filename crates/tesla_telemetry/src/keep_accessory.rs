@@ -158,9 +158,29 @@ fn decide_desired(
 /// * `radio_held` — the daemon currently owns the radio (session usable)
 /// * `charging_state` — last decoded charge state (only used when `hold_for_charge` is on)
 #[allow(clippy::too_many_arguments)]
+/// Who sends the keep-accessory command: the Pi's own BLE session when the Pi
+/// holds the car, or the ESP32-C6 (via its supervisor) when the C6 owns it.
+pub enum Route<'a> {
+    Ble(&'a PersistentSession),
+    /// Waits for the car's own cmd_result, like the BLE path.
+    C6 { api: &'a str },
+}
+
+impl Route<'_> {
+    pub(crate) async fn set_power(&self, on: bool) -> anyhow::Result<()> {
+        match self {
+            Route::Ble(s) => s.send_action(actions::set_keep_accessory_power(on)).await.map(|_| ()),
+            Route::C6 { api } => {
+                let cmd = serde_json::json!({"cmd": "keep_accessory", "on": on, "await_result": true});
+                crate::c6_coord::supervisor_command(api, &cmd).await
+            }
+        }
+    }
+}
+
 pub async fn evaluate(
     cfg: &KeepAccessoryConfig,
-    session: &PersistentSession,
+    route: Route<'_>,
     state: &mut KeepAccessoryState,
     lat: Option<f64>,
     lon: Option<f64>,
@@ -381,10 +401,7 @@ pub async fn evaluate(
 
     let label = if desired { "ON" } else { "OFF" };
     info!("keep-accessory: policy → {} ({})", label, why);
-    match session
-        .send_action(actions::set_keep_accessory_power(desired))
-        .await
-    {
+    match route.set_power(desired).await {
         Ok(_) => {
             state.last_sent = Some(desired);
             state.send_fail_streak = 0;

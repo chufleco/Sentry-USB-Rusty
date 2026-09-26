@@ -2814,6 +2814,7 @@ dependencies = [
  "rand 0.10.3",
  "sentryusb-ble-health",
  "sentryusb-config",
+ "serde_json",
  "sha1 0.11.0",
  "sha2 0.11.1",
  "tempfile",
