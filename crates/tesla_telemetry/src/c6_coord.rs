@@ -37,6 +37,10 @@ pub const SNAPSHOT_MAX_AGE_MS: u64 = 10_000;
 /// any single tick (scan + polls) so it can't lapse mid-tick.
 pub const LEASE_VALID_MS: u64 = 10 * 60_000;
 
+/// After withdrawing a C6 grant, wait out the firmware's own 30s command
+/// deadline before the sampler signs, so a C6 command already in flight ends.
+pub const CLAIM_SETTLE_MS: u64 = 35_000;
+
 /// How long a C6 grant stays valid without a refresh (C6-owned ticks refresh
 /// it every 15s). If this daemon dies, the C6 stops within this window.
 pub const GRANT_VALID_MS: u64 = 2 * 60_000;
