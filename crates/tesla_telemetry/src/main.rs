@@ -2365,6 +2365,10 @@ struct C6Link {
     grant_revoked_at: Option<u64>,
     /// The one-shot TELEMETRY_SOURCE onboarding write was attempted.
     onboarding_tried: bool,
+    /// First c6_release of this run checked for a leftover sampler lease.
+    startup_checked: bool,
+    /// Don't grant the C6 before this (boottime ms): leftover lease settle.
+    first_grant_after: Option<u64>,
     /// Consecutive fresh C6 drive readings showing parked (keep-accessory
     /// input while the C6 owns the car; the sampler's own counter is idle).
     parked_obs: u32,
@@ -2435,6 +2439,20 @@ async fn c6_release(
         link.grant_live = false;
         return;
     }
+    // A sampler lease we didn't write this run (daemon restart) may cover a
+    // Pi command still in flight: wait CLAIM_SETTLE_MS before the first grant.
+    let now = c6_coord::boottime_ms().unwrap_or(0);
+    if !link.grant_live && !link.startup_checked {
+        link.startup_checked = true;
+        if c6_coord::disk_sampler_lease_live() {
+            link.first_grant_after = Some(now.saturating_add(c6_coord::CLAIM_SETTLE_MS));
+        }
+    }
+    if link.first_grant_after.is_some_and(|t| now < t) {
+        link.grant_live = false;
+        return;
+    }
+    link.first_grant_after = None;
     link.grant_revoked_at = None;
     link.grant_live = c6_coord::write_lease(c6_coord::Owner::C6);
 }
@@ -2458,6 +2476,11 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     // just-withdrawn too: the C6 may be mid-command.
     if !link.grant_live && c6_coord::disk_grant_live() {
         link.grant_live = true;
+    }
+    // C6 unplugged: nothing left on the other side to finish a command.
+    if !c6_coord::c6_present() {
+        link.grant_live = false;
+        link.grant_revoked_at = None;
     }
     if !c6_coord::write_lease(c6_coord::Owner::Sampler) {
         return false;

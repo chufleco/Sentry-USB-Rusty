@@ -723,7 +723,7 @@ enum DirectBle {
 
 /// Pure: may this process open its own session? `lease` = current lease file.
 fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, boot_id: &str, now_ms: u64) -> DirectBle {
-    if !c6_primary || !c6_present {
+    if !c6_present {
         return DirectBle::Stock;
     }
     // A lease we can't parse at all: assume a live grant (refuse).
@@ -744,7 +744,15 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
                     _ => true, // unreadable grant: assume live
                 }
         });
-    if grant_recent { DirectBle::Block } else { DirectBle::Claim }
+    // A live/just-expired grant blocks whatever the flag says now (it may have
+    // been flipped while the daemon was down); otherwise flag off = stock.
+    if grant_recent {
+        DirectBle::Block
+    } else if c6_primary {
+        DirectBle::Claim
+    } else {
+        DirectBle::Stock
+    }
 }
 
 fn boottime_ms() -> Option<u64> {
@@ -766,7 +774,7 @@ fn c6_blocks_direct() -> bool {
         return c6_owns_link() && present; // can't evaluate a lease: refuse only with a C6
     };
     let owns = c6_owns_link();
-    if !owns || !present {
+    if !present {
         return false; // stock
     }
     // Read-decide-write under the lease lock the daemon also takes, so its
@@ -839,7 +847,9 @@ mod tests {
     #[test]
     fn c6_absent_or_flag_off_is_stock_behaviour() {
         assert_eq!(direct_ble_decision(true, false, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
-        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::Stock);
+        assert_eq!(direct_ble_decision(false, true, None, "b", 1), DirectBle::Stock);
+        // Flag flipped off while a grant is still live: still refuse.
+        assert_eq!(direct_ble_decision(false, true, Some(&grant(0, 120_000)), "b", 1), DirectBle::Block);
     }
 
     #[test]
