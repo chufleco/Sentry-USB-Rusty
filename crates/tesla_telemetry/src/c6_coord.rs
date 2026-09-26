@@ -152,6 +152,27 @@ pub fn lease_json(owner: Owner, boot_id: &str, now_ms: u64, valid_for_ms: u64) -
     .to_string()
 }
 
+/// Pure: is `lease` a live C6 grant from this boot? (Mirrors the supervisor.)
+pub fn grant_live_in(lease: &str, boot_id: &str, now_ms: u64) -> bool {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(lease) else { return false };
+    v.get("owner").and_then(|x| x.as_str()) == Some("c6")
+        && v.get("boot_id").and_then(|x| x.as_str()) == Some(boot_id)
+        && match (
+            v.get("written_boottime_ms").and_then(|x| x.as_u64()),
+            v.get("valid_for_ms").and_then(|x| x.as_u64()),
+        ) {
+            (Some(w), Some(valid)) => now_ms < w.saturating_add(valid),
+            _ => false,
+        }
+}
+
+/// A C6 grant on disk is still live (e.g. written by a previous run of this
+/// daemon), so the C6 may be mid-command right now.
+pub fn disk_grant_live() -> bool {
+    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
+    std::fs::read_to_string(LEASE_PATH).is_ok_and(|l| grant_live_in(&l, &boot, now))
+}
+
 /// Publish the lease atomically (tmp + rename). Returns false if it could not
 /// be written: the caller must then NOT connect to the car (a stale grant may
 /// still be live for the supervisor).
@@ -348,6 +369,15 @@ mod tests {
         let mut s = alive_snap();
         s.healthy = false;
         assert!(!c6_alive(Some(&s)));
+    }
+
+    #[test]
+    fn grant_check_matches_the_supervisor() {
+        assert!(grant_live_in(&lease_json(Owner::C6, "b", 1_000, GRANT_VALID_MS), "b", 5_000));
+        assert!(!grant_live_in(&lease_json(Owner::C6, "b", 1_000, GRANT_VALID_MS), "b", 1_000 + GRANT_VALID_MS));
+        assert!(!grant_live_in(&lease_json(Owner::Sampler, "b", 1_000, LEASE_VALID_MS), "b", 5_000));
+        assert!(!grant_live_in(&lease_json(Owner::C6, "other", 1_000, GRANT_VALID_MS), "b", 5_000));
+        assert!(!grant_live_in("garbage", "b", 5_000));
     }
 
     #[test]

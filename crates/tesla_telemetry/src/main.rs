@@ -2383,6 +2383,11 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     if !c6_possible {
         return true; // stock box
     }
+    // A grant still live on disk (e.g. from before a daemon restart) counts as
+    // just-withdrawn too: the C6 may be mid-command.
+    if !link.grant_live && c6_coord::disk_grant_live() {
+        link.grant_live = true;
+    }
     if !c6_coord::write_lease(c6_coord::Owner::Sampler) {
         return false;
     }
