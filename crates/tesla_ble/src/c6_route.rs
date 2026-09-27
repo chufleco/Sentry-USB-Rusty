@@ -36,14 +36,14 @@ pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
     Some(v)
 }
 
-/// POST one command to the supervisor (`/api/coprocessor/command`). Ok only on
+/// POST one command to the supervisor (`/api/esp32c6/command`). Ok only on
 /// HTTP 200: the car's own result for `await_result` commands, else the C6's
 /// receipt ack. Plain HTTP/1.1 over loopback, bounded.
 pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let payload = body.to_string();
     let req = format!(
-        "POST /api/coprocessor/command HTTP/1.1\r\nHost: {addr}\r\n\
+        "POST /api/esp32c6/command HTTP/1.1\r\nHost: {addr}\r\n\
          Content-Type: application/json\r\nContent-Length: {}\r\n\
          Connection: close\r\n\r\n{payload}",
         payload.len()
