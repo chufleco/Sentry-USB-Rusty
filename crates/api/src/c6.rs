@@ -233,7 +233,7 @@ async fn supervisor_status() -> Option<serde_json::Value> {
         .build()
         .ok()?;
     let resp = client
-        .get(format!("{C6_SUPERVISOR_API}/api/coprocessor/status"))
+        .get(format!("{C6_SUPERVISOR_API}/api/esp32c6/status"))
         .send()
         .await
         .ok()?;
