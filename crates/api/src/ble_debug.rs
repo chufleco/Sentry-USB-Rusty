@@ -25,6 +25,9 @@ use crate::router::AppState;
 
 const CAM_DISK_PATH: &str = "/backingfiles/cam_disk.bin";
 const HISTORY_PATH: &str = "/mutable/sentryusb-ble.log";
+// The C6 supervisor's RuntimeDirectory (present only when the C6 stack is
+// installed and has run). Gates the C6 section so non-C6 boards stay clean.
+const C6_RUNTIME_DIR: &str = "/run/sentryusb-c6";
 
 pub async fn get_ble_debug(State(s): State<AppState>) -> Response {
     let mut out = String::with_capacity(4096);
@@ -44,6 +47,16 @@ pub async fn get_ble_debug(State(s): State<AppState>) -> Response {
 
     section(&mut out, "Recent sampler journal (filtered)");
     write_journal(&mut out, 60).await;
+
+    // Only when an ESP32-C6 is present: the car link may ride the C6 instead of
+    // the Pi's onboard radio, so its supervisor journal + snapshot + lease are
+    // where the actual car-link activity and errors live. Without this, "check
+    // Bluetooth Logs" would show only the (idle) onboard path while the C6 owns
+    // the link.
+    if std::path::Path::new(C6_RUNTIME_DIR).exists() {
+        section(&mut out, "ESP32-C6 co-processor (car link when the C6 radio is on)");
+        write_c6(&mut out).await;
+    }
 
     section(&mut out, "Per-minute history (last ~6 hours, /mutable/sentryusb-ble.log)");
     write_history(&mut out);
@@ -371,6 +384,137 @@ async fn write_journal(out: &mut String, lines: usize) {
             ];
             for line in raw.lines() {
                 if interesting.iter().any(|p| line.contains(p)) {
+                    out.push_str(line);
+                    out.push('\n');
+                }
+            }
+        }
+        Ok(o) => {
+            out.push_str(&format!(
+                "journalctl exited {}: {}\n",
+                o.status.code().unwrap_or(-1),
+                String::from_utf8_lossy(&o.stderr).trim(),
+            ));
+        }
+        Err(e) => {
+            out.push_str(&format!("journalctl failed to spawn: {}\n", e));
+        }
+    }
+}
+
+/// A journal line is dropped entirely if it could carry firmware secrets — the
+/// Tesla VIN or a key fingerprint. Allowlisting the interesting patterns already
+/// skips the provisioning line, but this is the belt-and-suspenders guarantee so
+/// the C6 dump never leaks the VIN or key material even if a log string changes.
+fn c6_line_is_safe(line: &str) -> bool {
+    let l = line.to_ascii_lowercase();
+    !(l.contains("vin") || l.contains("key") || l.contains("fingerprint") || l.contains("private"))
+}
+
+/// C6 diagnostics: supervisor status, the snapshot's safe fields, the lease owner,
+/// and a filtered supervisor journal. Mirrors the sampler's write_journal style.
+/// Deliberately shows NO key fingerprint, VIN, or raw snapshot — only the fields a
+/// user needs to see what the car link is doing.
+async fn write_c6(out: &mut String) {
+    const SNAPSHOT: &str = "/run/sentryusb-c6/snapshot.json";
+    const LEASE: &str = "/run/sentryusb-c6/sampler_lease.json";
+    const UNIT: &str = "sentryusb-c6-supervisor";
+
+    let active = tokio::process::Command::new("systemctl")
+        .args(["is-active", UNIT])
+        .output()
+        .await
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "<systemctl unavailable>".into());
+    out.push_str("supervisor: ");
+    out.push_str(&active);
+    out.push('\n');
+
+    // Snapshot — only the safe diagnostic fields. NEVER key_fp or vin.
+    match std::fs::read_to_string(SNAPSHOT) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => {
+                for k in [
+                    "link",
+                    "healthy",
+                    "provisioned",
+                    "polling_enabled",
+                    "serial_connected",
+                    "last_fault",
+                    "last_heartbeat_age_ms",
+                    "uptime_s",
+                    "fw",
+                ] {
+                    if let Some(val) = v.get(k) {
+                        out.push_str("  ");
+                        out.push_str(k);
+                        out.push_str(": ");
+                        out.push_str(&val.to_string());
+                        out.push('\n');
+                    }
+                }
+            }
+            Err(_) => out.push_str("  snapshot: <unparseable>\n"),
+        },
+        Err(_) => out.push_str("  snapshot: <none yet>\n"),
+    }
+
+    // Lease — who may sign right now (owner) and which service wrote it. Not the
+    // boot_id or timing internals.
+    match std::fs::read_to_string(LEASE) {
+        Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
+            Ok(v) => {
+                let owner = v.get("owner").and_then(|x| x.as_str()).unwrap_or("?");
+                let holder = v.get("holder").and_then(|x| x.as_str()).unwrap_or("?");
+                out.push_str("  lease owner: ");
+                out.push_str(owner);
+                out.push_str(" (holder ");
+                out.push_str(holder);
+                out.push_str(")\n");
+            }
+            Err(_) => out.push_str("  lease: <unparseable>\n"),
+        },
+        Err(_) => out.push_str("  lease: <none>\n"),
+    }
+
+    out.push('\n');
+    let cmd = tokio::process::Command::new("journalctl")
+        .args([
+            "-u",
+            UNIT,
+            "-n",
+            "60",
+            "--no-pager",
+            "--output=short-iso",
+        ])
+        .output()
+        .await;
+    match cmd {
+        Ok(o) if o.status.success() => {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            // Switchover marker + car-link lifecycle. "starting C6 supervisor" is
+            // logged on each restart (a source switch triggers one), so its
+            // timestamp marks when the radio switched over.
+            let interesting = [
+                "starting C6 supervisor",
+                "car-link grant",
+                "no car-link grant",
+                "parked",
+                "resuming",
+                "link=",
+                "scanning",
+                "lost",
+                "settle",
+                "granting",
+                "waiting for the sampler",
+                "closing the sampler",
+                "WARN",
+                "ERROR",
+            ];
+            for line in raw.lines() {
+                if interesting.iter().any(|p| line.contains(p)) && c6_line_is_safe(line) {
                     out.push_str(line);
                     out.push('\n');
                 }
