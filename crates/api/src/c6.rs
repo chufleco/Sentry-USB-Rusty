@@ -19,6 +19,8 @@ const C6_SUPERVISOR_API: &str = "http://127.0.0.1:8787";
 const C6_SUPERVISOR_CONFIG: &str = "/etc/sentryusb/c6-supervisor.toml";
 /// systemd unit for the C6 supervisor.
 const C6_SUPERVISOR_SERVICE: &str = "sentryusb-c6-supervisor";
+/// The Pi's Tesla key (custodian model: copied to the C6, always Pi -> C6).
+const PI_KEY_PATH: &str = "/root/.ble/key_private.pem";
 
 /// Serializes the telemetry-source and telemetry-master endpoints so concurrent
 /// requests can't clobber sentryusb.conf or leave source/poll disagreeing.
@@ -44,7 +46,7 @@ pub(crate) async fn sync_supervisor_poll_to_telemetry(telemetry_enabled: bool) -
             let _ = std::process::Command::new("bash")
                 .args(["-c", "/root/bin/remountfs_rw"])
                 .status();
-            std::fs::write(C6_SUPERVISOR_CONFIG, updated)?;
+            write_supervisor_toml_atomic(&updated)?;
         }
         Ok(true)
     })
@@ -84,6 +86,144 @@ fn set_poll_enabled_in_toml(text: &str, enabled: bool) -> anyhow::Result<String>
 /// Is the C6 co-processor plugged in right now?
 pub fn c6_present() -> bool {
     std::path::Path::new(C6_DEVICE).exists()
+}
+
+/// Stamp the shared-key provision fields (all top-level) into the supervisor
+/// TOML, preserving everything else. Pure.
+fn set_provision_fields_in_toml(text: &str, vin: &str, key_path: &str) -> anyhow::Result<String> {
+    let mut doc = text.parse::<toml_edit::DocumentMut>()?;
+    doc["vin"] = toml_edit::value(vin);
+    doc["private_key_pem_path"] = toml_edit::value(key_path);
+    doc["onboard_ble_disabled"] = toml_edit::value(true);
+    doc["auto_provision"] = toml_edit::value(true);
+    Ok(doc.to_string())
+}
+
+/// True if the Pi key file exists and parses as a private-key PEM (guards
+/// arming on a missing/torn file). Absent => false.
+fn pi_key_looks_valid() -> bool {
+    std::fs::read_to_string(PI_KEY_PATH)
+        .map(|s| pem_looks_like_private_key(&s))
+        .unwrap_or(false)
+}
+
+/// PEM shape check. Requires the `-----END` footer too, so a torn write
+/// (header-only) is rejected.
+fn pem_looks_like_private_key(s: &str) -> bool {
+    s.contains("-----BEGIN") && s.contains("PRIVATE KEY-----") && s.contains("-----END")
+}
+
+/// Write the supervisor TOML atomically (temp + fsync + rename + dir fsync). The
+/// supervisor parses this only at boot and exits on a parse error, so a torn
+/// write would crash-loop it and risk a failback double-signer.
+fn write_supervisor_toml_atomic(contents: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    let path = std::path::Path::new(C6_SUPERVISOR_CONFIG);
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("supervisor config path has no parent dir"))?;
+    let tmp = path.with_extension("toml.tmp");
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    if let Ok(d) = std::fs::File::open(dir) {
+        let _ = d.sync_all(); // best-effort durability; rename already gave atomicity
+    }
+    Ok(())
+}
+
+/// The VIN the sampler is configured with, if any. Empty string => not set.
+fn configured_vin() -> String {
+    let config_path = sentryusb_config::find_config_path();
+    if let Ok((active, _commented)) = sentryusb_config::parse_file(config_path) {
+        if let Some(v) = active.get("TESLA_BLE_VIN") {
+            return v.trim().to_string();
+        }
+    }
+    String::new()
+}
+
+/// Background shared-key provisioning glue: when a C6 is plugged in and the Pi
+/// holds a valid key + VIN, arm the supervisor TOML to auto-provision the C6 with
+/// a copy (Pi is the custodian). No-op with no C6 / no key / no VIN / no
+/// supervisor config. Idempotent — writes only on a real change; restart also
+/// retried on a later tick if a prior one failed.
+pub async fn ensure_shared_key_provision_config() -> anyhow::Result<()> {
+    if !c6_present() {
+        return Ok(());
+    }
+    // No key yet = fresh install (pairing generates it first); silent, not an error.
+    if !std::path::Path::new(PI_KEY_PATH).exists() {
+        return Ok(());
+    }
+    if !pi_key_looks_valid() {
+        tracing::warn!("{PI_KEY_PATH} is not a valid-looking PEM — not arming C6 provision");
+        return Ok(());
+    }
+    // Tesla VINs are exactly 17 chars; a short one would retry-provision forever.
+    let vin = configured_vin();
+    if vin.len() != 17 {
+        if vin.is_empty() {
+            tracing::warn!(
+                "C6 present with a Pi key but no TESLA_BLE_VIN — cannot arm auto-provision"
+            );
+        } else {
+            tracing::warn!(
+                "C6 present but TESLA_BLE_VIN is {} chars, not 17 — not arming provision",
+                vin.len()
+            );
+        }
+        return Ok(());
+    }
+
+    // Share CONFIG_LOCK with the telemetry-source / master-switch writers so this
+    // timer can't clobber their config edits (e.g. revert [poll] enabled).
+    let _cfg_guard = CONFIG_LOCK.lock().await;
+
+    let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        let text = match std::fs::read_to_string(C6_SUPERVISOR_CONFIG) {
+            Ok(t) => t,
+            // No supervisor config: C6 tooling isn't installed on this box.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(anyhow::anyhow!("read {C6_SUPERVISOR_CONFIG}: {e}")),
+        };
+        let updated = set_provision_fields_in_toml(&text, &vin, PI_KEY_PATH)?;
+        if updated == text {
+            return Ok(false);
+        }
+        let _ = std::process::Command::new("bash")
+            .args(["-c", "/root/bin/remountfs_rw"])
+            .status();
+        write_supervisor_toml_atomic(&updated)?;
+        Ok(true)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("provision-config task panicked: {e}"))??;
+
+    // Release the lock before the slow restart so UI config endpoints aren't stalled.
+    drop(_cfg_guard);
+
+    // Track the restart as pending so a failed one is retried next tick (else the
+    // unchanged TOML means it never restarts and the supervisor keeps stale config).
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static RESTART_PENDING: AtomicBool = AtomicBool::new(false);
+    if changed {
+        RESTART_PENDING.store(true, Ordering::SeqCst);
+    }
+    if RESTART_PENDING.load(Ordering::SeqCst) {
+        tracing::info!("armed C6 shared-key auto-provision (Pi key -> C6); restarting supervisor");
+        match sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await {
+            Ok(_) => RESTART_PENDING.store(false, Ordering::SeqCst),
+            // Leave the flag set; the next 30s tick retries the restart.
+            Err(e) => tracing::error!(
+                "restart {C6_SUPERVISOR_SERVICE} (provision arm) failed, will retry next tick: {e:#}"
+            ),
+        }
+    }
+    Ok(())
 }
 
 /// Fetch the supervisor's live status JSON (ack-confirmed device state).
@@ -231,7 +371,7 @@ pub async fn telemetry_source_set(
         let write_conf = || sentryusb_config::write_file(config_path, &active);
         let write_sup = || -> anyhow::Result<()> {
             if let Some(ref t) = supervisor_toml {
-                std::fs::write(C6_SUPERVISOR_CONFIG, t)?;
+                write_supervisor_toml_atomic(t)?;
             }
             Ok(())
         };
@@ -311,5 +451,65 @@ mod tests {
         assert!(out.contains("[poll]"));
         assert!(out.contains("enabled = true"));
         assert!(out.contains("vin = \"5YJ\""), "existing top-level keys preserved");
+    }
+
+    #[test]
+    fn provision_fields_stamped_into_empty_config() {
+        let out = set_provision_fields_in_toml("", "5YJ3TESTVIN000001", PI_KEY_PATH).unwrap();
+        assert!(out.contains("vin = \"5YJ3TESTVIN000001\""));
+        assert!(out.contains("private_key_pem_path = \"/root/.ble/key_private.pem\""));
+        assert!(out.contains("onboard_ble_disabled = true"));
+        assert!(out.contains("auto_provision = true"));
+    }
+
+    #[test]
+    fn provision_fields_preserve_existing_content_and_poll_table() {
+        let src = "baud = 921600\n\n[poll]\nenabled = true\ndefault_secs = 15\n";
+        let out = set_provision_fields_in_toml(src, "5YJABC", "/root/.ble/key_private.pem").unwrap();
+        assert!(out.contains("baud = 921600"), "existing keys preserved");
+        assert!(out.contains("[poll]"), "poll table preserved");
+        assert!(out.contains("enabled = true"), "poll contents untouched");
+        assert!(out.contains("vin = \"5YJABC\""));
+        assert!(out.contains("auto_provision = true"));
+    }
+
+    #[test]
+    fn provision_fields_are_idempotent() {
+        // Stamping a config that already carries the same values is a no-op, so
+        // the ensure() caller never rewrites/restarts on an unchanged config.
+        let once = set_provision_fields_in_toml("baud = 921600\n", "5YJABC", PI_KEY_PATH).unwrap();
+        let twice = set_provision_fields_in_toml(&once, "5YJABC", PI_KEY_PATH).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn pem_shape_accepts_pkcs8_and_sec1_rejects_junk() {
+        assert!(pem_looks_like_private_key(
+            "-----BEGIN PRIVATE KEY-----\nMIIB...\n-----END PRIVATE KEY-----\n"
+        ));
+        assert!(pem_looks_like_private_key(
+            "-----BEGIN EC PRIVATE KEY-----\nMHc...\n-----END EC PRIVATE KEY-----\n"
+        ));
+        assert!(!pem_looks_like_private_key(""), "empty rejected");
+        assert!(!pem_looks_like_private_key("-----BEGIN"), "truncated header rejected");
+        assert!(!pem_looks_like_private_key("random bytes"), "junk rejected");
+        assert!(
+            !pem_looks_like_private_key("-----BEGIN PUBLIC KEY-----\n-----END PUBLIC KEY-----\n"),
+            "public key rejected"
+        );
+        assert!(
+            !pem_looks_like_private_key("-----BEGIN PRIVATE KEY-----\nMIIB"),
+            "header without footer (torn generate_keypair write) rejected"
+        );
+    }
+
+    #[test]
+    fn provision_fields_update_stale_key_path() {
+        // A config pointing at the old placeholder key path gets corrected.
+        let src = "vin = \"5YJABC\"\nprivate_key_pem_path = \"/mutable/tesla_key.pem\"\n";
+        let out = set_provision_fields_in_toml(src, "5YJABC", PI_KEY_PATH).unwrap();
+        assert!(out.contains("private_key_pem_path = \"/root/.ble/key_private.pem\""));
+        assert!(!out.contains("/mutable/tesla_key.pem"), "old path replaced");
+        assert_ne!(out, src, "a stale key path is a real change");
     }
 }
