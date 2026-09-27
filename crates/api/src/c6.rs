@@ -176,13 +176,13 @@ pub async fn telemetry_source_set(
     if use_c6 && !c6_present() {
         return crate::json_error(
             StatusCode::CONFLICT,
-            "no co-processor detected; plug in the ESP32-C6 first",
+            "no ESP32-C6 detected; plug it in first",
         );
     }
     if use_c6 && !c6_provisioned().await {
         return crate::json_error(
             StatusCode::CONFLICT,
-            "the co-processor is not provisioned with a Tesla key yet",
+            "the ESP32-C6 is not provisioned with a Tesla key yet",
         );
     }
 
@@ -269,7 +269,7 @@ pub async fn telemetry_source_set(
         return crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!(
-                "telemetry source set to {source}, but restarting the co-processor \
+                "telemetry source set to {source}, but restarting the ESP32-C6 \
                  supervisor failed: {e}. Reboot the device to apply, or retry."
             ),
         );

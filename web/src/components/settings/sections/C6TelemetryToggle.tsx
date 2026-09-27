@@ -8,11 +8,10 @@ interface C6Status {
 }
 
 /**
- * A single row inside the "Tesla BLE" card. When an ESP32 co-processor is
- * plugged in, it lets the user pick the co-processor as the Bluetooth radio for
- * the car link (telemetry + keep-awake ride it), instead of the Pi's own radio.
- * Renders nothing when no co-processor is detected, so it only appears once one
- * is present.
+ * A single row inside the "Tesla BLE" card. When an ESP32-C6 is plugged in, it
+ * lets the user pick the ESP32-C6 as the Bluetooth radio for the car link
+ * (telemetry + keep-awake ride it), instead of the Pi's own radio. Renders
+ * nothing when no ESP32-C6 is detected, so it only appears once one is present.
  */
 export function C6TelemetryToggle() {
   const [status, setStatus] = useState<C6Status | null>(null)
@@ -112,11 +111,11 @@ export function C6TelemetryToggle() {
         // is unreachable, so a failing C6 can't strand the car's Bluetooth.
         disabled={busy || (!active && !provisioned)}
         onChange={setSource}
-        label="Use the co-processor as the Bluetooth radio"
+        label="Use the ESP32-C6 Bluetooth radio"
         sub={
           !provisioned && !active
-            ? "ESP32 detected. Provision it with a Tesla key first, then it can carry the car's Bluetooth."
-            : "Carries the car's Bluetooth (telemetry and keep-awake) on the ESP32 instead of the Pi's own radio. Falls back to the Pi if it is unplugged."
+            ? "ESP32-C6 detected. Provision it with a Tesla key first, then it can carry the car's Bluetooth."
+            : "Carries the car's Bluetooth (telemetry and keep-awake) on the ESP32-C6 instead of the Pi's own radio. Falls back to the Pi if it is unplugged."
         }
       />
       {err && <p className="text-xs text-red-400">{err}</p>}

@@ -110,9 +110,9 @@ export function BleEnableToggle() {
               : "Nudges the car over BLE during archive cycles so USB power stays on."
           }
         />
-        {/* Third row, only when an ESP32 co-processor is plugged in: pick it as
-            the Bluetooth radio for the car link (like selecting an external
-            adapter). Renders nothing when no co-processor is present. */}
+        {/* Third row, only when an ESP32-C6 is plugged in: pick it as the
+            Bluetooth radio for the car link (like selecting an external
+            adapter). Renders nothing when no ESP32-C6 is present. */}
         <C6TelemetryToggle />
         {err && <p className="text-xs text-red-400">{err}</p>}
       </div>
