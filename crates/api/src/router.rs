@@ -107,6 +107,15 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/system/ble-status", get(crate::system::ble_status))
         .route("/api/system/ble-enabled", get(crate::ble::ble_enabled_get))
         .route("/api/system/ble-enabled", post(crate::ble::ble_enabled_set))
+        .route("/api/system/c6-status", get(crate::c6::c6_status_get))
+        .route(
+            "/api/system/telemetry-source",
+            get(crate::c6::telemetry_source_get),
+        )
+        .route(
+            "/api/system/telemetry-source",
+            post(crate::c6::telemetry_source_set),
+        )
         .route(
             "/api/system/ble-keep-awake-enabled",
             get(crate::ble::ble_keep_awake_enabled_get),

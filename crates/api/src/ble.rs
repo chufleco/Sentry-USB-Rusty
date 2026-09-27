@@ -199,6 +199,9 @@ pub async fn ble_enabled_set(
         }
     };
 
+    // Serialize with the telemetry-source endpoint (shared config + poll state).
+    let _cfg_guard = crate::c6::CONFIG_LOCK.lock().await;
+
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
@@ -222,10 +225,24 @@ pub async fn ble_enabled_set(
     .await;
 
     match result {
-        Ok(Ok(())) => (
-            StatusCode::OK,
-            Json(serde_json::json!({ "enabled": enabled })),
-        ),
+        Ok(Ok(())) => {
+            // Match C6 polling to this master switch; report a failure rather
+            // than claim success while the C6 keeps polling.
+            if let Err(e) = crate::c6::sync_supervisor_poll_to_telemetry(enabled).await {
+                return crate::json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &format!(
+                        "telemetry set to {}, but syncing the co-processor's polling \
+                         failed: {e}. Reboot to apply, or retry.",
+                        if enabled { "on" } else { "off" }
+                    ),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "enabled": enabled })),
+            )
+        }
         Ok(Err(e)) => crate::json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("failed to write config: {}", e),

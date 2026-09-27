@@ -661,7 +661,9 @@ async fn tick(
         *last_user_presence = None;
         return (DISABLED_POLL, Some(cfg));
     }
-    if cfg.vin.is_empty() {
+    // A present C6 fills the DB without the Pi's VIN; only the sampler needs one.
+    let c6_here = cfg.c6_primary && !cfg.c6_backfill && c6_coord::c6_present();
+    if cfg.vin.is_empty() && !c6_here {
         debug!("no TESLA_BLE_VIN configured, idling");
         if *held_radio {
             release_radio().await;
@@ -738,6 +740,26 @@ async fn tick(
             }
         }
     }
+    // Clear a completed handoff-close so a stale pending_close can't misroute IPC
+    // to the C6 after the sampler retook the car (no daemon restart clears it now).
+    if c6_link.pending_close.as_ref().is_some_and(|s| s.is_closed()) {
+        c6_link.pending_close = None;
+    }
+
+    // Sampler failback needs the Pi's VIN; without one, idle rather than
+    // ensure_session_for("") tearing down the app-facing sentryusb-ble.
+    if cfg.vin.is_empty() {
+        debug!("no TESLA_BLE_VIN for sampler failback, idling");
+        if *held_radio {
+            release_radio().await;
+            *held_radio = false;
+        }
+        *ble_session = None;
+        *parked_polls = 0;
+        *last_user_presence = None;
+        return (DISABLED_POLL, Some(cfg));
+    }
+
     // Lease first, so the supervisor holds before we connect; no lease, no car.
     if !c6_claim_for_sampler(&cfg, c6_link) {
         return (Duration::from_secs(5), Some(cfg));
@@ -1817,6 +1839,22 @@ async fn handle_action_request(
         }
     };
     enforce_backfill_rule(&mut cfg);
+
+    // C6 owns the car: route through it, before the BLE/VIN gates (those gate the
+    // Pi's own radio), so a box with no Pi VIN or BLE off can still act via the C6.
+    if c6_link.c6_owns(&cfg)
+        || c6_link.pending_close.as_ref().is_some_and(|s| !s.is_closed())
+    {
+        let result = c6_action(&cfg, &verb).await;
+        match &result {
+            Ok(_) => info!("action_socket: verb={} routed via C6", verb),
+            Err(e) => warn!("action_socket: verb={} via C6 failed: {:#}", verb, e),
+        }
+        let _ = req.reply.send(result);
+        return;
+    }
+
+    // Sampler path uses the Pi's own radio: honor BLE_ENABLED + VIN.
     if !cfg.enabled {
         let _ = req.reply.send(Err(anyhow::anyhow!(
             "BLE is disabled in settings"
@@ -1827,17 +1865,6 @@ async fn handle_action_request(
         let _ = req.reply.send(Err(anyhow::anyhow!(
             "TESLA_BLE_VIN not configured"
         )));
-        return;
-    }
-
-    // C6 owns the car: route through it, never open our own session.
-    if c6_link.c6_owns(&cfg) || c6_link.pending_close.is_some() {
-        let result = c6_action(&cfg, &verb).await;
-        match &result {
-            Ok(_) => info!("action_socket: verb={} routed via C6", verb),
-            Err(e) => warn!("action_socket: verb={} via C6 failed: {:#}", verb, e),
-        }
-        let _ = req.reply.send(result);
         return;
     }
 
