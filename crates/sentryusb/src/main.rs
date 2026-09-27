@@ -183,6 +183,19 @@ async fn main() {
         }
     });
 
+    // C6 shared-key auto-provision watcher: arms the supervisor to provision a
+    // plugged-in (or factory-reset) C6 with a copy of the Pi's key. Idempotent, so
+    // the 30s tick is a no-op once armed.
+    tokio::spawn(async {
+        let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+        loop {
+            tick.tick().await; // fires immediately, then every 30s
+            if let Err(e) = sentryusb_api::c6::ensure_shared_key_provision_config().await {
+                tracing::warn!("C6 provision-config check failed: {e:#}");
+            }
+        }
+    });
+
     // Initialize auth
     let auth = sentryusb_api::init_auth();
     phase!("auth_initialized");
