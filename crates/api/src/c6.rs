@@ -52,11 +52,17 @@ pub(crate) async fn sync_supervisor_poll_to_telemetry(telemetry_enabled: bool) -
     .map_err(|e| anyhow::anyhow!("sync supervisor poll task panicked: {e}"))??;
 
     if existed {
-        // Always restart so the poll change actually takes and a prior failed
-        // restart is recovered. A failure here is propagated to the caller.
-        sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE])
-            .await
-            .map_err(|e| anyhow::anyhow!("restart {C6_SUPERVISOR_SERVICE}: {e}"))?;
+        // Fire the restart DETACHED so the BLE master toggle returns immediately
+        // instead of blocking on the supervisor stop (up to TimeoutStopSec). The
+        // TOML written above is the source of truth; Restart=on-failure recovers a
+        // failed restart, and the /run lease (not restart timing) governs signing.
+        tokio::spawn(async {
+            if let Err(e) =
+                sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await
+            {
+                tracing::error!("restart {C6_SUPERVISOR_SERVICE} (poll sync) failed: {e:#}");
+            }
+        });
     }
     Ok(())
 }
@@ -256,24 +262,25 @@ pub async fn telemetry_source_set(
         }
     }
 
-    // Restart ONLY the supervisor (its [poll] is boot-read). Never restart
-    // sentryusb-telemetry: it re-reads the source each tick, and a SIGTERM would
-    // drop the lease/settle and let the sampler sign while the C6 is still active.
+    // Restart ONLY the supervisor (its [poll] is boot-read) to make it re-read the
+    // change. Never restart sentryusb-telemetry: it re-reads the source each tick.
+    // Fire the restart DETACHED and return immediately: a synchronous restart made
+    // the toggle hang for up to TimeoutStopSec while a busy supervisor stopped,
+    // which read as an unresponsive UI. The config written above is the source of
+    // truth; the unit's Restart=on-failure recovers a failed restart, and the UI's
+    // c6-status poll reflects the applied state. Single-signer is unaffected: who
+    // may sign is governed by the /run lease (owner:c6 vs owner:sampler), not by
+    // when this restart lands.
     let source = if use_c6 { "c6_primary" } else { "sampler" };
-    // Report a failed restart, don't warn-and-succeed: the old supervisor is
-    // already stopped so the change did not take (a reboot also applies it).
-    if let Err(e) =
-        sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await
-    {
-        tracing::error!("restart {C6_SUPERVISOR_SERVICE} after telemetry-source change failed: {e:#}");
-        return crate::json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!(
-                "telemetry source set to {source}, but restarting the ESP32-C6 \
-                 supervisor failed: {e}. Reboot the device to apply, or retry."
-            ),
-        );
-    }
+    tokio::spawn(async {
+        if let Err(e) =
+            sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await
+        {
+            tracing::error!(
+                "restart {C6_SUPERVISOR_SERVICE} after telemetry-source change failed: {e:#}"
+            );
+        }
+    });
 
     (StatusCode::OK, Json(serde_json::json!({ "source": source })))
 }
