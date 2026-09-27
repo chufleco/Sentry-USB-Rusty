@@ -226,13 +226,18 @@ pub async fn ble_enabled_set(
 
     match result {
         Ok(Ok(())) => {
-            // Match C6 polling to this master switch; report a failure rather
-            // than claim success while the C6 keeps polling.
+            // Match C6 polling to this master switch. This writes the supervisor
+            // [poll] config and fires the restart DETACHED, so it only surfaces a
+            // config-WRITE failure here, not a restart failure. That is fine for
+            // correctness: when telemetry is off the sampler tick claims
+            // owner:sampler, and the supervisor parks the C6 off the lease
+            // regardless of whether the [poll] restart landed. The restart just
+            // refreshes the supervisor's own poll loop.
             if let Err(e) = crate::c6::sync_supervisor_poll_to_telemetry(enabled).await {
                 return crate::json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     &format!(
-                        "telemetry set to {}, but syncing the co-processor's polling \
+                        "telemetry set to {}, but syncing the ESP32-C6's polling \
                          failed: {e}. Reboot to apply, or retry.",
                         if enabled { "on" } else { "off" }
                     ),

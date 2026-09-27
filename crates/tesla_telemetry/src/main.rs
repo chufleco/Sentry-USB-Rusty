@@ -644,9 +644,19 @@ async fn tick(
     // in settings, and (b) on a Pi with no BLE key file turned the
     // intended 60s idle poll into a 5s retry spin with a warning logged
     // every cycle.
-    // C6-primary with the sampler idle (BLE off / no VIN): the C6 may own the car.
-    if (!cfg.enabled || cfg.vin.is_empty()) && cfg.c6_primary && !cfg.c6_backfill {
-        c6_release(ble_session, held_radio, c6_link).await;
+    // C6-primary with the sampler idle: decide who (if anyone) holds the car.
+    if cfg.c6_primary && !cfg.c6_backfill {
+        if !cfg.enabled {
+            // Master telemetry switch OFF: nothing should poll or sign. PARK the
+            // C6 by claiming owner:sampler (with a settle for any in-flight C6
+            // command); the sampler itself won't open a session (disabled branch
+            // below). Previously this called c6_release, which GRANTED the C6 and
+            // left it polling/holding the car after the user turned telemetry off.
+            let _ = c6_claim_for_sampler(&cfg, c6_link);
+        } else if cfg.vin.is_empty() {
+            // Enabled but the Pi has no VIN of its own: the C6 owns the car link.
+            c6_release(ble_session, held_radio, c6_link).await;
+        }
     }
     if !cfg.enabled {
         if *held_radio {
@@ -2544,6 +2554,13 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
         return true; // stock box
     }
     let Some(_lock) = c6_coord::lease_lock() else { return false };
+    // A direct ble-action holds the car (owner:sampler, holder:ble-action): don't
+    // claim/connect, or a daemon that restarts mid-direct-action would overwrite
+    // that reservation and open a second Pi session on the shared key. Mirror
+    // c6_release, which already gates on this.
+    if c6_coord::ble_action_holds_car() {
+        return false;
+    }
     // A grant still live on disk (e.g. from before a daemon restart) counts as
     // just-withdrawn too: the C6 may be mid-command.
     if !link.grant_live && c6_coord::disk_grant_live() {
