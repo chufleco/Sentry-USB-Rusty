@@ -115,7 +115,7 @@ export function C6TelemetryToggle() {
         sub={
           !provisioned && !active
             ? "ESP32-C6 detected. Provision it with a Tesla key first, then it can carry the car's Bluetooth."
-            : "Carries the car's Bluetooth (telemetry and keep-awake) on the ESP32-C6 instead of the Pi's own radio. Falls back to the Pi if it is unplugged."
+            : "Use the ESP32-C6 as the car's Bluetooth adapter. If you unplug it, the built-in Bluetooth takes over automatically."
         }
       />
       {err && <p className="text-xs text-red-400">{err}</p>}
