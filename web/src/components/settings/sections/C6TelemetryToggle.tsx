@@ -111,7 +111,7 @@ export function C6TelemetryToggle() {
         // is unreachable, so a failing C6 can't strand the car's Bluetooth.
         disabled={busy || (!active && !provisioned)}
         onChange={setSource}
-        label="Use the ESP32-C6 Bluetooth radio"
+        label="Use the ESP32-C6 as the Bluetooth adapter"
         sub={
           !provisioned && !active
             ? "ESP32-C6 detected. Provision it with a Tesla key first, then it can carry the car's Bluetooth."
