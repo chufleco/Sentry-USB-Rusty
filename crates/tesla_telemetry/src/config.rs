@@ -52,6 +52,12 @@ pub struct BleConfig {
     /// Bench/soak only (`C6_BACKFILL=1`): per-domain BLE backfill beside the
     /// C6. Both radios talk to the car, so never with a shared key.
     pub c6_backfill: bool,
+    /// 4C+ test-only (`C6_SHADOW=1`, requires `c6_primary`): the C6 drives the
+    /// DB (`source='state'`) while the sampler keeps polling every domain and
+    /// writes its own reading as `source='shadow'` (never DB-visible). Both
+    /// radios run, so it shares `backfill_allowed()`'s separate-key gate. NOT a
+    /// production mode — production is single-radio (see c6_source failover).
+    pub c6_shadow: bool,
     /// C6 supervisor REST address; car actions route here while the C6 owns
     /// the link (`C6_SUPERVISOR_API`, loopback only).
     pub c6_supervisor_api: String,
@@ -76,6 +82,7 @@ impl Default for BleConfig {
             c6_primary: false,
             telemetry_source_set: false,
             c6_backfill: false,
+            c6_shadow: false,
             c6_supervisor_api: DEFAULT_C6_SUPERVISOR_API.to_string(),
         }
     }
@@ -192,6 +199,11 @@ impl BleConfig {
         let c6_backfill = active.get("C6_BACKFILL")
             .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"))
             .unwrap_or(false);
+        // 4C+ test-only shadow mode. ACTIVE line only (same reasoning as the
+        // selectors above): commenting it out disables it.
+        let c6_shadow = active.get("C6_SHADOW")
+            .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "yes" | "true"))
+            .unwrap_or(false);
         // Loopback only: this carries signed car commands.
         let c6_supervisor_api = sentryusb_config::get_config_value(&active, &commented, "C6_SUPERVISOR_API")
             .map(|v| v.trim().to_string())
@@ -209,6 +221,7 @@ impl BleConfig {
             c6_primary,
             telemetry_source_set,
             c6_backfill,
+            c6_shadow,
             c6_supervisor_api,
         })
     }

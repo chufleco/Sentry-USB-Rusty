@@ -637,6 +637,7 @@ async fn tick(
         }
     };
     enforce_backfill_rule(&mut cfg);
+    enforce_shadow_rule(&mut cfg);
 
     // Disabled / unconfigured checks BEFORE the session spawn. The old
     // order ensured the session first, which (a) kept a warm GATT
@@ -645,7 +646,9 @@ async fn tick(
     // intended 60s idle poll into a 5s retry spin with a warning logged
     // every cycle.
     // C6-primary with the sampler idle: decide who (if anyone) holds the car.
-    if cfg.c6_primary && !cfg.c6_backfill {
+    // Shadow mode (4C+ test) skips this: the sampler must keep its own session
+    // and poll every domain, so it never parks here.
+    if cfg.c6_primary && !cfg.c6_backfill && !cfg.c6_shadow {
         if !cfg.enabled {
             // Master telemetry switch OFF: nothing should poll or sign. PARK the
             // C6 by claiming owner:sampler (with a settle for any in-flight C6
@@ -659,6 +662,17 @@ async fn tick(
         }
     }
     if !cfg.enabled {
+        // Shadow/backfill: the C6 holds a live grant, and the coordination block
+        // above (which the non-shadow path uses to park it) is skipped in shadow.
+        // We must NOT call c6_claim_for_sampler here — in shadow it would REGRANT.
+        // So withdraw the grant directly: owner:sampler under the lock parks the
+        // C6 immediately, instead of it polling for up to 2 min on a stale grant.
+        if cfg.c6_primary && (cfg.c6_backfill || cfg.c6_shadow) && c6_link.grant_live {
+            if let Some(_lock) = c6_coord::lease_lock() {
+                c6_coord::write_lease(c6_coord::Owner::Sampler);
+                c6_link.grant_live = false;
+            }
+        }
         if *held_radio {
             info!("BLE disabled in settings — releasing radio");
             release_radio().await;
@@ -672,7 +686,8 @@ async fn tick(
         return (DISABLED_POLL, Some(cfg));
     }
     // A present C6 fills the DB without the Pi's VIN; only the sampler needs one.
-    let c6_here = cfg.c6_primary && !cfg.c6_backfill && c6_coord::c6_present();
+    // Shadow keeps the sampler live, so it still needs its VIN (c6_here=false).
+    let c6_here = cfg.c6_primary && !cfg.c6_backfill && !cfg.c6_shadow && c6_coord::c6_present();
     if cfg.vin.is_empty() && !c6_here {
         debug!("no TESLA_BLE_VIN configured, idling");
         if *held_radio {
@@ -692,10 +707,10 @@ async fn tick(
 
     // Shared-key coordination: decide who may talk to the car BEFORE any
     // session exists. C6-owned => no Tesla BLE from this process at all.
-    if cfg.c6_primary && !cfg.c6_backfill && !c6_coord::c6_present() {
+    if cfg.c6_primary && !cfg.c6_backfill && !cfg.c6_shadow && !c6_coord::c6_present() {
         // No C6 plugged in: stock behaviour, no failback wait.
         c6_link.coord.mark_absent();
-    } else if cfg.c6_primary && !cfg.c6_backfill {
+    } else if cfg.c6_primary && !cfg.c6_backfill && !cfg.c6_shadow {
         let snap = c6_source::read_snapshot();
         // No boottime => time never advances => stays C6-owned (safe side).
         let now = c6_coord::boottime_ms().unwrap_or(0);
@@ -773,6 +788,15 @@ async fn tick(
     // Lease first, so the supervisor holds before we connect; no lease, no car.
     if !c6_claim_for_sampler(&cfg, c6_link) {
         return (Duration::from_secs(5), Some(cfg));
+    }
+
+    // 4C+ shadow (test-only): the C6 drives telemetry_samples HERE — after the
+    // grant (so the supervisor is polling the car) and BEFORE the sampler's
+    // session/poll — so the UI keeps updating from the C6 even if the sampler's
+    // own BLE session fails or the radio lock is contended, and in Quiet too.
+    // Runs every tick; freshness+dedup gated so it only writes real C6 updates.
+    if cfg.c6_primary && cfg.c6_shadow {
+        persist_c6_display_row(conn, c6_link);
     }
 
     // Lazy-spawn / recreate-on-VIN-change the persistent BLE session.
@@ -943,7 +967,7 @@ async fn tick(
                     Ok(bc) => {
                         let p = bc.user_presence;
                         let awake = bc.awake;
-                        persist(conn, bc.sample);
+                        persist_sampler(conn, bc.sample, cfg.c6_primary && cfg.c6_shadow);
                         (p, awake)
                     }
                     Err(e) => {
@@ -1008,7 +1032,7 @@ async fn tick(
                             source: "state".into(),
                             ..Sample::default()
                         };
-                        persist(conn, probe_sample);
+                        persist_sampler(conn, probe_sample, cfg.c6_primary && cfg.c6_shadow);
                         if shift_changed_to_drive {
                             info!(
                                 "shift_state non-Park while user in car — resuming full state polls"
@@ -1142,7 +1166,7 @@ async fn tick(
                     }
 
                     if any_ok {
-                        persist(conn, refresh);
+                        persist_sampler(conn, refresh, cfg.c6_primary && cfg.c6_shadow);
                     }
                 }
             }
@@ -1219,6 +1243,12 @@ async fn tick(
         // shared-key production, where this tick only runs once the sampler
         // owns the car (see c6_coord) and polls everything itself.
         let c6_backfill = cfg.c6_primary && cfg.c6_backfill;
+        // Shadow (4C+ test) also reads the snapshot: not to skip polls (it polls
+        // everything), but so the C6 row can drive the DB at persist time.
+        // Shadow tags the sampler's reading for its own JSONL log below; it does
+        // NOT read the tick's c6_snap (the C6 display row reads its own fresh
+        // snapshot near the top of the tick), so this stays backfill-only.
+        let c6_shadow = cfg.c6_primary && cfg.c6_shadow;
         let c6_snap = if c6_backfill { c6_source::read_snapshot() } else { None };
         // Only stamped in backfill mode; every other path never reads it.
         let now_ms = if c6_backfill {
@@ -1547,8 +1577,15 @@ async fn tick(
             if sample.location_name.is_none() {
                 sample.location_name = last_location_name.clone();
             }
-            persist(conn, sample);
+            // Route through persist_sampler like the Quiet sites: in shadow the
+            // sampler's full reading is the independent gap-reference and goes to
+            // its OWN JSONL log, NEVER the DB (telemetry_samples PK is ts-only and
+            // several readers don't filter source). The C6 drives the DB up top.
+            persist_sampler(conn, sample, c6_shadow);
         }
+        // NOTE: the C6 display row that drives telemetry_samples is written near
+        // the top of the tick (right after the grant), NOT here — so it runs in
+        // both Active and Quiet and does not depend on the sampler polling.
 
         // Sampler keep-awake CPC dispatch (task #336 / supervisor pattern).
         //
@@ -1761,6 +1798,159 @@ fn persist(conn: &Connection, sample: Sample) {
     }
 }
 
+/// Persist a SAMPLER-origin reading. In 4C+ shadow the sampler never writes the
+/// DB (the C6 owns telemetry_samples); its reading goes to the JSONL gap-log
+/// instead. Every sampler persist site (Active and Quiet) must route here so
+/// shadow isolation holds in all modes. C6-origin rows call `persist` directly.
+fn persist_sampler(conn: &Connection, sample: Sample, shadow: bool) {
+    if shadow {
+        shadow_log_append(&sample);
+    } else {
+        persist(conn, sample);
+    }
+}
+
+/// 4C+ shadow (test-only): append the Pi sampler's full reading to its own JSONL
+/// log — NEVER the DB. `telemetry_samples` has a ts-only PK (same-second rows
+/// merge) and several readers don't filter `source`, so a shadow row there would
+/// collide with / pollute the C6's `state` rows. A flat log is the independent
+/// gap-reference to diff against the C6's `c6-events.log`. Best-effort.
+const SHADOW_LOG_PATH: &str = "/mutable/sampler/shadow_samples.jsonl";
+
+/// Cap for the shadow JSONL: rotate to `.1` past this so a long soak can't fill
+/// `/mutable`. One line is ~500 B, so 64 MiB is ~130k samples (weeks of 15s).
+const SHADOW_LOG_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn shadow_log_append(s: &Sample) {
+    use std::io::Write;
+    let line = serde_json::json!({
+        "ts": s.ts, "source": "shadow",
+        "battery_pct": s.battery_pct, "battery_temp_c": s.battery_temp_c,
+        "interior_temp_c": s.interior_temp_c, "exterior_temp_c": s.exterior_temp_c,
+        "hvac_on": s.hvac_on,
+        "tire_fl_psi": s.tire_fl_psi, "tire_fr_psi": s.tire_fr_psi,
+        "tire_rl_psi": s.tire_rl_psi, "tire_rr_psi": s.tire_rr_psi,
+        "odometer_mi": s.odometer_mi, "location_name": s.location_name,
+        "charger_power_kw": s.charger_power_kw, "charger_actual_current_a": s.charger_actual_current_a,
+        "charger_voltage_v": s.charger_voltage_v, "charge_rate_mph": s.charge_rate_mph,
+        "charge_energy_added_kwh": s.charge_energy_added_kwh, "charge_limit_soc": s.charge_limit_soc,
+        "battery_range_mi": s.battery_range_mi, "charging_amps_set": s.charging_amps_set,
+        "charge_current_request_max": s.charge_current_request_max,
+        "charge_port_door_open": s.charge_port_door_open,
+        "charge_minutes_to_full": s.charge_minutes_to_full, "charging_state": s.charging_state,
+        "latitude": s.latitude, "longitude": s.longitude,
+    });
+    if let Some(dir) = std::path::Path::new(SHADOW_LOG_PATH).parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    // Rotate once over the cap. If rotation FAILS, do NOT append — that would
+    // grow the file unbounded past the cap (fail-closed) — and surface it.
+    if std::fs::metadata(SHADOW_LOG_PATH).map(|m| m.len() > SHADOW_LOG_MAX_BYTES).unwrap_or(false) {
+        if let Err(e) = std::fs::rename(SHADOW_LOG_PATH, format!("{SHADOW_LOG_PATH}.1")) {
+            shadow_log_warn(&format!("rotation failed, dropping line to stay under cap: {e}"));
+            return;
+        }
+    }
+    let res = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(SHADOW_LOG_PATH)
+        .and_then(|mut f| writeln!(f, "{line}"));
+    if let Err(e) = res {
+        shadow_log_warn(&format!("write failed ({SHADOW_LOG_PATH}): {e}"));
+    }
+}
+
+/// Throttled (~once/min) warn for shadow-log I/O failures, so a persistent
+/// failure surfaces (a silent shadow log invalidates the comparison) without
+/// spamming every tick.
+fn shadow_log_warn(msg: &str) {
+    static LAST_WARN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = sample::now_secs().max(0) as u64;
+    let prev = LAST_WARN.load(std::sync::atomic::Ordering::Relaxed);
+    if now.saturating_sub(prev) >= 60 {
+        LAST_WARN.store(now, std::sync::atomic::Ordering::Relaxed);
+        warn!("shadow log: {msg}");
+    }
+}
+
+/// 4C+ shadow (test-only): build a `state` row from a FRESH C6 snapshot and
+/// persist it so the C6 drives the DB/UI each tick, independent of the sampler.
+/// Reads the snapshot right here (not the tick's frozen `c6_snap`) so a slow BLE
+/// tick can't stale-freeze the freshness check. No gate/keep-awake/cache side
+/// effects — the live sampler owns those.
+fn persist_c6_display_row(conn: &Connection, link: &mut C6Link) {
+    let Some(snap) = c6_source::read_snapshot() else { return };
+    let now = sample::now_secs().max(0) as u64 * 1000;
+    let mut row = Sample { ts: sample::now_secs(), source: "state".into(), ..Sample::default() };
+    let mut any = false;
+    // Freshness (decide_domain==C6) AND dedup (updated_at_ms not yet consumed)
+    // per domain, keyed on the shadow-scoped `shadow_written` (isolated from
+    // c6_owned_tick's `written`, so a shadow<->primary switch never inherits
+    // stale marks). So a reading is persisted once per real C6 update, never
+    // re-stamped "now" every tick (which would make charging.rs sum phantom
+    // energy). Marks are committed only after a successful insert (below).
+    let mut marks: Vec<(&'static str, u64)> = Vec::new();
+    let telemetry: [(&'static str, fn(&serde_json::Map<String, serde_json::Value>, &mut Sample) -> bool); 4] = [
+        ("charge", c6_source::apply_charge),
+        ("climate", c6_source::apply_climate),
+        ("drive", c6_source::apply_drive),
+        ("tires", c6_source::apply_tires),
+    ];
+    for (domain, apply) in telemetry {
+        if c6_source::decide_domain(Some(&snap), domain, now) != c6_source::Source::C6 {
+            continue;
+        }
+        if let Some(d) = snap.domains.get(domain) {
+            if link.shadow_written.get(domain) != Some(&d.updated_at_ms) {
+                if apply(&d.fields, &mut row) {
+                    any = true;
+                }
+                marks.push((domain, d.updated_at_ms));
+            }
+        }
+    }
+    // Location: freshness+dedup gated, and BOTH coords and an address-only
+    // update count as new data (an address-only update must not be silently
+    // dropped). Update the carry-forward cache from whatever's present.
+    if c6_source::decide_domain(Some(&snap), "location", now) == c6_source::Source::C6 {
+        if let Some(d) = snap.domains.get("location") {
+            if link.shadow_written.get("location") != Some(&d.updated_at_ms) {
+                let lat = d.fields.get("latitude").and_then(|v| v.as_f64());
+                let lon = d.fields.get("longitude").and_then(|v| v.as_f64());
+                if let (Some(la), Some(lo)) = (lat, lon) {
+                    link.shadow_last_lat = Some(la);
+                    link.shadow_last_lon = Some(lo);
+                    any = true;
+                }
+                if let Some(n) = d.fields.get("location_name").and_then(|v| v.as_str()) {
+                    link.shadow_last_location_name = Some(n.to_string());
+                    any = true;
+                }
+                marks.push(("location", d.updated_at_ms));
+            }
+        }
+    }
+    // Carry the last-known location onto EVERY row so a charge-only row still
+    // has coords for the charging map (charging.rs reads coords off charge rows).
+    row.latitude = link.shadow_last_lat;
+    row.longitude = link.shadow_last_lon;
+    if row.location_name.is_none() {
+        row.location_name = link.shadow_last_location_name.clone();
+    }
+    if any {
+        // Commit dedup marks only AFTER a successful insert, so a transient DB
+        // error re-tries that reading next tick instead of skipping it forever.
+        if db::insert(conn, &row).is_ok() {
+            for (dm, t) in marks {
+                link.shadow_written.insert(dm, t);
+            }
+        } else {
+            error!("shadow: C6 display row insert failed (ts={})", row.ts);
+        }
+    }
+}
+
 /// Live gate inputs for the BLE card, overwritten each Active tick (not
 /// persisted). `unknown` = no value read from the car yet.
 const GATE_STATUS_PATH: &str = "/mutable/sentryusb-ble-gate.txt";
@@ -1849,6 +2039,7 @@ async fn handle_action_request(
         }
     };
     enforce_backfill_rule(&mut cfg);
+    enforce_shadow_rule(&mut cfg);
 
     // C6 owns the car: route through it, before the BLE/VIN gates (those gate the
     // Pi's own radio), so a box with no Pi VIN or BLE off can still act via the C6.
@@ -2422,6 +2613,15 @@ struct C6Link {
     /// Consecutive fresh C6 drive readings showing parked (keep-accessory
     /// input while the C6 owns the car; the sampler's own counter is idle).
     parked_obs: u32,
+    /// 4C+ shadow ONLY: per-domain dedup for the C6 display row, kept SEPARATE
+    /// from `written` so a shadow->pure-primary switch doesn't inherit stale
+    /// consumed-marks (and vice versa).
+    shadow_written: std::collections::HashMap<&'static str, u64>,
+    /// 4C+ shadow ONLY: last-known C6 location, carried forward onto every
+    /// display row so a charge-only row still has coords for the charging map.
+    shadow_last_lat: Option<f64>,
+    shadow_last_lon: Option<f64>,
+    shadow_last_location_name: Option<String>,
 }
 
 /// C6_BACKFILL (bench side-by-side) only on a proven separate key; on a shared
@@ -2437,6 +2637,29 @@ fn enforce_backfill_rule(cfg: &mut BleConfig) {
                  one-at-a-time C6 coordination instead."
             );
         }
+        cfg.c6_backfill = false;
+    }
+}
+
+/// 4C+ test-only shadow gate. Shadow runs both radios (C6 drives the DB, the
+/// sampler polls in parallel to source='shadow'), so it needs the same proven
+/// separate-key evidence as backfill, plus c6_primary. It supersedes backfill
+/// (they can't both own the sampler's poll), so a valid shadow clears backfill.
+fn enforce_shadow_rule(cfg: &mut BleConfig) {
+    if !cfg.c6_shadow {
+        return;
+    }
+    if !cfg.c6_primary || !sentryusb_tesla_ble::c6_backfill::backfill_allowed() {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            error!(
+                "C6_SHADOW=1 REFUSED: needs TELEMETRY_SOURCE=c6_primary AND a proven-separate \
+                 C6 key (marker names a pubkey != the Pi's). Running without shadow."
+            );
+        }
+        cfg.c6_shadow = false;
+    } else {
+        // Shadow owns the sampler's poll; backfill's gap-skip must not also apply.
         cfg.c6_backfill = false;
     }
 }
@@ -2542,24 +2765,29 @@ async fn c6_release(
 /// not yet safe to connect: the lease write failed, or a C6 grant was only
 /// just withdrawn and a C6 command may still be in flight.
 fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
-    if cfg.c6_primary && cfg.c6_backfill {
-        // Bench backfill: both radios by design, so the C6 is granted too. The
-        // grant is marked backfill: the supervisor honours it only on a proven
-        // separate key (it re-checks every time, so no window on a re-key).
-        link.grant_live = c6_coord::write_backfill_grant();
-        return true;
-    }
     let c6_possible = cfg.c6_primary || std::path::Path::new(c6_source::SNAPSHOT_PATH).exists();
     if !c6_possible {
-        return true; // stock box
+        return true; // stock box, no lease needed
     }
+    // Every lease read-decide-write holds the flock (INTEGRATION_PLAN). Acquire
+    // it BEFORE the ble-action check AND the grant write so ble-action can't
+    // claim between them and get clobbered — which would leave two live signers
+    // on the Pi key. Held for the whole function (dropped on return).
     let Some(_lock) = c6_coord::lease_lock() else { return false };
     // A direct ble-action holds the car (owner:sampler, holder:ble-action): don't
-    // claim/connect, or a daemon that restarts mid-direct-action would overwrite
-    // that reservation and open a second Pi session on the shared key. Mirror
-    // c6_release, which already gates on this.
+    // claim/connect in ANY mode, or a daemon that restarts mid-direct-action
+    // opens a second Pi session on the Pi key. Mirror c6_release.
     if c6_coord::ble_action_holds_car() {
         return false;
+    }
+    if cfg.c6_primary && (cfg.c6_backfill || cfg.c6_shadow) {
+        // Bench backfill / 4C+ shadow: both radios by design, so the C6 is
+        // granted too (same backfill grant — honoured only on a proven separate
+        // key, re-checked every time). Without this the sampler would park the
+        // C6 and it would produce no snapshot to drive the DB. Under the lock,
+        // and fail closed if the grant write fails.
+        link.grant_live = c6_coord::write_backfill_grant();
+        return link.grant_live;
     }
     // A grant still live on disk (e.g. from before a daemon restart) counts as
     // just-withdrawn too: the C6 may be mid-command.
@@ -2624,7 +2852,10 @@ impl C6Link {
     }
 
     fn c6_owns_with(&self, cfg: &BleConfig, c6_present: bool) -> bool {
-        cfg.c6_primary && !cfg.c6_backfill && c6_present && self.coord.owner() == c6_coord::Owner::C6
+        // Shadow (4C+ test) keeps the sampler's own BLE session live, so the C6
+        // does NOT "own" the car link for routing: IPC actions and keep-accessory
+        // must go through the sampler's session, not the parked supervisor.
+        cfg.c6_primary && !cfg.c6_backfill && !cfg.c6_shadow && c6_present && self.coord.owner() == c6_coord::Owner::C6
     }
 }
 
