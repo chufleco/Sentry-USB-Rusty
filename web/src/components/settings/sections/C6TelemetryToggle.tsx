@@ -5,6 +5,7 @@ interface C6Status {
   present: boolean
   provisioned: boolean
   source_active: boolean
+  fw: string | null
 }
 
 /**
@@ -45,6 +46,7 @@ export function C6TelemetryToggle() {
             present: Boolean(d?.present),
             provisioned: Boolean(d?.provisioned),
             source_active: Boolean(d?.source_active),
+            fw: typeof d?.fw === "string" && d.fw.trim() ? d.fw.trim() : null,
           })
           setLoaded(true)
         })
@@ -118,6 +120,9 @@ export function C6TelemetryToggle() {
             : "Use the ESP32-C6 as the car's Bluetooth adapter. If you unplug it, the built-in Bluetooth takes over automatically."
         }
       />
+      {status.fw && (
+        <p className="text-xs text-slate-500">Firmware: {status.fw}</p>
+      )}
       {err && <p className="text-xs text-red-400">{err}</p>}
     </>
   )

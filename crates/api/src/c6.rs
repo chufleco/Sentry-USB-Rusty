@@ -270,12 +270,23 @@ fn c6_source_active() -> bool {
 pub async fn c6_status_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // One supervisor fetch for both provisioned + fw (each call has a 2s timeout).
+    let status = supervisor_status().await;
+    let provisioned = status
+        .as_ref()
+        .and_then(|v| v.get("provisioned").and_then(|b| b.as_bool()))
+        .unwrap_or(false);
+    let fw = status
+        .as_ref()
+        .and_then(|v| v.get("fw").and_then(|s| s.as_str()))
+        .map(str::to_string);
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "present": c6_present(),
-            "provisioned": c6_provisioned().await,
+            "provisioned": provisioned,
             "source_active": c6_source_active(),
+            "fw": fw,
         })),
     )
 }
