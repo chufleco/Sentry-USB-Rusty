@@ -202,6 +202,8 @@ async fn main() {
             if let Err(e) = sentryusb_api::c6::ensure_shared_key_provision_config().await {
                 tracing::warn!("C6 provision-config check failed: {e:#}");
             }
+            // Recover the C6 supervisor if an interrupted flash left it stopped.
+            sentryusb_api::c6_firmware::reconcile_supervisor().await;
         }
     });
 

@@ -2,6 +2,7 @@ pub mod auth;
 pub mod ai_local_actions;
 pub mod ble;
 pub mod c6;
+pub mod c6_firmware;
 pub mod degraded;
 pub mod ble_debug;
 pub mod router;

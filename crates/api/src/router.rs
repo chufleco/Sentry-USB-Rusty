@@ -119,6 +119,22 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::c6::telemetry_source_set),
         )
         .route(
+            "/api/system/c6-firmware",
+            get(crate::c6_firmware::get_status),
+        )
+        .route(
+            "/api/system/c6-firmware/install",
+            post(crate::c6_firmware::install),
+        )
+        .route(
+            "/api/system/c6-firmware/rollback",
+            post(crate::c6_firmware::rollback),
+        )
+        .route(
+            "/api/system/c6-firmware/recover",
+            post(crate::c6_firmware::recover),
+        )
+        .route(
             "/api/system/ble-keep-awake-enabled",
             get(crate::ble::ble_keep_awake_enabled_get),
         )
