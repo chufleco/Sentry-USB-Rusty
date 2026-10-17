@@ -18,8 +18,8 @@
 //! can never linger and trigger an unwanted reflash.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::State;
@@ -47,16 +47,78 @@ const C6_SUPERVISOR_SERVICE: &str = "sentryusb-c6-supervisor";
 const C6_FLASH_SERVICE: &str = "sentryusb-c6-flash.service";
 
 /// Guards a second flash starting while one is in flight — they would fight
-/// over the serial port and the bundle on disk.
+/// over the serial port and the bundle on disk. Held briefly by the background
+/// reconcile probe, and for the whole duration of a user flash.
 static INSTALL_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Clears INSTALL_RUNNING on drop so a panic in the spawned flash task can't
-/// leave the flag stuck true (which would 409 every later request AND make
-/// reconcile refuse to bring the supervisor back).
+/// True only while the current INSTALL_RUNNING holder is a USER op. Lets a second
+/// user click fail fast (409) instead of waiting out the acquire window for a
+/// flash that will not release soon; reconcile never sets it.
+static USER_HOLDS_LOCK: AtomicBool = AtomicBool::new(false);
+
+/// Count of user ops currently waiting for OR holding the lock. reconcile yields
+/// whenever this is > 0 so its ~7s probe never starves a user click. Kept correct
+/// across request cancellation by `PendingGuard`.
+static USER_OP_WAITERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Clears the lock (and the user-holder flag) on drop so a panic — or a dropped
+/// spawn task — can't leave INSTALL_RUNNING stuck true (which would 409 every
+/// later request AND make reconcile refuse to bring the supervisor back).
 struct RunGuard;
 impl Drop for RunGuard {
     fn drop(&mut self) {
+        USER_HOLDS_LOCK.store(false, Ordering::SeqCst);
         INSTALL_RUNNING.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Counts the caller as a waiter for the whole time it is trying to acquire the
+/// lock. Drop runs even when the HTTP request future is cancelled mid-wait (tab
+/// close / reload / network drop), so the waiter count — and thus reconcile's
+/// yield — can never leak true.
+struct PendingGuard;
+impl PendingGuard {
+    fn new() -> Self {
+        USER_OP_WAITERS.fetch_add(1, Ordering::SeqCst);
+        PendingGuard
+    }
+}
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        USER_OP_WAITERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// How long a user op waits for an in-flight reconcile probe to release the lock
+/// before giving up. The probe returns within ~7s on a silent chip; 15s leaves
+/// margin without hanging the POST.
+const USER_OP_ACQUIRE_WAIT: Duration = Duration::from_secs(15);
+
+/// Claim the flash lock for a user-initiated op, with priority over reconcile.
+/// Counts the caller as a waiter (reconcile yields), fails fast if another USER
+/// op already holds the lock, then polls until an in-flight reconcile probe
+/// releases it. Returns the owning `RunGuard` on success — move it into the flash
+/// task so the lock is held for the whole op; None means a user flash is in
+/// flight or the window elapsed (→ 409). Cancel-safe: the PendingGuard covers the
+/// wait, and on success the RunGuard owns release.
+async fn claim_for_user_op() -> Option<RunGuard> {
+    let _waiter = PendingGuard::new();
+    let deadline = Instant::now() + USER_OP_ACQUIRE_WAIT;
+    loop {
+        // A user flash already owns the lock: don't wait it out, 409 now.
+        if USER_HOLDS_LOCK.load(Ordering::SeqCst) {
+            return None;
+        }
+        if !INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
+            // No await between here and returning the guard → no cancellation
+            // window can leave INSTALL_RUNNING set without an owning RunGuard.
+            USER_HOLDS_LOCK.store(true, Ordering::SeqCst);
+            return Some(RunGuard);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
     }
 }
 
@@ -388,8 +450,13 @@ async fn reconcile_bundle_to(chip: &str) -> bool {
 
 pub async fn reconcile_supervisor() {
     // Passive checks FIRST — do not claim INSTALL_RUNNING during routine idle
-    // polling, or a user's install/rollback click in that window 409s.
-    if !c6_present() || INSTALL_RUNNING.load(Ordering::SeqCst) {
+    // polling, or a user's install/rollback click in that window 409s. Also yield
+    // the moment a user op is waiting for the lock, so our ~7s probe never starves
+    // their recover click.
+    if !c6_present()
+        || USER_OP_WAITERS.load(Ordering::SeqCst) > 0
+        || INSTALL_RUNNING.load(Ordering::SeqCst)
+    {
         return;
     }
     if service_busy(C6_FLASH_SERVICE).await {
@@ -409,7 +476,9 @@ pub async fn reconcile_supervisor() {
                 if read_version(INSTALL_DIR).as_deref() != Some(chip.as_str())
                     || !bundle_bin_is(INSTALL_DIR, &chip)
                 {
-                    if INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
+                    if USER_OP_WAITERS.load(Ordering::SeqCst) > 0
+                        || INSTALL_RUNNING.swap(true, Ordering::SeqCst)
+                    {
                         return;
                     }
                     let _guard = RunGuard;
@@ -423,7 +492,8 @@ pub async fn reconcile_supervisor() {
 
     // Supervisor DOWN, no flash running → interrupted-flash recovery. Claim the
     // flag now (we are about to mutate + start), then re-check flash isn't busy.
-    if INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
+    // Yield if a user op is waiting — a silent-chip recover must win this race.
+    if USER_OP_WAITERS.load(Ordering::SeqCst) > 0 || INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
         return;
     }
     let _guard = RunGuard;
@@ -657,9 +727,21 @@ pub async fn install(State(s): State<AppState>) -> (StatusCode, Json<serde_json:
             "No ESP32-C6 firmware update is available to install.",
         );
     };
+    // Take the lock FIRST, then check chip state while holding it — the acquire can
+    // wait up to 15s, and a chip that was responsive at entry could go silent in
+    // that window. Flashing a silent chip sends the flasher down its FULL (factory)
+    // path, rewriting NVS and losing the Tesla key, so these checks must be fresh.
+    let guard = match claim_for_user_op().await {
+        Some(g) => g,
+        None => {
+            return crate::json_error(
+                StatusCode::CONFLICT,
+                "An ESP32-C6 firmware operation is already running.",
+            );
+        }
+    };
     // Only flash a chip that is actually responding (healthy + fresh heartbeat,
-    // not just a cached fw). A silent chip would send the flasher down its FULL
-    // (factory) path, rewriting NVS and losing the chip's Tesla key.
+    // not just a cached fw). (guard drops on early return, releasing the lock.)
     if !chip_responsive().await {
         return crate::json_error(
             StatusCode::CONFLICT,
@@ -675,12 +757,6 @@ pub async fn install(State(s): State<AppState>) -> (StatusCode, Json<serde_json:
             "The ESP32-C6 is already running that firmware.",
         );
     }
-    if INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "An ESP32-C6 firmware operation is already running.",
-        );
-    }
     set_op("install");
     // Publish a fresh "running" state SYNCHRONOUSLY before returning 202, so the
     // UI's first 2s poll can't read a stale terminal state from a previous run and
@@ -689,7 +765,7 @@ pub async fn install(State(s): State<AppState>) -> (StatusCode, Json<serde_json:
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        let _guard = RunGuard; // clears INSTALL_RUNNING even on panic
+        let _guard = guard; // owns the lock for the whole flash; clears on drop
         if let Err(e) = run_install(&hub, &target).await {
             warn!("[c6-fw] install failed: {e}");
             set_state(&hub, "failed", "failed", 100, &e.to_string());
@@ -790,7 +866,20 @@ pub async fn rollback(State(s): State<AppState>) -> (StatusCode, Json<serde_json
             "No previous ESP32-C6 firmware is saved to roll back to.",
         );
     };
+    // Take the lock FIRST, then check chip state while holding it — the acquire can
+    // wait up to 15s and a responsive chip could go silent in that window; flashing
+    // a silent chip full-flashes and wipes NVS, so these checks must be fresh.
+    let guard = match claim_for_user_op().await {
+        Some(g) => g,
+        None => {
+            return crate::json_error(
+                StatusCode::CONFLICT,
+                "An ESP32-C6 firmware operation is already running.",
+            );
+        }
+    };
     // Same guard as install: never flash a silent chip (full-flash would wipe NVS).
+    // (guard drops on early return, releasing the lock.)
     if !chip_responsive().await {
         return crate::json_error(
             StatusCode::CONFLICT,
@@ -805,18 +894,12 @@ pub async fn rollback(State(s): State<AppState>) -> (StatusCode, Json<serde_json
             "The ESP32-C6 is already running that firmware.",
         );
     }
-    if INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "An ESP32-C6 firmware operation is already running.",
-        );
-    }
     set_op("rollback");
     set_state(&s.hub, "running", "prepare", 0, "Starting…");
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        let _guard = RunGuard; // clears INSTALL_RUNNING even on panic
+        let _guard = guard; // owns the lock for the whole flash; clears on drop
         if let Err(e) = run_rollback(&hub, &target).await {
             warn!("[c6-fw] rollback failed: {e}");
             set_state(&hub, "failed", "failed", 100, &e.to_string());
@@ -932,7 +1015,22 @@ pub async fn recover(State(s): State<AppState>) -> (StatusCode, Json<serde_json:
     if !c6_present() {
         return crate::json_error(StatusCode::CONFLICT, "No ESP32-C6 is plugged in.");
     }
+    // Take the lock FIRST, then check port/supervisor state while holding it. The
+    // acquire can wait up to 15s for a reconcile probe; checking chip_responsive /
+    // service_busy beforehand would let that result go stale (e.g. reconcile brings
+    // the chip + supervisor back healthy during the wait and we would still arm a
+    // factory flash and stop a healthy supervisor).
+    let guard = match claim_for_user_op().await {
+        Some(g) => g,
+        None => {
+            return crate::json_error(
+                StatusCode::CONFLICT,
+                "An ESP32-C6 firmware operation is already running.",
+            );
+        }
+    };
     // If the chip is actually responsive, it isn't silent — use update/rollback.
+    // (guard drops here on early return, releasing the lock.)
     if chip_responsive().await {
         return crate::json_error(
             StatusCode::CONFLICT,
@@ -945,18 +1043,12 @@ pub async fn recover(State(s): State<AppState>) -> (StatusCode, Json<serde_json:
             "A firmware flash is already running.",
         );
     }
-    if INSTALL_RUNNING.swap(true, Ordering::SeqCst) {
-        return crate::json_error(
-            StatusCode::CONFLICT,
-            "An ESP32-C6 firmware operation is already running.",
-        );
-    }
     set_op("recover");
     set_state(&s.hub, "running", "prepare", 0, "Starting…");
 
     let hub = s.hub.clone();
     tokio::spawn(async move {
-        let _guard = RunGuard;
+        let _guard = guard; // owns the lock for the whole flash; clears on drop
         if let Err(e) = run_recover(&hub).await {
             warn!("[c6-fw] recover failed: {e}");
             set_state(&hub, "failed", "failed", 100, &e.to_string());
