@@ -21,6 +21,18 @@ const C6_SUPERVISOR_CONFIG: &str = "/etc/sentryusb/c6-supervisor.toml";
 const C6_SUPERVISOR_SERVICE: &str = "sentryusb-c6-supervisor";
 /// The Pi's Tesla key (custodian model: copied to the C6, always Pi -> C6).
 const PI_KEY_PATH: &str = "/root/.ble/key_private.pem";
+/// Parse-free separate-key sentinel, shared verbatim with the flasher. Its presence
+/// alone means "never stamp the shared key here", authoritative even if the TOML
+/// flag is absent/torn.
+const SEPARATE_KEY_SENTINEL: &str = "/opt/sentryusb/c6/SEPARATE_KEY";
+
+/// Does the separate-key sentinel REQUIRE us to skip arming? True when it exists
+/// AND, fail-closed, when its existence can't be determined (a metadata error must
+/// never be read as "absent" and let the Pi key be stamped). Only a definitive
+/// "does not exist" returns false.
+fn separate_key_sentinel_blocks() -> bool {
+    !matches!(std::path::Path::new(SEPARATE_KEY_SENTINEL).try_exists(), Ok(false))
+}
 
 /// Serializes the telemetry-source and telemetry-master endpoints so concurrent
 /// requests can't clobber sentryusb.conf or leave source/poll disagreeing.
@@ -99,6 +111,22 @@ fn set_provision_fields_in_toml(text: &str, vin: &str, key_path: &str) -> anyhow
     Ok(doc.to_string())
 }
 
+/// Should the shared-key custodian LEAVE this box alone? Fail-closed: skip unless
+/// the config clearly says shared-key. Skip when `c6_separate_key` is present with
+/// any value other than an explicit boolean `false` (a non-boolean value is
+/// ambiguous, so skip), and skip when the TOML won't parse. Only an absent flag,
+/// an explicit `false`, or (caller) a missing file is the shared-key default.
+/// Pure for testability.
+fn should_skip_shared_key_arming(text: &str) -> bool {
+    match text.parse::<toml_edit::DocumentMut>() {
+        Ok(doc) => match doc.get("c6_separate_key") {
+            None => false,
+            Some(v) => !matches!(v.as_bool(), Some(false)),
+        },
+        Err(_) => true,
+    }
+}
+
 /// True if the Pi key file exists and parses as a private-key PEM (guards
 /// arming on a missing/torn file). Absent => false.
 fn pi_key_looks_valid() -> bool {
@@ -155,6 +183,10 @@ pub async fn ensure_shared_key_provision_config() -> anyhow::Result<()> {
     if !c6_present() {
         return Ok(());
     }
+    // NOTE: the separate-key gate is NOT a top-level early return — that would
+    // bypass the RESTART_PENDING retry below. It is enforced inside the locked
+    // read-modify-write (which returns `changed=false` without stamping), so a
+    // separate-key board is never stamped yet a pending restart still fires.
     // No key yet = fresh install (pairing generates it first); silent, not an error.
     if !std::path::Path::new(PI_KEY_PATH).exists() {
         return Ok(());
@@ -190,6 +222,12 @@ pub async fn ensure_shared_key_provision_config() -> anyhow::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(e) => return Err(anyhow::anyhow!("read {C6_SUPERVISOR_CONFIG}: {e}")),
         };
+        // Authoritative re-check under the lock: a separate-key config (TOML flag
+        // OR the parse-free sentinel, which the installer writes FIRST) must never
+        // be stamped with the Pi key. Checked as late as possible before the write.
+        if should_skip_shared_key_arming(&text) || separate_key_sentinel_blocks() {
+            return Ok(false);
+        }
         let updated = set_provision_fields_in_toml(&text, &vin, PI_KEY_PATH)?;
         if updated == text {
             return Ok(false);
@@ -197,6 +235,13 @@ pub async fn ensure_shared_key_provision_config() -> anyhow::Result<()> {
         let _ = std::process::Command::new("bash")
             .args(["-c", "/root/bin/remountfs_rw"])
             .status();
+        // Final sentinel re-check with the smallest possible window before the
+        // write: if the installer dropped the sentinel during remount, abort the
+        // stamp. (The installer writes the sentinel FIRST and `chattr +i`s the
+        // TOML, so this race is already vanishingly small.)
+        if separate_key_sentinel_blocks() {
+            return Ok(false);
+        }
         write_supervisor_toml_atomic(&updated)?;
         Ok(true)
     })
@@ -522,5 +567,40 @@ mod tests {
         assert!(out.contains("private_key_pem_path = \"/root/.ble/key_private.pem\""));
         assert!(!out.contains("/mutable/tesla_key.pem"), "old path replaced");
         assert_ne!(out, src, "a stale key path is a real change");
+    }
+
+    #[test]
+    fn separate_key_flag_gates_shared_key_arming() {
+        // Marked separate-key: custodian must leave the box alone.
+        assert!(should_skip_shared_key_arming(
+            "c6_separate_key = true\nprivate_key_pem_path = \"/mutable/c6_own_key.pem\"\n"
+        ));
+        // Not marked (shared-key default): custodian arms.
+        assert!(!should_skip_shared_key_arming(
+            "private_key_pem_path = \"/root/.ble/key_private.pem\"\n"
+        ));
+        // Explicit false is shared-key.
+        assert!(!should_skip_shared_key_arming("c6_separate_key = false\n"));
+        // Empty config = shared-key default.
+        assert!(!should_skip_shared_key_arming(""));
+    }
+
+    #[test]
+    fn unparsable_toml_fails_closed_skips_arming() {
+        // A torn/garbage TOML must NOT be stamped with the shared key — fail closed
+        // so a separate-key board is never clobbered on a transient bad read.
+        assert!(should_skip_shared_key_arming("this is = = not toml ]["));
+        assert!(should_skip_shared_key_arming("c6_separate_key = "));
+    }
+
+    #[test]
+    fn non_boolean_separate_key_fails_closed() {
+        // Any present `c6_separate_key` that is not an explicit boolean false is
+        // treated as separate-key (skip) — a string/int value must not fail open.
+        assert!(should_skip_shared_key_arming("c6_separate_key = \"true\"\n"));
+        assert!(should_skip_shared_key_arming("c6_separate_key = 1\n"));
+        assert!(should_skip_shared_key_arming("c6_separate_key = \"yes\"\n"));
+        // Explicit boolean false is the only "present" value that still arms.
+        assert!(!should_skip_shared_key_arming("c6_separate_key = false\n"));
     }
 }
