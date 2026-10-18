@@ -39,9 +39,17 @@ pub fn lease_lock() -> Option<LeaseLock> {
         let _ = std::fs::create_dir_all(dir);
     }
     let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
-    // SAFETY: valid fd owned by `f` for the duration of the call.
-    let rc = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) };
-    (rc == 0).then_some(LeaseLock(f))
+    // Bounded non-blocking acquire (~100ms): holders only do fast tmpfs I/O, so a
+    // contended lock still succeeds, but a wedged holder can never stall the
+    // caller indefinitely. None = couldn't lock => caller holds (no dual-session).
+    for _ in 0..20 {
+        // SAFETY: valid fd owned by `f` for the duration of the call.
+        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(LeaseLock(f));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
 }
 
 /// Who wrote a sampler lease: this daemon, or `sentryusb-ble-action` holding
@@ -478,6 +486,38 @@ fn write_lease_with(owner: Owner, settle_until: Option<u64>, mode: Option<&str>)
     ok
 }
 
+
+/// On daemon exit: park the C6 (owner:sampler) with a SHORT-lived lease carrying
+/// a settle deadline, instead of deleting. Deleting makes a restart grant the C6
+/// at once (missing lease = "C6 may grab") while the old session is still tearing
+/// down = two signers. This parks the C6 immediately AND makes the successor wait
+/// CLAIM_SETTLE, without blocking ble-action for the full LEASE_VALID_MS. Caller
+/// must hold the lease lock.
+pub fn write_exit_park_lease() -> bool {
+    let (Some(boot), Some(now)) = (boot_id(), boottime_ms()) else { return false };
+    let path = std::path::Path::new(LEASE_PATH);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    let body = match serde_json::from_str::<serde_json::Value>(&lease_json(
+        Owner::Sampler,
+        &boot,
+        now,
+        CLAIM_SETTLE_MS,
+    )) {
+        Ok(mut v) => {
+            v["settle_until_ms"] = serde_json::json!(now.saturating_add(CLAIM_SETTLE_MS));
+            v.to_string()
+        }
+        Err(_) => return false,
+    };
+    let ok = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)).is_ok();
+    if !ok {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    ok
+}
 
 // Verb mapping + supervisor client live in tesla_ble so sentryusb-ble-action
 // uses the exact same routing when this daemon is down.

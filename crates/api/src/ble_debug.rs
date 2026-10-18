@@ -408,7 +408,30 @@ async fn write_journal(out: &mut String, lines: usize) {
 /// the C6 dump never leaks the VIN or key material even if a log string changes.
 fn c6_line_is_safe(line: &str) -> bool {
     let l = line.to_ascii_lowercase();
-    !(l.contains("vin") || l.contains("key") || l.contains("fingerprint") || l.contains("private"))
+    const DENY: [&str; 8] =
+        ["vin", "key", "fingerprint", "private", "token", "pairing", "secret", "passphrase"];
+    !DENY.iter().any(|d| l.contains(d))
+}
+
+/// Redact opaque high-entropy runs the keyword scrub can't catch (unmarked or
+/// encoded secrets): any unbroken run of >= 20 characters over the base64url /
+/// hex alphabet (incl. - and _) becomes <redacted>, so a hyphenated UUID or a
+/// base64url token is one run, not short fragments. Normal log prose breaks on
+/// spaces/punctuation well before 20.
+fn redact_opaque_tokens(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut run = String::new();
+    for ch in line.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '+' | '/' | '=' | '-' | '_') {
+            run.push(ch);
+            continue;
+        }
+        out.push_str(if run.len() >= 20 { "<redacted>" } else { &run });
+        run.clear();
+        out.push(ch);
+    }
+    out.push_str(if run.len() >= 20 { "<redacted>" } else { &run });
+    out
 }
 
 /// C6 diagnostics: supervisor status, the snapshot's safe fields, the lease owner,
@@ -436,22 +459,30 @@ async fn write_c6(out: &mut String) {
     match std::fs::read_to_string(SNAPSHOT) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
+                // Only known structured fields. last_fault is deliberately omitted:
+                // it's free text and could carry an unmarked secret the scrub misses.
                 for k in [
                     "link",
                     "healthy",
                     "provisioned",
                     "polling_enabled",
                     "serial_connected",
-                    "last_fault",
                     "last_heartbeat_age_ms",
                     "uptime_s",
                     "fw",
                 ] {
                     if let Some(val) = v.get(k) {
+                        let s = val.to_string();
                         out.push_str("  ");
                         out.push_str(k);
                         out.push_str(": ");
-                        out.push_str(&val.to_string());
+                        // Same two-stage scrub as the journal lines: keyword denylist,
+                        // then opaque-token redaction for any secret-shaped run.
+                        if c6_line_is_safe(&s) {
+                            out.push_str(&redact_opaque_tokens(&s));
+                        } else {
+                            out.push_str("<redacted>");
+                        }
                         out.push('\n');
                     }
                 }
@@ -466,8 +497,14 @@ async fn write_c6(out: &mut String) {
     match std::fs::read_to_string(LEASE) {
         Ok(text) => match serde_json::from_str::<serde_json::Value>(&text) {
             Ok(v) => {
-                let owner = v.get("owner").and_then(|x| x.as_str()).unwrap_or("?");
-                let holder = v.get("holder").and_then(|x| x.as_str()).unwrap_or("?");
+                // Validate against the fixed enum set: emit only known values so a
+                // tampered lease can't inject arbitrary text into the dump.
+                let owner = v.get("owner").and_then(|x| x.as_str());
+                let holder = v.get("holder").and_then(|x| x.as_str());
+                let owner = owner.filter(|o| matches!(*o, "sampler" | "c6")).unwrap_or("<invalid>");
+                let holder = holder
+                    .filter(|h| matches!(*h, "telemetry" | "ble-action" | "sampler"))
+                    .unwrap_or("<invalid>");
                 out.push_str("  lease owner: ");
                 out.push_str(owner);
                 out.push_str(" (holder ");
@@ -515,7 +552,7 @@ async fn write_c6(out: &mut String) {
             ];
             for line in raw.lines() {
                 if interesting.iter().any(|p| line.contains(p)) && c6_line_is_safe(line) {
-                    out.push_str(line);
+                    out.push_str(&redact_opaque_tokens(line));
                     out.push('\n');
                 }
             }

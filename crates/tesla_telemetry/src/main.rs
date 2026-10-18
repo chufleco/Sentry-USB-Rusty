@@ -733,7 +733,7 @@ async fn tick(
 
     // C6 plugged in and provisioned, source unset: opt this box in (next tick).
     if !cfg.c6_primary {
-        c6_onboarding(&cfg, c6_link);
+        c6_onboarding(&cfg, c6_link).await;
     }
 
     // Shared-key coordination: decide who may talk to the car BEFORE any
@@ -748,11 +748,16 @@ async fn tick(
         let prev = c6_link.coord.owner();
         // Known awake: recording clips, or a keep-awake/archive holds it up
         // (an archive unplugs the gadget, so clips alone can't show that).
-        let health = c6_coord::health(
+        let mut health = c6_coord::health(
             snap.as_ref(),
             usb_watch::observe() == CarState::Awake || lock::keep_awake_requested(),
             c6_link.c6_nudge_failing,
         );
+        // Driving but the C6's GPS/drive poll went stale: the idle keepalive keeps
+        // car_ok fresh so only this surfaces it. Fail over to the sampler.
+        if c6_link.c6_drive_degraded {
+            health.car_link_down = true;
+        }
         let owner = c6_link.coord.step_health(health, now);
         if owner != prev {
             info!(
@@ -764,6 +769,13 @@ async fn tick(
         }
         match owner {
             c6_coord::Owner::C6 => {
+                if prev == c6_coord::Owner::Sampler {
+                    // Trial grant: give the C6 a clean slate so the first owned tick
+                    // re-tests the link instead of inheriting the stale failure that
+                    // triggered the failover (else the trial re-fails before a nudge).
+                    c6_link.c6_nudge_failing = false;
+                    c6_link.c6_drive_degraded = false;
+                }
                 c6_release(ble_session, held_radio, c6_link).await;
                 *parked_polls = 0;
                 *last_user_presence = None;
@@ -786,7 +798,8 @@ async fn tick(
             }
             c6_coord::Owner::Sampler => {
                 c6_link.parked_obs = 0; // C6 evidence is stale now
-                c6_link.c6_nudge_failing = false; // the Pi nudges now
+                // Do NOT clear c6_nudge_failing here: it must stay set so the ladder
+                // keeps the C6 parked until the trial grant (Sampler->C6) resets it.
                 if prev == c6_coord::Owner::C6 {
                     // A C6 nudge failure may have pushed the next nudge a full
                     // interval out; the Pi should nudge as soon as it can.
@@ -2598,6 +2611,12 @@ struct C6Link {
     first_grant_after: Option<u64>,
     /// The last C6 keep-awake nudge failed (cleared on success / no keep-awake).
     c6_nudge_failing: bool,
+    /// Last fresh C6 drive reading showed the car driving (not parked).
+    last_driving: bool,
+    /// Driving but the C6's drive/location poll went stale: treat as a degraded
+    /// car link and fail over to the sampler (idle keepalive keeps car_ok fresh,
+    /// so nothing else would).
+    c6_drive_degraded: bool,
     /// Consecutive fresh C6 drive readings showing parked (keep-accessory
     /// input while the C6 owns the car; the sampler's own counter is idle).
     parked_obs: u32,
@@ -2660,9 +2679,19 @@ fn keep_accessory_via(c6_owns: bool, c6_granted: bool, have_session: bool) -> Op
 ///     supervisor parks the C6 => only the Pi signs.
 ///   * A stale owner:sampler lease that would otherwise block ble-action's
 ///     fallback nudge for LEASE_VALID_MS while the daemon is down.
-/// Only touches the file we own (best-effort); our binary re-grants on restart.
+/// Under the lease lock so it can't race a ble-action claim. Best-effort.
 fn c6_clear_lease_on_exit() {
-    let _ = std::fs::remove_file(c6_coord::LEASE_PATH);
+    let Some(_lock) = c6_coord::lease_lock() else { return };
+    // A direct ble-action session holds the car: leave its reservation intact.
+    if c6_coord::ble_action_holds_car() {
+        return;
+    }
+    // Park the C6 (owner:sampler, short settle) rather than delete: a deleted
+    // lease lets a restart grant the C6 before the old session closes (two
+    // signers); parking stops the supervisor at once and makes the successor
+    // wait CLAIM_SETTLE. A stock (non-coordinating) successor never refreshes it,
+    // so it expires to "hold" and the C6 stays parked.
+    let _ = c6_coord::write_exit_park_lease();
 }
 
 /// Stand the sampler down and, once our car link is really closed, grant the
@@ -2704,7 +2733,12 @@ async fn c6_release(
     if !link.grant_live && !link.startup_checked {
         link.startup_checked = true;
         if c6_coord::disk_sampler_lease_live() {
-            link.first_grant_after = Some(now.saturating_add(c6_coord::CLAIM_SETTLE_MS));
+            // Honor the park-lease's recorded settle deadline if it's later than a
+            // fresh CLAIM_SETTLE, so the successor waits out the window the exiting
+            // daemon wrote rather than restarting the clock short.
+            let base = now.saturating_add(c6_coord::CLAIM_SETTLE_MS);
+            let until = c6_coord::disk_settle_until().map_or(base, |s| base.max(s));
+            link.first_grant_after = Some(until);
         }
     }
     if link.first_grant_after.is_some_and(|t| now < t) {
@@ -2768,10 +2802,46 @@ fn c6_claim_for_sampler(cfg: &BleConfig, link: &mut C6Link) -> bool {
     true
 }
 
+const C6_SUPERVISOR_CONFIG: &str = "/etc/sentryusb/c6-supervisor.toml";
+const C6_SUPERVISOR_SERVICE: &str = "sentryusb-c6-supervisor";
+/// Cross-process flock serializing the sentryusb.conf + supervisor-TOML
+/// read-modify-write. Must match the API's C6_CONFIG_LOCK: the API's in-process
+/// mutex can't coordinate across the api server and this daemon.
+const C6_CONFIG_LOCK: &str = "/run/sentryusb-c6/config.lock";
+
+/// Take the shared config lock. None = couldn't lock (caller skips the write).
+fn lock_config_file() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = std::path::Path::new(C6_CONFIG_LOCK);
+    let _ = path.parent().map(std::fs::create_dir_all);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+}
+
+/// Set `[poll] enabled` in the supervisor TOML (creating the table if missing),
+/// preserving the rest. Atomic (tmp + rename).
+fn set_supervisor_poll_enabled(enabled: bool) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(C6_SUPERVISOR_CONFIG)?;
+    let mut doc = text.parse::<toml_edit::DocumentMut>()?;
+    if doc.get("poll").and_then(|p| p.as_table_like()).is_none() {
+        doc["poll"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["poll"]["enabled"] = toml_edit::value(enabled);
+    let updated = doc.to_string();
+    if updated != text {
+        let tmp = format!("{C6_SUPERVISOR_CONFIG}.tmp");
+        std::fs::write(&tmp, &updated)?;
+        std::fs::rename(&tmp, C6_SUPERVISOR_CONFIG)?;
+    }
+    Ok(())
+}
+
 /// C6 onboarding: once a provisioned C6 is live and TELEMETRY_SOURCE is unset,
-/// write `TELEMETRY_SOURCE=c6_primary` so the sampler stands down. Never over an
-/// explicit choice, never with a C6_BACKFILL bench config; tried once per run.
-fn c6_onboarding(cfg: &BleConfig, link: &mut C6Link) {
+/// write `c6_primary` AND enable supervisor polling (when the BLE master is on)
+/// so the C6 drives the car from the start, never c6_primary + poll off. Never
+/// over an explicit choice or a C6_BACKFILL bench config; tried once per run.
+async fn c6_onboarding(cfg: &BleConfig, link: &mut C6Link) {
     if cfg.telemetry_source_set || cfg.c6_backfill || link.onboarding_tried {
         return;
     }
@@ -2780,19 +2850,52 @@ fn c6_onboarding(cfg: &BleConfig, link: &mut C6Link) {
         return;
     }
     link.onboarding_tried = true;
-    let path = sentryusb_config::find_config_path();
-    let result = (|| -> anyhow::Result<()> {
+    let master_on = cfg.enabled;
+    // Blocking file + remount work off the async runtime.
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        // Serialize with the API's telemetry_source_set across processes, then
+        // RE-READ the conf under the lock so we never commit a stale map (a
+        // concurrent master-off/source change could otherwise strand
+        // c6_primary + poll off).
+        let Some(_cfg_lock) = lock_config_file() else { return Ok(false) };
+        let path = sentryusb_config::find_config_path();
         let (mut active, commented) = sentryusb_config::parse_file(path)?;
         if sentryusb_config::get_config_value(&active, &commented, "TELEMETRY_SOURCE").is_some() {
-            return Ok(()); // raced with a user edit
+            return Ok(false); // raced with a user edit
+        }
+        let _ = std::process::Command::new("bash").args(["-c", "/root/bin/remountfs_rw"]).status();
+        // Poll first: supervisor polling on with no owner:c6 grant yet is safe (it
+        // can't sign without the lease), while c6_primary + poll off is no-data. If
+        // the master is off, leave poll off (the master switch gates it).
+        if master_on {
+            set_supervisor_poll_enabled(true)?;
         }
         active.insert("TELEMETRY_SOURCE".into(), "c6_primary".into());
-        let _ = std::process::Command::new("bash").args(["-c", "/root/bin/remountfs_rw"]).status();
-        sentryusb_config::write_file(path, &active)
-    })();
+        sentryusb_config::write_file(path, &active)?;
+        Ok(true)
+    })
+    .await;
     match result {
-        Ok(()) => info!("C6 onboarding: provisioned C6 found, set TELEMETRY_SOURCE=c6_primary"),
-        Err(e) => warn!("C6 onboarding: could not set TELEMETRY_SOURCE: {e:#}"),
+        Ok(Ok(true)) => {
+            info!("C6 onboarding: provisioned C6 found, set TELEMETRY_SOURCE=c6_primary + supervisor poll");
+            // [poll] is boot-read: restart the supervisor so it polls now. Detached.
+            if master_on {
+                tokio::spawn(async {
+                    if let Err(e) = sentryusb_shell::run_with_timeout(
+                        Duration::from_secs(30),
+                        "systemctl",
+                        &["restart", C6_SUPERVISOR_SERVICE],
+                    )
+                    .await
+                    {
+                        warn!("C6 onboarding: supervisor restart failed: {e:#}");
+                    }
+                });
+            }
+        }
+        Ok(Ok(false)) => {}
+        Ok(Err(e)) => warn!("C6 onboarding: could not set source/poll: {e:#}"),
+        Err(e) => warn!("C6 onboarding: task panicked: {e:#}"),
     }
 }
 
@@ -2872,6 +2975,45 @@ fn c6_drive_parked(shift: Option<sample::ShiftState>, power: Option<f64>) -> boo
     }
 }
 
+/// Positive driving evidence for the drive-GPS failover: shift in D/R, or
+/// non-zero power. Missing/unknown shift AND no power reads as NOT driving, so a
+/// parked car with a sparse reading never false-fails-over (the whole-device
+/// health failover still catches a truly-dead C6 while actually driving).
+fn c6_driving(shift: Option<sample::ShiftState>, power: Option<f64>) -> bool {
+    matches!(shift, Some(sample::ShiftState::Drive) | Some(sample::ShiftState::Reverse))
+        || power.is_some_and(|p| p.abs() >= 1.0)
+}
+
+/// Driving but the C6's drive/location poll went stale past this long => a
+/// degraded car link. ~3 C6-owned poll intervals, so one slow cycle won't trip it.
+const DRIVE_DEGRADE_STALE_MS: u64 = 45_000;
+/// No fresh drive frame within this long => stop treating the car as driving
+/// (it may have parked+slept without a final Park frame). Prevents stale
+/// driving-evidence from driving a failover. (Driving keeps odometer ticking,
+/// so the drive domain stays fresh well inside this while actually moving.)
+const DRIVE_EVIDENCE_STALE_MS: u64 = 60_000;
+
+/// Pure: last reading showed the car driving AND location is stale past the
+/// threshold (or never reported). Parked (last_driving=false) is never degraded,
+/// so a Sentry-parked car with naturally stale location won't false-fail-over.
+fn drive_link_degraded(last_driving: bool, location_age_ms: Option<u64>, threshold_ms: u64) -> bool {
+    last_driving && location_age_ms.map(|a| a > threshold_ms).unwrap_or(true)
+}
+
+/// Age out stale driving evidence: still driving only if a drive frame arrived
+/// within stale_ms. Missing/old drive age => not driving (parked+slept).
+///
+/// KNOWN LIMITATION (accepted): if the car is actually DRIVING but the C6's
+/// drive domain alone dies past stale_ms while the idle keepalive keeps the
+/// device otherwise fresh, this reads it as parked and won't trip the drive-GPS
+/// failover — we can't tell that apart from a parked+asleep car without an
+/// independent motion/speed signal. Backstop: a fully-dead C6 is still caught by
+/// the ~90s whole-device health failover. (Do not re-tighten; this is the
+/// round-4/5 tension deliberately settled on the no-false-failover side.)
+fn driving_after_staleness(last_driving: bool, drive_age_ms: Option<u64>, stale_ms: u64) -> bool {
+    last_driving && drive_age_ms.is_some_and(|a| a <= stale_ms)
+}
+
 /// Fresh C6 value for `domain` not yet written as a row, else None.
 fn c6_new_value<'a>(
     snap: Option<&'a c6_source::C6Snapshot>,
@@ -2915,8 +3057,12 @@ async fn c6_owned_tick(
             any = true;
         }
         shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
-        let parked = c6_drive_parked(shift, d.fields.get("power").and_then(|v| v.as_f64()));
+        let power = d.fields.get("power").and_then(|v| v.as_f64());
+        let parked = c6_drive_parked(shift, power);
         link.parked_obs = if parked { link.parked_obs.saturating_add(1) } else { 0 };
+        // Require positive driving evidence (not merely !parked): unknown shift +
+        // no power must NOT read as driving, else a parked car false-fails-over.
+        link.last_driving = c6_driving(shift, power);
         mark.push(("drive", d.updated_at_ms));
     } else if c6_source::decide_domain(snap, "drive", now_wall) != c6_source::Source::C6 {
         link.parked_obs = 0; // no fresh drive data: no parked evidence
@@ -2965,6 +3111,15 @@ async fn c6_owned_tick(
     for (d, t) in mark {
         link.written.insert(d, t);
     }
+    // Age out stale driving evidence first: with no fresh drive frame in the
+    // window, the car isn't actively driving (may have parked+slept without a
+    // final Park frame), so stale last_driving can't drive a failover.
+    let drive_age = snap.and_then(|s| s.domain_age_ms("drive", now_wall));
+    link.last_driving = driving_after_staleness(link.last_driving, drive_age, DRIVE_EVIDENCE_STALE_MS);
+    // Degraded-drive detection: driving but the location domain stale past the
+    // threshold. Fails over next tick (parked => last_driving false => never).
+    let loc_age = snap.and_then(|s| s.domain_age_ms("location", now_wall));
+    link.c6_drive_degraded = drive_link_degraded(link.last_driving, loc_age, DRIVE_DEGRADE_STALE_MS);
     if any {
         row.latitude = *last_lat;
         row.longitude = *last_lon;
@@ -3029,6 +3184,32 @@ mod c6_link_tests {
     use super::*;
 
     #[test]
+    fn drive_degraded_only_when_driving_and_location_stale() {
+        let t = DRIVE_DEGRADE_STALE_MS;
+        // Driving + stale (or never reported) location => degraded.
+        assert!(drive_link_degraded(true, Some(t + 1), t));
+        assert!(drive_link_degraded(true, None, t));
+        // Driving + fresh location => fine.
+        assert!(!drive_link_degraded(true, Some(t - 1), t));
+        // Parked => never degraded, even with stale/absent location (Sentry).
+        assert!(!drive_link_degraded(false, Some(t * 10), t));
+        assert!(!drive_link_degraded(false, None, t));
+    }
+
+    #[test]
+    fn driving_evidence_ages_out_without_a_fresh_drive_frame() {
+        let s = DRIVE_EVIDENCE_STALE_MS;
+        // Fresh drive frame => keep driving state.
+        assert!(driving_after_staleness(true, Some(s - 1), s));
+        assert!(driving_after_staleness(true, Some(s), s));
+        // No/old drive frame => not driving (parked+slept, no final Park frame).
+        assert!(!driving_after_staleness(true, Some(s + 1), s));
+        assert!(!driving_after_staleness(true, None, s));
+        // Not driving stays not driving regardless of age.
+        assert!(!driving_after_staleness(false, Some(0), s));
+    }
+
+    #[test]
     fn flag_unset_never_hands_the_car_to_the_c6() {
         // Stock config: the sampler always owns, whatever the coordinator says.
         let link = C6Link::default();
@@ -3069,6 +3250,19 @@ mod keep_accessory_route_tests {
         assert!(!c6_drive_parked(Some(Unknown), Some(12.0)), "moving");
         assert!(!c6_drive_parked(None, Some(0.0)), "no shift field");
         assert!(!c6_drive_parked(Some(Drive), Some(0.0)));
+    }
+
+    #[test]
+    fn c6_driving_needs_positive_evidence() {
+        use sample::ShiftState::*;
+        assert!(c6_driving(Some(Drive), None));
+        assert!(c6_driving(Some(Reverse), None));
+        assert!(c6_driving(Some(Unknown), Some(5.0)), "non-zero power");
+        // The false-failover bug: unknown/missing shift with no power is NOT driving.
+        assert!(!c6_driving(Some(Unknown), None));
+        assert!(!c6_driving(None, None));
+        assert!(!c6_driving(Some(Park), Some(0.0)));
+        assert!(!c6_driving(Some(Neutral), Some(0.0)));
     }
 
     #[test]

@@ -19,6 +19,10 @@ const C6_SUPERVISOR_API: &str = "http://127.0.0.1:8787";
 const C6_SUPERVISOR_CONFIG: &str = "/etc/sentryusb/c6-supervisor.toml";
 /// systemd unit for the C6 supervisor.
 const C6_SUPERVISOR_SERVICE: &str = "sentryusb-c6-supervisor";
+/// Cross-process flock serializing the conf + supervisor-TOML read-modify-write.
+/// Must match the telemetry daemon's C6_CONFIG_LOCK: the CONFIG_LOCK tokio mutex
+/// below only serializes within THIS process, not against the daemon's onboarding.
+const C6_CONFIG_LOCK: &str = "/run/sentryusb-c6/config.lock";
 /// The Pi's Tesla key (custodian model: copied to the C6, always Pi -> C6).
 const PI_KEY_PATH: &str = "/root/.ble/key_private.pem";
 /// Parse-free separate-key sentinel, shared verbatim with the flasher. Its presence
@@ -38,6 +42,25 @@ fn separate_key_sentinel_blocks() -> bool {
 /// requests can't clobber sentryusb.conf or leave source/poll disagreeing.
 pub(crate) static CONFIG_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Coalesces detached supervisor restarts so a burst of toggles can't spawn
+/// overlapping `systemctl restart`s. The config written before the restart is the
+/// source of truth, so collapsing a burst into one reload loses nothing.
+static RESTART_PENDING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn spawn_supervisor_restart(context: &'static str) {
+    use std::sync::atomic::Ordering;
+    if RESTART_PENDING.swap(true, Ordering::SeqCst) {
+        return; // one already queued; it reloads the latest on-disk config
+    }
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await; // coalesce a burst
+        RESTART_PENDING.store(false, Ordering::SeqCst);
+        if let Err(e) = sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await {
+            tracing::error!("restart {C6_SUPERVISOR_SERVICE} ({context}) failed: {e:#}");
+        }
+    });
+}
+
 /// Keep supervisor polling in step with the telemetry master: telemetry off must
 /// stop the C6 polling/signing too. No-op unless the C6 is the active source.
 pub(crate) async fn sync_supervisor_poll_to_telemetry(telemetry_enabled: bool) -> anyhow::Result<()> {
@@ -45,6 +68,10 @@ pub(crate) async fn sync_supervisor_poll_to_telemetry(telemetry_enabled: bool) -
         return Ok(());
     }
     let existed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        // Cross-process lock + read under it (same as telemetry_source_set) so a
+        // concurrent onboarding/provision write can't clobber this poll edit.
+        let _cfg_lock = lock_config_file()
+            .ok_or_else(|| anyhow::anyhow!("could not lock {C6_CONFIG_LOCK}"))?;
         let text = match std::fs::read_to_string(C6_SUPERVISOR_CONFIG) {
             Ok(t) => t,
             // No supervisor config: nothing to poll-gate (C6 not installed here).
@@ -70,13 +97,7 @@ pub(crate) async fn sync_supervisor_poll_to_telemetry(telemetry_enabled: bool) -
         // instead of blocking on the supervisor stop (up to TimeoutStopSec). The
         // TOML written above is the source of truth; Restart=on-failure recovers a
         // failed restart, and the /run lease (not restart timing) governs signing.
-        tokio::spawn(async {
-            if let Err(e) =
-                sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await
-            {
-                tracing::error!("restart {C6_SUPERVISOR_SERVICE} (poll sync) failed: {e:#}");
-            }
-        });
+        spawn_supervisor_restart("poll sync");
     }
     Ok(())
 }
@@ -163,6 +184,17 @@ fn write_supervisor_toml_atomic(contents: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Take the shared config flock (the daemon's onboarding takes the same path).
+/// The lock releases when the returned file drops. None = couldn't lock.
+fn lock_config_file() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = std::path::Path::new(C6_CONFIG_LOCK);
+    let _ = path.parent().map(std::fs::create_dir_all);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+}
+
 /// The VIN the sampler is configured with, if any. Empty string => not set.
 fn configured_vin() -> String {
     let config_path = sentryusb_config::find_config_path();
@@ -216,6 +248,10 @@ pub async fn ensure_shared_key_provision_config() -> anyhow::Result<()> {
     let _cfg_guard = CONFIG_LOCK.lock().await;
 
     let changed = tokio::task::spawn_blocking(move || -> anyhow::Result<bool> {
+        // Cross-process lock + read under it (not just CONFIG_LOCK): otherwise this
+        // timer can read a stale poll=false and write it back AFTER onboarding
+        // enabled polling, restoring c6_primary + poll off. Skip if contended.
+        let Some(_cfg_lock) = lock_config_file() else { return Ok(false) };
         let text = match std::fs::read_to_string(C6_SUPERVISOR_CONFIG) {
             Ok(t) => t,
             // No supervisor config: C6 tooling isn't installed on this box.
@@ -311,27 +347,51 @@ fn c6_source_active() -> bool {
     false
 }
 
-/// GET /api/system/c6-status
+/// `[poll] enabled` from the supervisor TOML (the UI's source of truth for
+/// whether the C6 is signing). None = no supervisor config / unreadable.
+fn supervisor_poll_enabled() -> Option<bool> {
+    let text = std::fs::read_to_string(C6_SUPERVISOR_CONFIG).ok()?;
+    let doc = text.parse::<toml_edit::DocumentMut>().ok()?;
+    doc.get("poll").and_then(|p| p.get("enabled")).and_then(|v| v.as_bool())
+}
+
+/// Current car-link owner from the sampler lease ("c6" | "sampler"), so the UI
+/// can tell a failed-over C6 (owner:sampler) from one actually driving.
+fn lease_owner() -> Option<String> {
+    let text = std::fs::read_to_string("/run/sentryusb-c6/sampler_lease.json").ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v.get("owner").and_then(|x| x.as_str()).map(str::to_string)
+}
+
+/// GET /api/system/c6-status. Includes poll/link/owner so the UI can distinguish
+/// a parked C6 (idle/session, owner:c6), a wedged one (active link but no car
+/// contact), and a failed-over one (owner:sampler) — not just present/on.
 pub async fn c6_status_get(
     State(_s): State<AppState>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    // One supervisor fetch for both provisioned + fw (each call has a 2s timeout).
     let status = supervisor_status().await;
-    let provisioned = status
-        .as_ref()
-        .and_then(|v| v.get("provisioned").and_then(|b| b.as_bool()))
-        .unwrap_or(false);
-    let fw = status
-        .as_ref()
-        .and_then(|v| v.get("fw").and_then(|s| s.as_str()))
-        .map(str::to_string);
+    let get_bool = |k: &str| status.as_ref().and_then(|v| v.get(k).and_then(|b| b.as_bool()));
+    let get_str = |k: &str| {
+        status.as_ref().and_then(|v| v.get(k).and_then(|s| s.as_str())).map(str::to_string)
+    };
+    let get_u64 = |k: &str| status.as_ref().and_then(|v| v.get(k).and_then(|n| n.as_u64()));
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "present": c6_present(),
-            "provisioned": provisioned,
+            "provisioned": get_bool("provisioned").unwrap_or(false),
             "source_active": c6_source_active(),
-            "fw": fw,
+            "fw": get_str("fw"),
+            // Live link/health from the supervisor; owner from the lease — the
+            // fields the UI needs to show parked/wedged/failover. Poll prefers the
+            // supervisor's live status if it reports it, else the boot-read TOML.
+            "link": get_str("link"),
+            "healthy": get_bool("healthy"),
+            "serial_connected": get_bool("serial_connected"),
+            "car_ok_age_ms": get_u64("car_ok_age_ms"),
+            "last_heartbeat_age_ms": get_u64("last_heartbeat_age_ms"),
+            "polling_enabled": get_bool("polling_enabled").or_else(supervisor_poll_enabled),
+            "owner": lease_owner(),
         })),
     )
 }
@@ -394,33 +454,50 @@ pub async fn telemetry_source_set(
     // Supervisor polling is ON only when the C6 is the source AND telemetry is
     // enabled by the master switch. Selecting the C6 must not override a
     // telemetry-off master, otherwise the C6 would poll/sign against master-off.
+    // NOTE: with the master OFF this intentionally leaves c6_primary + poll off —
+    // telemetry is meant to be off, the source is remembered, and master-on calls
+    // sync_supervisor_poll_to_telemetry(true) to re-enable poll. This is the BY
+    // DESIGN self-healing case, NOT the accidental no-data state onboarding guards.
     let poll_on = use_c6 && crate::ble::is_ble_enabled();
 
     let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+        // Serialize with the daemon's c6_onboarding across processes (the
+        // in-process CONFIG_LOCK can't): take the shared file lock, then read the
+        // conf UNDER it so onboarding can't interleave a stale read-modify-write.
+        let _cfg_lock = lock_config_file()
+            .ok_or_else(|| anyhow::anyhow!("could not lock {C6_CONFIG_LOCK}"))?;
         // Prepare and validate BOTH edits in memory before writing either file,
         // so a bad/missing supervisor TOML can't leave sentryusb.conf switched
         // with polling out of sync.
         let config_path = sentryusb_config::find_config_path();
         let (mut active, _) = sentryusb_config::parse_file(config_path)?;
-        if use_c6 {
-            active.insert("TELEMETRY_SOURCE".to_string(), "c6_primary".to_string());
-        } else {
-            active.remove("TELEMETRY_SOURCE");
-        }
+        // Write "sampler" explicitly (not remove): an absent key re-triggers C6
+        // auto-onboarding, which would override the user's sampler choice.
+        active.insert(
+            "TELEMETRY_SOURCE".to_string(),
+            if use_c6 { "c6_primary" } else { "sampler" }.to_string(),
+        );
+        // Original bytes for rollback if the second write fails (never leave
+        // source and poll disagreeing).
+        let orig_conf = std::fs::read(config_path).ok();
 
         // Poll matches poll_on (C6 source + master on). Absent config is fine
         // when disabling; enabling reached here only with a present+provisioned C6.
-        let supervisor_toml: Option<String> = match std::fs::read_to_string(C6_SUPERVISOR_CONFIG) {
-            Ok(text) => {
-                let updated = set_poll_enabled_in_toml(&text, poll_on)?; // validates TOML
-                (updated != text).then_some(updated)
+        let orig_sup = std::fs::read_to_string(C6_SUPERVISOR_CONFIG).ok();
+        let supervisor_toml: Option<String> = match orig_sup.as_deref() {
+            Some(text) => {
+                let updated = set_poll_enabled_in_toml(text, poll_on)?; // validates TOML
+                (updated != *text).then_some(updated)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && !use_c6 => None,
-            Err(e) => return Err(anyhow::anyhow!("read {C6_SUPERVISOR_CONFIG}: {e}")),
+            None if !use_c6 => None,
+            None => return Err(anyhow::anyhow!("read {C6_SUPERVISOR_CONFIG}: not found")),
         };
 
-        // Commit order avoids both signers armed if the 2nd write fails: enabling
-        // writes source then poll; disabling writes poll off then source.
+        // Crash-safe commit order (a crash BETWEEN the two writes must never leave
+        // c6_primary + poll off): enabling writes poll ON first then source
+        // (poll-on without an owner:c6 grant can't sign => safe); disabling writes
+        // source=sampler first then poll OFF (sampler mode + a stray poll-on is
+        // benign). Rollback the 1st write if the 2nd fails, belt-and-suspenders.
         let _ = std::process::Command::new("bash")
             .args(["-c", "/root/bin/remountfs_rw"])
             .status();
@@ -432,11 +509,23 @@ pub async fn telemetry_source_set(
             Ok(())
         };
         if use_c6 {
-            write_conf()?;
             write_sup()?;
+            if let Err(e) = write_conf() {
+                if supervisor_toml.is_some() {
+                    if let Some(o) = orig_sup.as_deref() {
+                        let _ = write_supervisor_toml_atomic(o);
+                    }
+                }
+                return Err(e);
+            }
         } else {
-            write_sup()?;
             write_conf()?;
+            if let Err(e) = write_sup() {
+                if let Some(ref o) = orig_conf {
+                    let _ = std::fs::write(config_path, o);
+                }
+                return Err(e);
+            }
         }
         Ok(())
     })
@@ -468,15 +557,7 @@ pub async fn telemetry_source_set(
     // may sign is governed by the /run lease (owner:c6 vs owner:sampler), not by
     // when this restart lands.
     let source = if use_c6 { "c6_primary" } else { "sampler" };
-    tokio::spawn(async {
-        if let Err(e) =
-            sentryusb_shell::run("systemctl", &["restart", C6_SUPERVISOR_SERVICE]).await
-        {
-            tracing::error!(
-                "restart {C6_SUPERVISOR_SERVICE} after telemetry-source change failed: {e:#}"
-            );
-        }
-    });
+    spawn_supervisor_restart("telemetry-source change");
 
     (StatusCode::OK, Json(serde_json::json!({ "source": source })))
 }

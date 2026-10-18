@@ -139,6 +139,9 @@ async fn main() -> ExitCode {
     // socket isn't there (telemetry disabled) or the connect fails
     // (daemon crashed), fall back to direct BLE so users without
     // the telemetry daemon keep working.
+    // Held across the direct BLE work below so the reservation is renewed and
+    // released (Drop) for the whole session, not just the claim instant.
+    let _reservation;
     match no_answer_policy(try_via_ipc(verb.as_str()).await) {
         Ok(()) => {
             info!("action via daemon IPC: {} OK", verb);
@@ -152,14 +155,14 @@ async fn main() -> ExitCode {
                 reason
             );
             match c6_direct_path() {
-                DirectBle::Stock | DirectBle::Claim => {}
-                DirectBle::Block => {
+                (DirectBle::Stock | DirectBle::Claim, r) => _reservation = r,
+                (DirectBle::Block, _) => {
                     eprintln!("C6 just held the car link and the telemetry daemon is down; not opening direct BLE");
                     return ExitCode::from(3);
                 }
                 // The C6 holds a live grant: it's the only side allowed to sign,
                 // so send the action through its supervisor (car's real answer).
-                DirectBle::RouteC6 => return run_via_c6(verb.as_str()).await,
+                (DirectBle::RouteC6, _) => return run_via_c6(verb.as_str()).await,
             }
         }
         Err(IpcFail::DaemonRejected(msg)) => {
@@ -395,6 +398,7 @@ fn run_keygen() -> ExitCode {
 /// the telemetry daemon's warm connection; direct fallback covers a
 /// disabled/crashed daemon.
 async fn run_session_info() -> ExitCode {
+    let _reservation;
     match no_answer_policy(session_info_via_ipc().await) {
         Ok(token) => {
             println!("{token}");
@@ -406,9 +410,12 @@ async fn run_session_info() -> ExitCode {
                 reason
             );
             // Unknown, never NOT_PAIRED: the API leaves the paired marker alone.
-            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
-                println!("UNREACHABLE");
-                return ExitCode::SUCCESS;
+            match c6_direct_path() {
+                (DirectBle::Stock | DirectBle::Claim, r) => _reservation = r,
+                _ => {
+                    println!("UNREACHABLE");
+                    return ExitCode::SUCCESS;
+                }
             }
         }
         Err(IpcFail::DaemonRejected(msg)) => {
@@ -468,6 +475,7 @@ async fn run_session_info() -> ExitCode {
 ///
 /// Exit codes: 0 request delivered, 2 config/key error, 3 BLE/slot error.
 async fn run_pair(role: PairingRole) -> ExitCode {
+    let _reservation;
     match no_answer_policy(try_via_ipc(role.pair_verb()).await) {
         Ok(()) => {
             println!("OK");
@@ -479,9 +487,12 @@ async fn run_pair(role: PairingRole) -> ExitCode {
                 "telemetry IPC unavailable ({}), sending add-key-request via direct BLE",
                 reason
             );
-            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
-                eprintln!("C6 owns the car link; pair the C6 instead");
-                return ExitCode::from(3);
+            match c6_direct_path() {
+                (DirectBle::Stock | DirectBle::Claim, r) => _reservation = r,
+                _ => {
+                    eprintln!("C6 owns the car link; pair the C6 instead");
+                    return ExitCode::from(3);
+                }
             }
         }
         Err(IpcFail::DaemonRejected(msg)) => {
@@ -591,6 +602,7 @@ async fn session_info_via_ipc() -> Result<&'static str, IpcError> {
 /// query reuses the telemetry daemon's warm connection; direct fallback
 /// covers a disabled/crashed daemon.
 async fn run_state_query(verb: &str) -> ExitCode {
+    let _reservation;
     match no_answer_policy(state_query_via_ipc(verb).await) {
         Ok(token) => {
             println!("{token}");
@@ -601,9 +613,12 @@ async fn run_state_query(verb: &str) -> ExitCode {
                 "telemetry IPC unavailable ({}), reading vehicle state via direct BLE",
                 reason
             );
-            if !matches!(c6_direct_path(), DirectBle::Stock | DirectBle::Claim) {
-                eprintln!("C6 owns the car link and the telemetry daemon is down");
-                return ExitCode::from(3);
+            match c6_direct_path() {
+                (DirectBle::Stock | DirectBle::Claim, r) => _reservation = r,
+                _ => {
+                    eprintln!("C6 owns the car link and the telemetry daemon is down");
+                    return ExitCode::from(3);
+                }
             }
         }
         Err(IpcFail::DaemonRejected(msg)) => {
@@ -811,12 +826,13 @@ enum DirectBle {
 
 /// Pure: may this process open its own session? `lease` = current lease file.
 fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, boot_id: &str, now_ms: u64) -> DirectBle {
-    // A lease we can't parse at all: assume a live grant (refuse).
+    // A lease present but unparseable: fail closed (Block) REGARDLESS of C6
+    // presence — the sampler/daemon could still hold the car, so a malformed
+    // lease means "cannot determine => busy", never stock direct BLE.
     let parsed = match lease.map(serde_json::from_str::<serde_json::Value>) {
         None => None,
         Some(Ok(v)) => Some(v),
-        Some(Err(_)) if c6_present => return DirectBle::Block,
-        Some(Err(_)) => None,
+        Some(Err(_)) => return DirectBle::Block,
     };
     let live = |v: &serde_json::Value, owner: &str, extra_ms: u64| {
         v.get("owner").and_then(|x| x.as_str()) == Some(owner)
@@ -833,6 +849,13 @@ fn direct_ble_decision(c6_primary: bool, c6_present: bool, lease: Option<&str>, 
     // a direct session here would be a second Pi signer.
     if parsed.as_ref().is_some_and(|v| {
         live(v, "sampler", 0) && v.get("holder").and_then(|x| x.as_str()) == Some("telemetry")
+    }) {
+        return DirectBle::Block;
+    }
+    // Another direct ble-action already holds the car (same boot, lease live):
+    // don't steal its reservation — report busy rather than become a 2nd signer.
+    if parsed.as_ref().is_some_and(|v| {
+        live(v, "sampler", 0) && v.get("holder").and_then(|x| x.as_str()) == Some("ble-action")
     }) {
         return DirectBle::Block;
     }
@@ -896,50 +919,238 @@ fn boottime_ms() -> Option<u64> {
 /// flag off = stock direct BLE. C6 present: route through it while it holds
 /// a live grant, refuse right after one; otherwise publish our own sampler
 /// lease (supervisor holds + parks) and go direct.
-fn c6_direct_path() -> DirectBle {
+fn c6_direct_path() -> (DirectBle, Option<CarReservation>) {
     let present = std::path::Path::new(C6_DEVICE).exists();
-    // No C6 and no lease at all: stock, untouched.
-    if !present && !std::path::Path::new(C6_LEASE_PATH).exists() {
-        return DirectBle::Stock;
+    // No C6 device: decide by whether a lease FILE exists, via try_exists so a
+    // stat ERROR is not read as "absent" (Path::exists would). Confirmed-absent =>
+    // stock; a stat error => fail closed; a lease that exists falls through to
+    // the lock + read + decide below.
+    if !present {
+        match std::path::Path::new(C6_LEASE_PATH).try_exists() {
+            Ok(false) => return (DirectBle::Stock, None),
+            Ok(true) => {}
+            Err(_) => return (DirectBle::Block, None),
+        }
     }
     let (Some(boot), Some(now)) = (
         std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok().map(|s| s.trim().to_string()),
         boottime_ms(),
     ) else {
-        return DirectBle::Block; // can't evaluate a lease: refuse
+        return (DirectBle::Block, None); // can't evaluate a lease: refuse
     };
     let owns = c6_owns_link();
     // Read-decide-write under the lease lock the daemon also takes, so its
     // grant and our claim can never interleave. Can't lock = refuse.
-    let _lock = {
-        use std::os::fd::AsRawFd;
-        let path = std::path::Path::new(C6_LEASE_LOCK_PATH);
-        let _ = path.parent().map(std::fs::create_dir_all);
-        let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path) else {
-            return DirectBle::Block;
-        };
-        // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return DirectBle::Block;
-        }
-        f
+    let Some(_lock) = lock_lease() else {
+        return (DirectBle::Block, None);
     };
-    let lease = std::fs::read_to_string(C6_LEASE_PATH).ok();
+    // Fail closed on read uncertainty: NotFound = truly absent (ok to claim), but
+    // any other I/O error means we can't tell if a live C6/daemon lease exists, so
+    // refuse rather than risk overwriting it and becoming a second signer.
+    let lease = match std::fs::read_to_string(C6_LEASE_PATH) {
+        Ok(s) => Some(s),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return (DirectBle::Block, None),
+    };
     match direct_ble_decision(owns, present, lease.as_deref(), &boot, now) {
         DirectBle::Claim => {
-            let body = serde_json::json!({
-                "owner": "sampler", "holder": "ble-action", "boot_id": boot,
-                "written_boottime_ms": now, "valid_for_ms": C6_SAMPLER_LEASE_MS,
-            })
-            .to_string();
-            let path = std::path::Path::new(C6_LEASE_PATH);
-            let tmp = path.with_extension("json.tmp");
-            let ok = path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
-                && std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)).is_ok();
-            // Can't publish our claim: don't risk two signers.
-            if ok { DirectBle::Claim } else { DirectBle::Block }
+            let token = reservation_token(&boot);
+            if write_ble_action_lease(&boot, &token, now) {
+                // Hold the reservation alive (renew) for the direct session.
+                (DirectBle::Claim, Some(CarReservation::start(token, boot)))
+            } else {
+                (DirectBle::Block, None) // can't publish our claim: don't risk two signers
+            }
         }
-        other => other,
+        other => (other, None),
+    }
+}
+
+/// Per-process reservation token so renew/park act ONLY on our own lease: two
+/// ble-action processes share a boot_id, so boot alone can't tell them apart
+/// (and one process's cleanup could otherwise clobber another's live hold).
+fn reservation_token(boot: &str) -> String {
+    format!("{boot}:{}:{}", std::process::id(), boottime_ms().unwrap_or(0))
+}
+
+/// Take the shared lease lock (the same lock file the telemetry daemon and the
+/// C6 supervisor take) so a read-decide-write can't interleave with a daemon
+/// grant. The lock releases when the returned file drops. None = couldn't lock.
+fn lock_lease() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+    let path = std::path::Path::new(C6_LEASE_LOCK_PATH);
+    let _ = path.parent().map(std::fs::create_dir_all);
+    let f = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(path).ok()?;
+    // SAFETY: valid fd owned by `f`; the lock is released when `f` drops.
+    (unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } == 0).then_some(f)
+}
+
+/// Write/refresh our car reservation (owner:sampler, holder:ble-action, our
+/// token) in the on-disk format the daemon's c6_coord reads. Caller holds lock.
+fn write_ble_action_lease(boot: &str, token: &str, now: u64) -> bool {
+    let body = serde_json::json!({
+        "owner": "sampler", "holder": "ble-action", "boot_id": boot, "token": token,
+        "written_boottime_ms": now, "valid_for_ms": C6_SAMPLER_LEASE_MS,
+    })
+    .to_string();
+    let path = std::path::Path::new(C6_LEASE_PATH);
+    let tmp = path.with_extension("json.tmp");
+    path.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+        && std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path)).is_ok()
+}
+
+/// Whether the on-disk lease is still OUR reservation (our token, not just our
+/// boot). `Unknown` distinguishes a transient read/parse error (retry) from a
+/// CONFIRMED change (`No`: readable but owner/holder/token differ, or the lease
+/// is gone). Caller holds the lock.
+enum Owned {
+    Yes,
+    No,
+    Unknown,
+}
+
+fn lease_ownership(token: &str) -> Owned {
+    let text = match std::fs::read_to_string(C6_LEASE_PATH) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Owned::No, // gone = lost
+        Err(_) => return Owned::Unknown, // transient I/O error
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Err(_) => Owned::Unknown, // torn/garbled read: don't treat as a confirmed change
+        Ok(v) => {
+            let ours = v.get("owner").and_then(|x| x.as_str()) == Some("sampler")
+                && v.get("holder").and_then(|x| x.as_str()) == Some("ble-action")
+                && v.get("token").and_then(|x| x.as_str()) == Some(token);
+            if ours { Owned::Yes } else { Owned::No }
+        }
+    }
+}
+
+/// True only when the lease is CONFIRMED ours (guards park so we never clobber
+/// another owner, and skip on an uncertain read).
+fn lease_is_ours(token: &str) -> bool {
+    matches!(lease_ownership(token), Owned::Yes)
+}
+
+/// Outcome of a renewal re-stamp.
+enum Renew {
+    Ok,     // re-stamped; lease is fresh
+    Lost,   // CONFIRMED no longer ours — the car was taken; stop the operation
+    Failed, // couldn't lock/stamp or uncertain read — retry soon, abort if it persists
+}
+
+/// Re-stamp our lease if it's still ours, so a long direct verb never lets the
+/// 120s lease lapse mid-session (which would let the daemon grant owner:c6 =
+/// two signers). The caller retries a Failed quickly and aborts if it can't
+/// renew before the lease would expire — it must never act on a stale lease.
+fn restamp_ble_action_lease(token: &str, boot: &str) -> Renew {
+    let Some(_lock) = lock_lease() else { return Renew::Failed };
+    match lease_ownership(token) {
+        Owned::No => return Renew::Lost,       // confirmed taken over
+        Owned::Unknown => return Renew::Failed, // transient: retry, don't abort yet
+        Owned::Yes => {}
+    }
+    let Some(now) = boottime_ms() else { return Renew::Failed };
+    if write_ble_action_lease(boot, token, now) { Renew::Ok } else { Renew::Failed }
+}
+
+/// Release our reservation on exit by writing the SAME settling park lease the
+/// daemon's clean exit writes (owner:sampler + settle_until), not by deleting:
+/// a bare delete lets a restarting daemon grant the C6 with no settle while our
+/// session is still tearing down. Only if it's still ours. Best-effort.
+fn park_ble_action_lease(token: &str, boot: &str) {
+    let Some(_lock) = lock_lease() else { return };
+    if !lease_is_ours(token) {
+        return;
+    }
+    let Some(now) = boottime_ms() else { return };
+    let body = serde_json::json!({
+        "owner": "sampler", "holder": "telemetry", "boot_id": boot,
+        "written_boottime_ms": now, "valid_for_ms": C6_CLAIM_SETTLE_MS,
+        "settle_until_ms": now.saturating_add(C6_CLAIM_SETTLE_MS),
+    })
+    .to_string();
+    let path = std::path::Path::new(C6_LEASE_PATH);
+    let tmp = path.with_extension("json.tmp");
+    let _ = std::fs::write(&tmp, body).and_then(|()| std::fs::rename(&tmp, path));
+}
+
+/// Holds the car reservation for a direct BLE verb. Renews the lease every 60s
+/// (inside its 120s validity) so a slow verb (hung link, interactive pair) can
+/// never let it lapse while we still hold the car session, and releases it on
+/// normal exit (Drop) and on SIGINT/SIGTERM. Panic (abort) and SIGKILL skip the
+/// release, but renewal then stops too and the lease expires within 120s while
+/// the dead process holds no car session, so the single-signer invariant holds.
+struct CarReservation {
+    task: Option<tokio::task::JoinHandle<()>>,
+    token: String,
+    boot: String,
+}
+
+impl CarReservation {
+    fn start(token: String, boot: String) -> Self {
+        let (t, b) = (token.clone(), boot.clone());
+        let task = tokio::spawn(async move {
+            use std::time::Duration;
+            // Renew well inside the 120s validity; a failed stamp retries fast, and
+            // if we can't renew within RENEW_ABORT_AFTER of the last good stamp we
+            // abort before expiry so we never act on a lapsed (second-signer) lease.
+            // 80s is chosen so >= 40s of the base 120s lease always remains at abort
+            // (>= CLAIM_SETTLE 35s + margin): raw expiry alone guarantees the settle
+            // even if the best-effort park-write fails. Normal cadence stays 60s.
+            const RENEW_INTERVAL: Duration = Duration::from_secs(60);
+            const RENEW_RETRY: Duration = Duration::from_secs(3);
+            const RENEW_ABORT_AFTER: Duration = Duration::from_secs(80);
+            let mut sigterm =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).ok();
+            let mut last_ok = std::time::Instant::now();
+            let mut delay = RENEW_INTERVAL;
+            loop {
+                let term = async {
+                    match sigterm.as_mut() {
+                        Some(s) => {
+                            s.recv().await;
+                        }
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => match restamp_ble_action_lease(&t, &b) {
+                        Renew::Ok => { last_ok = std::time::Instant::now(); delay = RENEW_INTERVAL; }
+                        Renew::Lost => {
+                            // The car is no longer ours: stop the whole operation, not
+                            // just renewal. Park (no-op since not ours) then exit.
+                            eprintln!("ble-action: car reservation taken over by another owner; aborting");
+                            park_ble_action_lease(&t, &b);
+                            std::process::exit(5);
+                        }
+                        Renew::Failed => {
+                            if last_ok.elapsed() >= RENEW_ABORT_AFTER {
+                                // Leave the settling park lease (if still ours) BEFORE
+                                // exiting so the successor waits the full CLAIM_SETTLE —
+                                // process::exit bypasses Drop's park write.
+                                eprintln!("ble-action: cannot renew the car reservation; aborting to avoid a stale-lease second signer");
+                                park_ble_action_lease(&t, &b);
+                                std::process::exit(4);
+                            }
+                            delay = RENEW_RETRY;
+                        }
+                    },
+                    _ = tokio::signal::ctrl_c() => { park_ble_action_lease(&t, &b); std::process::exit(130); }
+                    _ = term => { park_ble_action_lease(&t, &b); std::process::exit(143); }
+                }
+            }
+        });
+        CarReservation { task: Some(task), token, boot }
+    }
+}
+
+impl Drop for CarReservation {
+    fn drop(&mut self) {
+        if let Some(t) = self.task.take() {
+            t.abort();
+        }
+        park_ble_action_lease(&self.token, &self.boot);
     }
 }
 
@@ -1046,15 +1257,19 @@ mod tests {
         // Grant long expired (daemon down), no lease, sampler lease, other boot: claim + go.
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "b", 156_000), DirectBle::Claim);
         assert_eq!(direct_ble_decision(true, true, None, "b", 1), DirectBle::Claim);
+        // Another ble-action's live reservation (same boot): busy, don't steal it.
         let sampler = r#"{"owner":"sampler","holder":"ble-action","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
-        assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 1), DirectBle::Claim);
+        assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 1), DirectBle::Block);
+        // Expired ble-action reservation: free to claim.
+        assert_eq!(direct_ble_decision(true, true, Some(sampler), "b", 700_000), DirectBle::Claim);
         // The daemon's own live lease: it holds the car, so no second Pi session.
         let daemon = r#"{"owner":"sampler","holder":"telemetry","boot_id":"b","written_boottime_ms":0,"valid_for_ms":600000}"#;
         assert_eq!(direct_ble_decision(true, true, Some(daemon), "b", 1), DirectBle::Block);
         assert_eq!(direct_ble_decision(false, false, Some(daemon), "b", 1), DirectBle::Block);
         assert_eq!(direct_ble_decision(true, true, Some(&grant(0, 120_000)), "old", 1), DirectBle::Claim);
-        // Unparseable lease: assume a live grant.
+        // Unparseable lease: fail closed regardless of C6 presence (never Stock).
         assert_eq!(direct_ble_decision(true, true, Some("garbage"), "b", 1), DirectBle::Block);
+        assert_eq!(direct_ble_decision(true, false, Some("garbage"), "b", 1), DirectBle::Block);
     }
 
     fn owns_with(conf: &str, backfill_ok: bool) -> bool {

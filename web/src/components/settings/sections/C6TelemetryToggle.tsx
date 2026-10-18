@@ -10,6 +10,11 @@ interface C6Status {
   provisioned: boolean
   source_active: boolean
   fw: string | null
+  // Live car-link detail so the UI can tell parked vs wedged vs failed-over.
+  link: string | null
+  owner: string | null
+  polling_enabled: boolean | null
+  car_ok_age_ms: number | null
 }
 
 /**
@@ -82,6 +87,10 @@ export function C6TelemetryToggle() {
             provisioned: Boolean(d?.provisioned),
             source_active: Boolean(d?.source_active),
             fw: typeof d?.fw === "string" && d.fw.trim() ? d.fw.trim() : null,
+            link: typeof d?.link === "string" ? d.link : null,
+            owner: typeof d?.owner === "string" ? d.owner : null,
+            polling_enabled: typeof d?.polling_enabled === "boolean" ? d.polling_enabled : null,
+            car_ok_age_ms: typeof d?.car_ok_age_ms === "number" ? d.car_ok_age_ms : null,
           })
           setLoaded(true)
           // Chip healthy again: clear any stale recovery dismissal so a future
@@ -237,6 +246,40 @@ export function C6TelemetryToggle() {
     const active = status.source_active === true
     const provisioned = status.provisioned === true
     const updateAvailable = fw?.update_available === true
+    // Live car-link state so the row shows what the C6 is actually doing.
+    // Precedence matters: a stopped poll or a wedged link (up but no signed car
+    // response) must show BEFORE owner==="sampler", else a real no-data fault is
+    // masked as a benign failover. "session" with a stale car_ok is a wedge.
+    const WEDGE_MS = 60000
+    const wedge =
+      status.link === "session" &&
+      (status.car_ok_age_ms === null || status.car_ok_age_ms > WEDGE_MS)
+    let linkNote: { text: string; cls: string } | null = null
+    if (active) {
+      if (status.polling_enabled === false) {
+        linkNote = {
+          text: "ESP32-C6 is selected but not polling the car (turn Bluetooth on).",
+          cls: "text-amber-400/80",
+        }
+      } else if (wedge) {
+        linkNote = {
+          text: "ESP32-C6 link is up but the car hasn't responded — check the chip.",
+          cls: "text-amber-400/80",
+        }
+      } else if (status.owner === "sampler") {
+        linkNote = {
+          text: "Built-in Bluetooth has temporarily taken over (ESP32-C6 couldn't reach the car).",
+          cls: "text-amber-400/80",
+        }
+      } else if (status.link === "session") {
+        linkNote = { text: "Connected to the car.", cls: "text-emerald-400/80" }
+      } else if (status.link && status.link !== "idle") {
+        linkNote = {
+          text: `ESP32-C6 link: ${status.link} (not yet connected to the car).`,
+          cls: "text-amber-400/80",
+        }
+      }
+    }
     body = (
       <>
         <Toggle
@@ -250,6 +293,7 @@ export function C6TelemetryToggle() {
               : "Use the ESP32-C6 as the car's Bluetooth adapter. If you unplug it, the built-in Bluetooth takes over automatically."
           }
         />
+        {linkNote && <p className={`text-[11px] ${linkNote.cls}`}>{linkNote.text}</p>}
         {status.fw && (
           <div className="flex items-center justify-between gap-3">
             <p className="text-xs text-slate-500">ESP32-C6 Firmware: {status.fw}</p>
