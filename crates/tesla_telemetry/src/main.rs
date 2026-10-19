@@ -3363,11 +3363,11 @@ async fn c6_owned_tick(
 
     // Keep-awake: same cadence/retry/notify budget as the BLE path, sent by
     // the C6 (the only device allowed to sign on this key right now).
+    // Gated on the master switch (BLE_KEEP_AWAKE_ENABLED) like the direct-BLE
+    // site; off => zero nudges in c6_primary mode too, not just shadow.
     // No grant on disk yet (our session still closing, or ble-action holds the
     // car): the supervisor would refuse, so don't burn the retry budget.
-    // Same master switch as the direct-BLE path: `BLE_KEEP_AWAKE_ENABLED=no`
-    // suppresses holding the car awake here too (the archive still runs).
-    if lock::keep_awake_requested() && link.grant_live && cfg.keep_awake_enabled {
+    if cfg.keep_awake_enabled && lock::keep_awake_requested() && link.grant_live {
         let now = Instant::now();
         if next_nudge_due_at.map(|t| now >= t).unwrap_or(true) {
             let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
@@ -3399,7 +3399,9 @@ async fn c6_owned_tick(
                 }
             }
         }
-    } else if !lock::keep_awake_requested() {
+    } else if !cfg.keep_awake_enabled || !lock::keep_awake_requested() {
+        // Disabled OR not requested: clear retry state so re-enabling can't fire
+        // a stale 3/3 failure push.
         *next_nudge_due_at = None;
         *nudge_retry_count = 0;
         link.c6_nudge_failing = false;

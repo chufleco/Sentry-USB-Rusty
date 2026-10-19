@@ -37,6 +37,11 @@ StartLimitIntervalSec=120
 
 [Service]
 Type=simple
+# Shadow mode reads /mutable/c6/provisioned_key.json every tick; if the
+# sampler starts before /mutable (external disk) mounts, the marker reads
+# missing and shadow starts disabled. Wait up to 20s for the mount, then
+# proceed regardless (soft: never blocks start on boards without /mutable).
+ExecStartPre=-/bin/bash -c '[ -e /dev/sentryusb-c6 ] || exit 0; for i in $$(seq 1 20); do grep -q " /mutable " /proc/mounts && break; sleep 1; done; exit 0'
 # Clean up our own stale lock at startup (only if we own it AND it's
 # >24h old) so a crash mid-session doesn't leave the radio held forever.
 #
