@@ -3288,7 +3288,10 @@ mod keep_accessory_route_tests {
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
             let mut bodies = Vec::new();
-            for status in ["200 OK", "502 Bad Gateway"] {
+            // 200 = ok; 502 = car answered with a non-OK action status (e.g.
+            // cable connected) = reachable = success (matches direct-BLE
+            // send_action); 504 = no result from the car = genuine failure.
+            for status in ["200 OK", "502 Bad Gateway", "504 Gateway Timeout"] {
                 let (mut s, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 4096];
                 let n = s.read(&mut buf).await.unwrap();
@@ -3300,8 +3303,9 @@ mod keep_accessory_route_tests {
             bodies
         });
         let route = keep_accessory::Route::C6 { api: &addr };
-        assert!(route.set_power(true).await.is_ok(), "car said ok");
-        assert!(route.set_power(false).await.is_err(), "car rejected => failure, not success");
+        assert!(route.set_power(true).await.is_ok(), "200 => success");
+        assert!(route.set_power(false).await.is_ok(), "502 car-answered => success (matches direct-BLE send_action)");
+        assert!(route.set_power(true).await.is_err(), "504 no-answer => failure");
         let bodies = server.await.unwrap();
         assert!(bodies[0].contains(r#""cmd":"keep_accessory""#) && bodies[0].contains(r#""on":true"#));
         assert!(bodies[0].contains(r#""await_result":true"#));

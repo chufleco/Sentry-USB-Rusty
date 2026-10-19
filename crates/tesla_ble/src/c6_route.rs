@@ -36,9 +36,11 @@ pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
     Some(v)
 }
 
-/// POST one command to the supervisor (`/api/esp32c6/command`). Ok only on
-/// HTTP 200: the car's own result for `await_result` commands, else the C6's
-/// receipt ack. Plain HTTP/1.1 over loopback, bounded.
+/// POST one command to the supervisor (`/api/esp32c6/command`). Ok on HTTP 200
+/// (car OK / receipt ack) AND 502 (car ANSWERED with an action fault, e.g.
+/// "cable connected" — reachable, so treated as success like the direct-BLE
+/// send_action). 504/other (no car reply / C6-side error) => Err. Plain
+/// HTTP/1.1 over loopback, bounded.
 pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let payload = body.to_string();
@@ -61,15 +63,26 @@ pub async fn supervisor_command(addr: &str, body: &serde_json::Value) -> anyhow:
         .await
         .map_err(|_| anyhow::anyhow!("C6 supervisor timed out"))??;
     let text = String::from_utf8_lossy(&resp);
-    let status_ok = text
+    let status = text
         .lines()
         .next()
-        .is_some_and(|l| l.split_whitespace().nth(1) == Some("200"));
-    if status_ok {
-        Ok(())
-    } else {
-        let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
-        anyhow::bail!("C6 command failed: {}", if body.is_empty() { "no response" } else { body })
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse::<u16>().ok());
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("").trim();
+    match status {
+        Some(200) => Ok(()),
+        // 502 = the car ANSWERED with a non-OK action status (e.g. "cable
+        // connected" on a plugged-in car). The car is reachable, so — like the
+        // direct-BLE send_action, which returns Ok on any signed car reply and
+        // ignores the ActionStatus — treat an answered-with-error reply as
+        // success, not a command/keep-awake failure (a false failure here also
+        // trips c6_nudge_failing -> a spurious C6->Pi failback). 504 (no
+        // result), 409 (no grant) and transport failures stay errors.
+        Some(502) => {
+            tracing::debug!("C6 command: car answered non-OK, treating as reachable: {body}");
+            Ok(())
+        }
+        _ => anyhow::bail!("C6 command failed: {}", if body.is_empty() { "no response" } else { body }),
     }
 }
 
