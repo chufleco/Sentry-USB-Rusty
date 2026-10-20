@@ -99,7 +99,7 @@ export function C6TelemetryToggle() {
           // Chase firmware-update status when a C6 is present, OR when the last
           // firmware record is still non-idle — so a flash that drops the chip
           // off the bus keeps reporting (instead of the row silently vanishing).
-          if (d?.present || (fwRef.current && fwRef.current.install?.state !== "idle")) {
+          if (fwRef.current === null || d?.present || (fwRef.current && fwRef.current.install?.state !== "idle")) {
             refreshFw()
           }
         })
@@ -221,27 +221,6 @@ export function C6TelemetryToggle() {
         </div>
       )
     }
-  } else if (
-    fw?.can_recover &&
-    canRecoverSince !== null &&
-    Date.now() - canRecoverSince >= 8000
-  ) {
-    body = (
-      <div className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
-        <p className="text-xs font-medium text-amber-300">ESP32-C6 detected but not responding</p>
-        <p className="text-[11px] leading-relaxed text-amber-200/80">
-          First try: unplug the ESP32-C6 and plug it back in, or hold its RESET button for ~5
-          seconds. If it still does not respond, set it up below — it reinstalls firmware,
-          keeping the Tesla key when it can and re-provisioning it only if a full recovery is needed.
-        </p>
-        <button
-          onClick={() => setFwModal("recover")}
-          className="self-start rounded-lg bg-amber-500/20 px-2.5 py-1 text-xs font-medium text-amber-300 hover:bg-amber-500/30"
-        >
-          Set up / recover this ESP32-C6
-        </button>
-      </div>
-    )
   } else {
     const active = status.source_active === true
     const provisioned = status.provisioned === true
@@ -280,8 +259,28 @@ export function C6TelemetryToggle() {
         }
       }
     }
+    const showRecover =
+      fw?.can_recover === true &&
+      canRecoverSince !== null &&
+      Date.now() - canRecoverSince >= 8000
     body = (
       <>
+        {showRecover && (
+          <div className="flex flex-col gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3">
+            <p className="text-xs font-medium text-amber-300">ESP32-C6 detected but not responding</p>
+            <p className="text-[11px] leading-relaxed text-amber-200/80">
+              First try: unplug the ESP32-C6 and plug it back in, or hold its RESET button for ~5
+              seconds. If it still does not respond, set it up below — it reinstalls firmware,
+              keeping the Tesla key when it can and re-provisioning it only if a full recovery is needed.
+            </p>
+            <button
+              onClick={() => setFwModal("recover")}
+              className="self-start rounded-lg bg-amber-500/20 px-2.5 py-1 text-xs font-medium text-amber-300 hover:bg-amber-500/30"
+            >
+              Set up / recover this ESP32-C6
+            </button>
+          </div>
+        )}
         <Toggle
           checked={active}
           disabled={busy || (!active && !provisioned)}
