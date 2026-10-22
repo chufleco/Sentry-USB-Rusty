@@ -3134,7 +3134,9 @@ async fn c6_owned_tick(
     // the C6 (the only device allowed to sign on this key right now).
     // No grant on disk yet (our session still closing, or ble-action holds the
     // car): the supervisor would refuse, so don't burn the retry budget.
-    if lock::keep_awake_requested() && link.grant_live {
+    // Same master switch as the direct-BLE path: `BLE_KEEP_AWAKE_ENABLED=no`
+    // suppresses holding the car awake here too (the archive still runs).
+    if lock::keep_awake_requested() && link.grant_live && cfg.keep_awake_enabled {
         let now = Instant::now();
         if next_nudge_due_at.map(|t| now >= t).unwrap_or(true) {
             let interval = Duration::from_secs(cfg.keep_awake_interval_secs);
