@@ -801,6 +801,7 @@ async fn tick(
                     c6_link,
                     last_charging_state,
                     last_sentry_mode,
+                    last_shift_state,
                     last_lat,
                     last_lon,
                     last_location_name,
@@ -1338,6 +1339,9 @@ async fn tick(
             let success = if c6_backfill
                 && c6_took_drive(&c6_snap, now_ms, &mut sample, &mut shift_state_observed)
             {
+                if let Some(shift) = shift_state_observed {
+                    *last_shift_state = c6_timed_gear(c6_snap.as_ref(), shift, now_ms);
+                }
                 true
             } else { match sample_ble::sample_drive_ble(session).await {
                 Ok(d) => {
@@ -2657,6 +2661,17 @@ fn c6_fallback(domain: &str, reason: &str) -> bool {
     false
 }
 
+/// A C6 gear reading timed from when the C6 read it, not when we saw it, so a
+/// stale drive domain never reads as a fresh gear.
+fn c6_timed_gear(
+    snap: Option<&c6_source::C6Snapshot>,
+    gear: sample::ShiftState,
+    now_ms: u64,
+) -> Option<TimedReading<sample::ShiftState>> {
+    let age = snap.and_then(|s| s.domain_age_ms("drive", now_ms)).unwrap_or(u64::MAX / 2);
+    TimedReading::at_age(gear, Duration::from_millis(age))
+}
+
 fn c6_took_drive(
     snap: &Option<c6_source::C6Snapshot>,
     now_ms: u64,
@@ -3270,6 +3285,7 @@ async fn c6_owned_tick(
     link: &mut C6Link,
     last_charging_state: &mut Option<TimedReading<sample::ChargingState>>,
     last_sentry_mode: &mut Option<TimedReading<sample::SentryMode>>,
+    last_shift_state: &mut Option<TimedReading<sample::ShiftState>>,
     last_lat: &mut Option<f64>,
     last_lon: &mut Option<f64>,
     last_location_name: &mut Option<String>,
@@ -3280,14 +3296,16 @@ async fn c6_owned_tick(
     let now_wall = sample::now_secs().max(0) as u64 * 1000;
     let mut row = Sample { ts: sample::now_secs(), source: "state".into(), ..Sample::default() };
     let mut any = false;
-    let mut shift = None;
     let mut mark: Vec<(&'static str, u64)> = Vec::new();
 
     if let Some(d) = c6_new_value(snap, link, "drive", now_wall) {
         if c6_source::apply_drive(&d.fields, &mut row) {
             any = true;
         }
-        shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
+        let shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
+        if let Some(g) = shift {
+            *last_shift_state = c6_timed_gear(snap, g, now_wall);
+        }
         let power = d.fields.get("power").and_then(|v| v.as_f64());
         let parked = c6_drive_parked(shift, power);
         link.parked_obs = if parked { link.parked_obs.saturating_add(1) } else { 0 };
@@ -3359,11 +3377,8 @@ async fn c6_owned_tick(
         }
         persist(conn, row);
     }
-    let shift_reading = shift.and_then(|g| {
-        let age = snap.and_then(|s| s.domain_age_ms("drive", now_wall)).unwrap_or(u64::MAX / 2);
-        TimedReading::at_age(g, Duration::from_millis(age))
-    });
-    write_gate_status_file(last_sentry_mode.as_ref(), last_charging_state.as_ref(), shift_reading.as_ref());
+    // Held between C6 drive updates like the sampler's gear; the gate ages it out.
+    write_gate_status_file(last_sentry_mode.as_ref(), last_charging_state.as_ref(), last_shift_state.as_ref());
 
     // Keep-awake: same cadence/retry/notify budget as the BLE path, sent by
     // the C6 (the only device allowed to sign on this key right now).
