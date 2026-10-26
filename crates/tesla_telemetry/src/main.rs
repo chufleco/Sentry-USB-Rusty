@@ -3359,7 +3359,11 @@ async fn c6_owned_tick(
         }
         persist(conn, row);
     }
-    write_gate_status_file(last_sentry_mode.as_ref(), last_charging_state.as_ref(), shift);
+    let shift_reading = shift.and_then(|g| {
+        let age = snap.and_then(|s| s.domain_age_ms("drive", now_wall)).unwrap_or(u64::MAX / 2);
+        TimedReading::at_age(g, Duration::from_millis(age))
+    });
+    write_gate_status_file(last_sentry_mode.as_ref(), last_charging_state.as_ref(), shift_reading.as_ref());
 
     // Keep-awake: same cadence/retry/notify budget as the BLE path, sent by
     // the C6 (the only device allowed to sign on this key right now).
