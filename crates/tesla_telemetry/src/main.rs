@@ -1340,7 +1340,7 @@ async fn tick(
                 && c6_took_drive(&c6_snap, now_ms, &mut sample, &mut shift_state_observed)
             {
                 if let Some(shift) = shift_state_observed {
-                    *last_shift_state = c6_timed_gear(c6_snap.as_ref(), shift, now_ms);
+                    *last_shift_state = c6_timed_gear(c6_snap.as_ref(), shift);
                 }
                 true
             } else { match sample_ble::sample_drive_ble(session).await {
@@ -2666,6 +2666,21 @@ fn c6_fallback(domain: &str, reason: &str) -> bool {
 fn c6_timed_gear(
     snap: Option<&c6_source::C6Snapshot>,
     gear: sample::ShiftState,
+) -> Option<TimedReading<sample::ShiftState>> {
+    c6_timed_gear_at(snap, gear, wall_now_ms())
+}
+
+/// Millisecond wall time: the tick's whole-second clock can understate a legacy age by up to 1 s.
+fn wall_now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+fn c6_timed_gear_at(
+    snap: Option<&c6_source::C6Snapshot>,
+    gear: sample::ShiftState,
     now_ms: u64,
 ) -> Option<TimedReading<sample::ShiftState>> {
     let age = snap.and_then(|s| s.domain_age_strict_ms("drive", now_ms)).unwrap_or(u64::MAX / 2);
@@ -2783,10 +2798,13 @@ mod timed_reading_tests {
     fn c6_gear_from_a_future_wall_clock_is_not_fresh() {
         let json = r#"{"healthy":true,"domains":{"drive":{"updated_at_ms":10000,"fields":{"shift_state":"D"}}}}"#;
         let snap = c6_source::C6Snapshot::parse(json).unwrap();
-        let stale = c6_timed_gear(Some(&snap), sample::ShiftState::Drive, 5_000);
+        let stale = c6_timed_gear_at(Some(&snap), sample::ShiftState::Drive, 5_000);
         assert!(stale.map_or(true, |g| g.fresh(Duration::from_secs(30)).is_none()));
-        let g = c6_timed_gear(Some(&snap), sample::ShiftState::Drive, 11_000).unwrap();
+        let g = c6_timed_gear_at(Some(&snap), sample::ShiftState::Drive, 11_000).unwrap();
         assert!(g.fresh(Duration::from_secs(30)).is_some());
+        // 30.5 s old must be stale at a 30 s window (no whole-second rounding).
+        let old = c6_timed_gear_at(Some(&snap), sample::ShiftState::Drive, 40_500).unwrap();
+        assert!(old.fresh(Duration::from_secs(30)).is_none());
     }
 
     #[test]
@@ -3314,7 +3332,7 @@ async fn c6_owned_tick(
         }
         let shift = d.fields.get("shift_state").and_then(|v| v.as_str()).map(sample::ShiftState::from_c6_str);
         if let Some(g) = shift {
-            *last_shift_state = c6_timed_gear(snap, g, now_wall);
+            *last_shift_state = c6_timed_gear(snap, g);
         }
         let power = d.fields.get("power").and_then(|v| v.as_f64());
         let parked = c6_drive_parked(shift, power);
