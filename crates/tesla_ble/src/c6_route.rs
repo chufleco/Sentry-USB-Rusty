@@ -164,7 +164,7 @@ mod tests {
     async fn send_verb_validates_like_the_ble_path_before_sending() {
         // Port 9 on loopback: nothing listens, so any send attempt would fail with a
         // connection error, not the validation error asserted here.
-        for bad in ["climate-set-temp:14.9", "climate-set-temp:28.1", "climate-set-temp:21.25", "set-charge-limit:101"] {
+        for bad in ["climate-set-temp:14.9", "climate-set-temp:28.1", "climate-set-temp:21.25", "climate-set-temp:warm", "set-charge-limit:101"] {
             let e = send_verb("127.0.0.1:9", bad).await.unwrap_err().to_string();
             assert!(!e.contains("C6"), "{bad}: {e}");
         }

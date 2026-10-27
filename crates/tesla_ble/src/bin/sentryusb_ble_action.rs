@@ -1157,6 +1157,11 @@ impl Drop for CarReservation {
 /// Send `verb` through the C6 supervisor, waiting for the car's own answer
 /// where the firmware tracks one. Exit codes as the direct path.
 async fn run_via_c6(verb: &str) -> ExitCode {
+    // A malformed command is the caller's error (exit 1, not retried), as on the direct path.
+    if let Err(e) = sentryusb_tesla_ble::actions::parse_verb(verb) {
+        eprintln!("{e}");
+        return ExitCode::from(1);
+    }
     if sentryusb_tesla_ble::c6_route::verb_to_c6_command(verb).is_none() {
         eprintln!("C6 owns the car link; '{verb}' has no C6 equivalent");
         return ExitCode::from(3);
