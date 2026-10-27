@@ -521,7 +521,7 @@ pub fn write_exit_park_lease() -> bool {
 
 // Verb mapping + supervisor client live in tesla_ble so sentryusb-ble-action
 // uses the exact same routing when this daemon is down.
-pub use sentryusb_tesla_ble::c6_route::{supervisor_command, verb_to_c6_command};
+pub use sentryusb_tesla_ble::c6_route::supervisor_command;
 
 #[cfg(test)]
 mod tests {

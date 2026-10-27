@@ -2985,11 +2985,10 @@ async fn c6_action(cfg: &BleConfig, verb: &str) -> Result<String> {
         }
         "pair" => Err(anyhow::anyhow!("C6 owns the car link; pair the C6 instead")),
         _ => {
-            // Same validation (ranges, typos) as the BLE path, then map.
+            // Same validation (ranges, typos) as the BLE path, then map; a sleeping
+            // car is woken first for the commands the BLE path wakes it for.
             action_socket::parse_verb(verb)?;
-            let cmd = c6_coord::verb_to_c6_command(verb)
-                .ok_or_else(|| anyhow::anyhow!("'{verb}' has no C6 equivalent"))?;
-            c6_coord::supervisor_command(&cfg.c6_supervisor_api, &cmd).await?;
+            sentryusb_tesla_ble::c6_route::send_verb(&cfg.c6_supervisor_api, verb).await?;
             Ok(String::new())
         }
     }
