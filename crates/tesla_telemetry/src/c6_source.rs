@@ -140,6 +140,16 @@ impl C6Snapshot {
         Some(self.car_ok_age_at_write_ms?.saturating_add(self.snapshot_age_ms.unwrap_or(u64::MAX / 4)))
     }
 
+    /// [domain_age_ms], but a legacy wall-clock reading from the future (clock stepped
+    /// back) is unknown, not zero: a stale value must never read as fresh.
+    pub fn domain_age_strict_ms(&self, domain: &str, now_wall_ms: u64) -> Option<u64> {
+        let d = self.domains.get(domain)?;
+        match (d.age_at_write_ms, self.snapshot_age_ms, self.written_boottime_ms) {
+            (Some(a), Some(s), Some(_)) => Some(a.saturating_add(s)),
+            _ => now_wall_ms.checked_sub(d.updated_at_ms),
+        }
+    }
+
     /// Age of the last sleep-status reading now.
     pub fn car_sleep_age_ms(&self) -> Option<u64> {
         Some(self.car_sleep_age_at_write_ms?.saturating_add(self.snapshot_age_ms.unwrap_or(u64::MAX / 4)))
