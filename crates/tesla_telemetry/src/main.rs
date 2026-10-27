@@ -2668,7 +2668,7 @@ fn c6_timed_gear(
     gear: sample::ShiftState,
     now_ms: u64,
 ) -> Option<TimedReading<sample::ShiftState>> {
-    let age = snap.and_then(|s| s.domain_age_ms("drive", now_ms)).unwrap_or(u64::MAX / 2);
+    let age = snap.and_then(|s| s.domain_age_strict_ms("drive", now_ms)).unwrap_or(u64::MAX / 2);
     TimedReading::at_age(gear, Duration::from_millis(age))
 }
 
@@ -2778,6 +2778,16 @@ fn c6_took_tires(snap: &Option<c6_source::C6Snapshot>, now_ms: u64, sample: &mut
 #[cfg(test)]
 mod timed_reading_tests {
     use super::*;
+
+    #[test]
+    fn c6_gear_from_a_future_wall_clock_is_not_fresh() {
+        let json = r#"{"healthy":true,"domains":{"drive":{"updated_at_ms":10000,"fields":{"shift_state":"D"}}}}"#;
+        let snap = c6_source::C6Snapshot::parse(json).unwrap();
+        let stale = c6_timed_gear(Some(&snap), sample::ShiftState::Drive, 5_000);
+        assert!(stale.map_or(true, |g| g.fresh(Duration::from_secs(30)).is_none()));
+        let g = c6_timed_gear(Some(&snap), sample::ShiftState::Drive, 11_000).unwrap();
+        assert!(g.fresh(Duration::from_secs(30)).is_some());
+    }
 
     #[test]
     fn at_age_ages_from_delivery_not_now() {
