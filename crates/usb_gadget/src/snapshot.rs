@@ -595,6 +595,13 @@ pub(crate) fn lock_snapshots_dir() -> Result<std::fs::File> {
     }
 }
 
+/// Whether a snapshot producer, release or sweep holds the snapshots-dir
+/// lock right now. Probes without waiting; an unreadable lock counts as busy.
+pub fn snapshots_dir_busy() -> bool {
+    let Ok(file) = std::fs::File::open(SNAPSHOTS_DIR) else { return false };
+    !crate::cycle_lock::try_flock_exclusive(&file).unwrap_or(false)
+}
+
 /// True while archiveloop's archive overlay (lower = the TeslaCam farm) is
 /// mounted at /tmp/cam/merged.
 fn archive_overlay_active() -> bool {
