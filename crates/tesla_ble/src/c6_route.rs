@@ -23,11 +23,18 @@ pub fn verb_to_c6_command(verb: &str) -> Option<serde_json::Value> {
         "sentry-off" => json!({"cmd": "set_sentry_mode", "on": false}),
         "charge-start" => json!({"cmd": "charging_start_stop", "start": true}),
         "charge-stop" => json!({"cmd": "charging_start_stop", "start": false}),
+        // Same messages the BLE path sends: HvacAutoAction (no manual override) and
+        // HvacTemperatureAdjustmentAction on both front zones.
+        "climate-on" => json!({"cmd": "hvac_auto", "on": true}),
+        "climate-off" => json!({"cmd": "hvac_auto", "on": false}),
         other => {
             if let Some(n) = other.strip_prefix("set-charging-amps:") {
                 json!({"cmd": "set_charging_amps", "amps": n.trim().parse::<i64>().ok()?})
             } else if let Some(n) = other.strip_prefix("set-charge-limit:") {
                 json!({"cmd": "set_charge_limit", "percent": n.trim().parse::<i64>().ok()?})
+            } else if let Some(t) = other.strip_prefix("climate-set-temp:") {
+                let c = t.trim().parse::<f64>().ok().filter(|c| c.is_finite())?;
+                json!({"cmd": "set_temperature", "driver": c, "passenger": c})
             } else {
                 return None;
             }
@@ -99,5 +106,18 @@ mod tests {
         assert!(verb_to_c6_command("set-charging-amps:x").is_none());
         assert!(verb_to_c6_command("pair").is_none());
         assert!(verb_to_c6_command("unlock").is_none());
+    }
+
+    #[test]
+    fn climate_verbs_map_to_the_firmware_hvac_commands() {
+        let on = verb_to_c6_command("climate-on").unwrap();
+        assert_eq!((on["cmd"].as_str(), on["on"].as_bool()), (Some("hvac_auto"), Some(true)));
+        assert_eq!(verb_to_c6_command("climate-off").unwrap()["on"], false);
+        let t = verb_to_c6_command("climate-set-temp:22.5").unwrap();
+        assert_eq!(t["cmd"], "set_temperature");
+        assert_eq!(t["driver"], 22.5);
+        assert_eq!(t["passenger"], 22.5);
+        assert!(verb_to_c6_command("climate-set-temp:NaN").is_none());
+        assert!(verb_to_c6_command("climate-set-temp:warm").is_none());
     }
 }
